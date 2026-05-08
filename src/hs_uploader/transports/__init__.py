@@ -6,6 +6,7 @@ phases.
 """
 
 from .base import Transport
+from .pskreporter import PskReporterTcp
 from .wsprdaemon import (
     WsprdaemonTarFtp,
     WsprdaemonTarSftp,
@@ -14,6 +15,7 @@ from .wsprdaemon import (
 
 __all__ = [
     "Transport",
+    "PskReporterTcp",
     "WsprdaemonTarSftp",
     "WsprdaemonTarFtp",
     "build_wsprdaemon_tar",
