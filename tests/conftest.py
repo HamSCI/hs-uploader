@@ -111,6 +111,11 @@ class MemorySource:
             cursor_after=chunk[-1][1],
         )
 
+    def commit(self, commit_token: bytes) -> None:
+        # No-op for the in-memory source — Pipeline's commit hook is
+        # only meaningful for sources that need external cleanup.
+        return None
+
 
 # ---- fixtures ----
 

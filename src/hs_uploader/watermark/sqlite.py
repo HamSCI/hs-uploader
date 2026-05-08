@@ -58,7 +58,12 @@ CREATE TABLE IF NOT EXISTS deliverables (
     payload_blob    BLOB NOT NULL,
     enqueued_at     TEXT NOT NULL,
     attempts        INTEGER NOT NULL DEFAULT 0,
-    next_attempt_at TEXT NOT NULL
+    next_attempt_at TEXT NOT NULL,
+    source_id       TEXT NOT NULL DEFAULT '',
+    dest_id         TEXT NOT NULL DEFAULT '',
+    table_name      TEXT NOT NULL DEFAULT '',
+    cursor_after    BLOB NOT NULL DEFAULT x'',
+    commit_token    BLOB NOT NULL DEFAULT x''
 );
 CREATE INDEX IF NOT EXISTS deliverables_due_idx
     ON deliverables(pipeline, next_attempt_at);
@@ -181,12 +186,23 @@ class SqliteWatermarkStore:
         payload_blob: bytes,
         enqueued_at: str,
         next_attempt_at: str,
+        source_id: str = "",
+        dest_id: str = "",
+        table: str = "",
+        cursor_after: bytes = b"",
+        commit_token: bytes = b"",
     ) -> int:
         with self._lock, self._conn:
             cur = self._conn.execute(
                 "INSERT INTO deliverables(pipeline, payload_blob, enqueued_at, "
-                "attempts, next_attempt_at) VALUES(?,?,?,0,?)",
-                (pipeline, payload_blob, enqueued_at, next_attempt_at),
+                "attempts, next_attempt_at, source_id, dest_id, table_name, "
+                "cursor_after, commit_token) "
+                "VALUES(?,?,?,0,?,?,?,?,?,?)",
+                (
+                    pipeline, payload_blob, enqueued_at, next_attempt_at,
+                    source_id, dest_id, table,
+                    cursor_after, commit_token,
+                ),
             )
             return int(cur.lastrowid)
 
@@ -196,7 +212,8 @@ class SqliteWatermarkStore:
         with self._lock, self._conn:
             row = self._conn.execute(
                 "SELECT id, pipeline, payload_blob, enqueued_at, attempts, "
-                "next_attempt_at FROM deliverables "
+                "next_attempt_at, source_id, dest_id, table_name, "
+                "cursor_after, commit_token FROM deliverables "
                 "WHERE pipeline=? AND next_attempt_at<=? "
                 "ORDER BY next_attempt_at LIMIT 1",
                 (pipeline, now),
@@ -215,6 +232,11 @@ class SqliteWatermarkStore:
                 enqueued_at=row["enqueued_at"],
                 attempts=row["attempts"],
                 next_attempt_at=row["next_attempt_at"],
+                source_id=row["source_id"] or "",
+                dest_id=row["dest_id"] or "",
+                table=row["table_name"] or "",
+                cursor_after=bytes(row["cursor_after"] or b""),
+                commit_token=bytes(row["commit_token"] or b""),
             )
 
     def requeue_deliverable(self, deliverable: Deliverable) -> None:
@@ -228,7 +250,9 @@ class SqliteWatermarkStore:
         with self._lock, self._conn:
             self._conn.execute(
                 "INSERT INTO deliverables(id, pipeline, payload_blob, "
-                "enqueued_at, attempts, next_attempt_at) VALUES(?,?,?,?,?,?)",
+                "enqueued_at, attempts, next_attempt_at, source_id, "
+                "dest_id, table_name, cursor_after, commit_token) "
+                "VALUES(?,?,?,?,?,?,?,?,?,?,?)",
                 (
                     deliverable.id,
                     deliverable.pipeline,
@@ -236,6 +260,11 @@ class SqliteWatermarkStore:
                     deliverable.enqueued_at,
                     deliverable.attempts,
                     deliverable.next_attempt_at,
+                    deliverable.source_id,
+                    deliverable.dest_id,
+                    deliverable.table,
+                    deliverable.cursor_after,
+                    deliverable.commit_token,
                 ),
             )
 

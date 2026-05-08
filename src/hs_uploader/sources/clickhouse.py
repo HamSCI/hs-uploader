@@ -172,6 +172,11 @@ class ClickHouseSource:
     def health(self) -> str:
         return self._health
 
+    def commit(self, commit_token: bytes) -> None:
+        # No external cleanup — the watermark store's cursor advance
+        # alone is sufficient for the CH source.
+        return None
+
     def iter_batches(self, cursor: bytes, limit: int) -> Iterator[RecordBatch]:
         if self._config is None:
             # Standalone / no-CH mode — silent no-op, matches Writer's

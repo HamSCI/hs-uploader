@@ -84,6 +84,35 @@ def test_retry_later_persists_deliverable(tmp_path, memory_transport):
     assert wm.deliverable_count("test") == 1
 
 
+def test_replay_ack_advances_cursor_and_commits(tmp_path, memory_transport):
+    """Replay-ack must advance the cursor and call source.commit —
+    correctness fix beyond Phase 1's first-attempt-only logic."""
+    src = MemorySource(records=_records(2))
+    wm = SqliteWatermarkStore(tmp_path / "wm.db")
+    pipe = Pipeline(
+        name="test", source=src, transport=memory_transport,
+        watermark=wm, identity=_ident(),
+        retry=RetryPolicy(base=1.0, cap_sec=1.0, max_attempts=5),
+    )
+
+    # First pump: ship returns retry_later → deliverable queued, cursor
+    # has NOT advanced.
+    memory_transport.next_outcomes = [Outcome.retry_later("blip")]
+    Uploader([pipe]).pump()
+    assert wm.get_cursor("memory:test", "memory", "test.spots") == b""
+
+    # Second pump in fast-forward time: replay returns acked → cursor
+    # MUST now advance to b"2" (the cursor stored on the deliverable).
+    import time
+    far = time.time() + 86_400.0
+    up = Uploader([pipe], now_fn=lambda: far)
+    memory_transport.next_outcomes = [Outcome.acked()]
+    up.pump()
+
+    assert wm.get_cursor("memory:test", "memory", "test.spots") == b"2"
+    assert wm.deliverable_count("test") == 0
+
+
 def test_replay_acks_clears_deliverable(tmp_path, memory_transport):
     """First attempt fails, replay succeeds → deliverable consumed."""
     src = MemorySource(records=_records(2))

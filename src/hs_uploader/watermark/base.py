@@ -26,7 +26,18 @@ from typing import Optional, Protocol, runtime_checkable
 
 @dataclass(frozen=True)
 class Deliverable:
-    """One row out of the watermark deliverables table."""
+    """One row out of the watermark deliverables table.
+
+    ``cursor_after`` and ``commit_token`` carry the source-specific
+    ack semantics across the deliverable lifecycle so a replay-ack
+    can advance the cursor and trigger source cleanup just like a
+    first-attempt-ack would have.
+
+    ``source_id``, ``dest_id``, and ``table`` are stored alongside the
+    deliverable so the orchestrator can advance the right watermark
+    on replay-ack without needing to keep the original Pipeline
+    in-memory.
+    """
 
     id: int
     pipeline: str
@@ -34,6 +45,11 @@ class Deliverable:
     enqueued_at: str  # ISO8601
     attempts: int
     next_attempt_at: str
+    source_id: str = ""
+    dest_id: str = ""
+    table: str = ""
+    cursor_after: bytes = b""
+    commit_token: bytes = b""
 
 
 @runtime_checkable
@@ -90,6 +106,11 @@ class WatermarkStore(Protocol):
         payload_blob: bytes,
         enqueued_at: str,
         next_attempt_at: str,
+        source_id: str = "",
+        dest_id: str = "",
+        table: str = "",
+        cursor_after: bytes = b"",
+        commit_token: bytes = b"",
     ) -> int:
         """Returns the deliverable id."""
         ...

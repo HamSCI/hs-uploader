@@ -67,11 +67,19 @@ class Record:
 @dataclass(frozen=True)
 class RecordBatch:
     """A batch of records plus the cursor advance proposed if the
-    transport ACKs successfully.
+    transport ACKs successfully, plus an optional ``commit_token`` the
+    source uses to perform any cleanup (e.g. delete acked files) once
+    the batch has been delivered upstream.
+
+    Both ``cursor_after`` and ``commit_token`` are opaque to everything
+    but the source that emitted them.  The orchestrator persists them
+    alongside the deliverable so a retry-then-replay path arrives at
+    the same final ack semantics as a first-attempt ack.
     """
 
     records: Sequence[Record]
     cursor_after: bytes  # opaque to everything but the source
+    commit_token: bytes = b""  # source-specific cleanup payload
 
     def __len__(self) -> int:
         return len(self.records)
@@ -300,42 +308,35 @@ class Uploader:
         now: float,
     ) -> None:
         ts = _iso(now)
+        table = pipe.transport.primary_table()
         if outcome.kind == "acked":
             pipe.watermark.advance_cursor(
-                pipe.source_id(),
-                pipe.dest_id(),
-                pipe.transport.primary_table(),
-                cursor=batch.cursor_after,
-                last_ack=ts,
+                pipe.source_id(), pipe.dest_id(), table,
+                cursor=batch.cursor_after, last_ack=ts,
             )
+            pipe.source.commit(batch.commit_token)
             pipe.watermark.record_attempt(
-                ts=ts,
-                source_id=pipe.source_id(),
-                dest_id=pipe.dest_id(),
-                table=pipe.transport.primary_table(),
-                outcome="acked",
-                records=len(batch),
-                bytes_=None,
-                error=None,
+                ts=ts, source_id=pipe.source_id(), dest_id=pipe.dest_id(),
+                table=table, outcome="acked",
+                records=len(batch), bytes_=None, error=None,
             )
             return
         if outcome.kind == "partial_ack":
+            # Advance only to the partially-accepted cursor; commit the
+            # whole token (sources that need finer-grained "which rejected
+            # records did NOT get acked" can encode that into commit_token,
+            # but the v1 file source either acks all or none).
             pipe.watermark.advance_cursor(
-                pipe.source_id(),
-                pipe.dest_id(),
-                pipe.transport.primary_table(),
+                pipe.source_id(), pipe.dest_id(), table,
                 cursor=outcome.accepted_cursor or batch.cursor_after,
                 last_ack=ts,
             )
+            pipe.source.commit(batch.commit_token)
             pipe.watermark.record_attempt(
-                ts=ts,
-                source_id=pipe.source_id(),
-                dest_id=pipe.dest_id(),
-                table=pipe.transport.primary_table(),
-                outcome="partial_ack",
+                ts=ts, source_id=pipe.source_id(), dest_id=pipe.dest_id(),
+                table=table, outcome="partial_ack",
                 records=len(batch) - len(outcome.rejected),
-                bytes_=None,
-                error=outcome.reason or None,
+                bytes_=None, error=outcome.reason or None,
             )
             return
         if outcome.kind == "retry_later":
@@ -345,34 +346,30 @@ class Uploader:
                 payload_blob=payload,
                 enqueued_at=ts,
                 next_attempt_at=_iso(now + pipe.retry.delay_for(0)),
-            )
-            pipe.watermark.record_attempt(
-                ts=ts,
                 source_id=pipe.source_id(),
                 dest_id=pipe.dest_id(),
-                table=pipe.transport.primary_table(),
-                outcome="retry_later",
-                records=len(batch),
-                bytes_=len(payload),
+                table=table,
+                cursor_after=batch.cursor_after,
+                commit_token=batch.commit_token,
+            )
+            pipe.watermark.record_attempt(
+                ts=ts, source_id=pipe.source_id(), dest_id=pipe.dest_id(),
+                table=table, outcome="retry_later",
+                records=len(batch), bytes_=len(payload),
                 error=outcome.reason or None,
             )
             return
         if outcome.kind == "permanent":
             payload = pipe.transport.serialize_for_retry(batch, pipe.identity)
             pipe.watermark.send_to_dead_letter(
-                ts=ts,
-                pipeline=pipe.name,
+                ts=ts, pipeline=pipe.name,
                 payload_blob=payload,
                 final_error=outcome.reason or "permanent_failure",
             )
             pipe.watermark.record_attempt(
-                ts=ts,
-                source_id=pipe.source_id(),
-                dest_id=pipe.dest_id(),
-                table=pipe.transport.primary_table(),
-                outcome="permanent",
-                records=len(batch),
-                bytes_=None,
+                ts=ts, source_id=pipe.source_id(), dest_id=pipe.dest_id(),
+                table=table, outcome="permanent",
+                records=len(batch), bytes_=None,
                 error=outcome.reason or None,
             )
             return
@@ -387,10 +384,20 @@ class Uploader:
     ) -> None:
         ts = _iso(now)
         if outcome.kind == "acked":
-            # Note: deliverable replay does not advance the cursor — the
-            # cursor was already advanced (or not) on the first attempt;
-            # the deliverable carries its own scope.  This avoids
-            # double-advancing if the original attempt was a partial-ack.
+            # Replay-ack advances the cursor and triggers source cleanup
+            # using the (cursor_after, commit_token) tuple captured at
+            # enqueue time.  This is the correctness path that v1 was
+            # missing: without it, a CH source's cursor would never
+            # advance for a batch that succeeded only on retry.
+            if deliverable.cursor_after:
+                pipe.watermark.advance_cursor(
+                    deliverable.source_id or pipe.source_id(),
+                    deliverable.dest_id or pipe.dest_id(),
+                    deliverable.table or pipe.transport.primary_table(),
+                    cursor=deliverable.cursor_after,
+                    last_ack=ts,
+                )
+            pipe.source.commit(deliverable.commit_token)
             pipe.watermark.record_attempt(
                 ts=ts,
                 source_id=pipe.source_id(),

@@ -38,3 +38,17 @@ class Source(Protocol):
 
     def iter_batches(self, cursor: bytes, limit: int) -> Iterator[RecordBatch]:
         ...
+
+    def commit(self, commit_token: bytes) -> None:
+        """Optional cleanup hook called by the orchestrator after a
+        successful ack.  Sources that work purely by cursor advance
+        (e.g. ``ClickHouseSource``) leave this as a no-op; sources
+        that need to clean up external state — like ``FileTreeSource``
+        deleting acked files — override.
+
+        ``commit_token`` is whatever the source put into the
+        ``RecordBatch.commit_token`` field; opaque to the orchestrator.
+        Called on EITHER first-attempt-ack OR replay-ack of a
+        previously-failed deliverable.
+        """
+        return None
