@@ -105,9 +105,17 @@ def _default_client_factory(cfg: _ConnectionConfig) -> Any:
     )
 
 
+# Operators allowed in ``extra_where`` filters.  Restricted to a known
+# safe set so the column name + operator can be inlined into the SQL
+# without injection risk; values are still passed through parameterized
+# substitution.  Add operators here as concrete needs surface; broader
+# than this should be a separate higher-level filter API.
+_ALLOWED_EXTRA_OPS = {"=", "!=", "<", ">", "<=", ">=", "IN", "NOT IN"}
+
+
 class ClickHouseSource:
     """Yields rows from one ``<database>.<table>`` ordered by
-    ``(time, tiebreak)``.
+    ``(cursor_column, tiebreak)``.
 
     Strict schema check: the source is built with a list of accepted
     schema versions; on first poll it computes the live table's column
@@ -115,6 +123,18 @@ class ClickHouseSource:
     ``hs_uploader.schema``.  Mismatch → health becomes
     ``"stale-schema"`` and the source yields nothing until restarted
     (or until the producer is upgraded).
+
+    The cursor column defaults to ``time``.  Tables whose decode time
+    is non-monotonic across writers (e.g. psk.spots, where ChTailer
+    flushes per-mode batches asynchronously) should pass
+    ``cursor_column="ingested_at"`` so the watermark advances with
+    INSERT order, not with decode-time order.
+
+    ``extra_where`` lets a caller add static filters to the query —
+    e.g. ``[("radiod_id", "=", "my-rx888"), ("mode", "IN", ["ft8",
+    "ft4"])]`` to scope a multi-instance daemon's poll to its own
+    radiod's rows.  Each filter is rendered as ``AND <col> <op>
+    <param>`` with the value passed through CH parameterization.
     """
 
     def __init__(
@@ -125,6 +145,8 @@ class ClickHouseSource:
         accepted_schema_versions: Sequence[int],
         primary_key_columns: Sequence[str],
         select_columns: Optional[Sequence[str]] = None,
+        cursor_column: str = "time",
+        extra_where: Optional[Sequence[tuple[str, str, Any]]] = None,
         config: Optional[_ConnectionConfig] = None,
         client_factory: Optional[Callable[[_ConnectionConfig], Any]] = None,
     ):
@@ -133,6 +155,19 @@ class ClickHouseSource:
         self.accepted_schema_versions = list(accepted_schema_versions)
         self.primary_key_columns = list(primary_key_columns)
         self.select_columns = list(select_columns) if select_columns else None
+        self.cursor_column = cursor_column
+        self.extra_where = list(extra_where) if extra_where else []
+        for col, op, _val in self.extra_where:
+            if op not in _ALLOWED_EXTRA_OPS:
+                raise ValueError(
+                    f"extra_where operator {op!r} not allowed; "
+                    f"supported: {sorted(_ALLOWED_EXTRA_OPS)}"
+                )
+            if not col.replace("_", "").isalnum():
+                # Conservative — column names are inlined into SQL.
+                raise ValueError(
+                    f"extra_where column name {col!r} must be alphanumeric/underscore"
+                )
         self._config = config
         self._client_factory = client_factory or _default_client_factory
         self._client: Any = None
@@ -150,6 +185,8 @@ class ClickHouseSource:
         accepted_schema_versions: Sequence[int],
         primary_key_columns: Sequence[str],
         select_columns: Optional[Sequence[str]] = None,
+        cursor_column: str = "time",
+        extra_where: Optional[Sequence[tuple[str, str, Any]]] = None,
         env: Optional[dict] = None,
         client_factory: Optional[Callable[[_ConnectionConfig], Any]] = None,
     ) -> "ClickHouseSource":
@@ -160,6 +197,8 @@ class ClickHouseSource:
             accepted_schema_versions=accepted_schema_versions,
             primary_key_columns=primary_key_columns,
             select_columns=select_columns,
+            cursor_column=cursor_column,
+            extra_where=extra_where,
             config=cfg,
             client_factory=client_factory,
         )
@@ -238,13 +277,18 @@ class ClickHouseSource:
         records: list[Record] = []
         last_time_iso = cur.time_iso
         last_tiebreak = cur.tiebreak
-        time_idx = col_names.index("__time__")
+        cursor_idx = col_names.index("__cursor__")
         tiebreak_idx = col_names.index("__tiebreak__")
+        # The Record's `time` field comes from the row's `time` column
+        # if present, else the cursor column — Records always carry a
+        # canonical decode timestamp for transports to use, but the
+        # watermark may advance on a different column.
+        time_idx = col_names.index("time") if "time" in col_names else cursor_idx
         for row in rows:
             cols = {
                 name: val
                 for name, val in zip(col_names, row)
-                if name not in ("__time__", "__tiebreak__")
+                if name not in ("__cursor__", "__tiebreak__")
             }
             records.append(
                 Record(
@@ -253,7 +297,7 @@ class ClickHouseSource:
                     columns=cols,
                 )
             )
-            last_time_iso = _format_time(row[time_idx])
+            last_time_iso = _format_time(row[cursor_idx])
             last_tiebreak = int(row[tiebreak_idx])
 
         new_cursor = _Cursor(time_iso=last_time_iso, tiebreak=last_tiebreak).to_bytes()
@@ -264,19 +308,28 @@ class ClickHouseSource:
         select_cols = (
             ", ".join(self.select_columns) if self.select_columns else "*"
         )
-        sql = (
-            f"SELECT {select_cols}, time AS __time__, "
-            f"cityHash64({pk}) AS __tiebreak__ "
-            f"FROM {self.database}.{self.table} "
-            f"WHERE (time, cityHash64({pk})) > (parseDateTime64BestEffort(%(time)s), %(tiebreak)s) "
-            f"ORDER BY time, cityHash64({pk}) "
-            f"LIMIT %(limit)s"
-        )
-        return sql, {
-            "time": cur.time_iso,
+        cursor_col = self.cursor_column
+        params: dict[str, Any] = {
+            "cursor_value": cur.time_iso,
             "tiebreak": cur.tiebreak,
             "limit": int(limit),
         }
+        extra_clauses = []
+        for i, (col, op, value) in enumerate(self.extra_where):
+            param_name = f"extra_{i}"
+            extra_clauses.append(f" AND {col} {op} %({param_name})s")
+            params[param_name] = value
+        sql = (
+            f"SELECT {select_cols}, {cursor_col} AS __cursor__, "
+            f"cityHash64({pk}) AS __tiebreak__ "
+            f"FROM {self.database}.{self.table} "
+            f"WHERE ({cursor_col}, cityHash64({pk})) > "
+            f"(parseDateTime64BestEffort(%(cursor_value)s), %(tiebreak)s)"
+            f"{''.join(extra_clauses)} "
+            f"ORDER BY {cursor_col}, cityHash64({pk}) "
+            f"LIMIT %(limit)s"
+        )
+        return sql, params
 
 
 class _SchemaMismatch(Exception):

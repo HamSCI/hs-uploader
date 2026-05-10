@@ -118,7 +118,7 @@ def test_strict_schema_known_version_yields():
     ]
     client = _make_client(
         rows=rows,
-        col_names=["call", "freq_hz", "__time__", "__tiebreak__"],
+        col_names=["call", "freq_hz", "__cursor__", "__tiebreak__"],
         columns_rows=columns_rows,
     )
     src = ClickHouseSource(
@@ -181,3 +181,157 @@ def test_source_id_format():
         config=None,
     )
     assert src.source_id() == "ch:wspr.spots"
+
+
+# ---- cursor_column ----
+
+def test_cursor_column_defaults_to_time():
+    """Default behavior preserved — clients that don't pass
+    ``cursor_column`` get the original ``ORDER BY time`` query shape."""
+    cfg = _ConnectionConfig(url="http://localhost:8123")
+    columns = [("time", "DateTime"), ("call", "String")]
+    import hashlib
+    h = hashlib.sha256()
+    for n, t in columns:
+        h.update(f"{n}\x00{t}\x00".encode("utf-8"))
+    schema.register("foo.bar", version=1, column_hash=h.hexdigest()[:16])
+
+    captured: dict = {}
+    def fake_query(sql, parameters=None):
+        captured["sql"] = sql
+        captured["params"] = parameters
+        result = MagicMock()
+        if "system.columns" in sql:
+            result.result_rows = columns
+            result.column_names = ["name", "type"]
+        else:
+            result.result_rows = []
+            result.column_names = []
+        return result
+    client = MagicMock()
+    client.query = MagicMock(side_effect=fake_query)
+    src = ClickHouseSource(
+        database="foo", table="bar",
+        accepted_schema_versions=[1],
+        primary_key_columns=["time"],
+        config=cfg, client_factory=lambda c: client,
+    )
+    list(src.iter_batches(b"", limit=10))
+    assert "time AS __cursor__" in captured["sql"]
+    assert "ORDER BY time," in captured["sql"]
+
+
+def test_cursor_column_ingested_at_drives_query():
+    """psk-recorder's lesson: when decode time is non-monotonic across
+    writers, watermark on ``ingested_at`` instead.  The SQL should
+    reflect the chosen column in SELECT, WHERE, and ORDER BY."""
+    cfg = _ConnectionConfig(url="http://localhost:8123")
+    columns = [
+        ("time", "DateTime"), ("ingested_at", "DateTime"), ("call", "String"),
+    ]
+    import hashlib
+    h = hashlib.sha256()
+    for n, t in columns:
+        h.update(f"{n}\x00{t}\x00".encode("utf-8"))
+    schema.register("psk.spots", version=99, column_hash=h.hexdigest()[:16])
+
+    captured: dict = {}
+    def fake_query(sql, parameters=None):
+        captured["sql"] = sql
+        captured["params"] = parameters
+        result = MagicMock()
+        if "system.columns" in sql:
+            result.result_rows = columns
+            result.column_names = ["name", "type"]
+        else:
+            result.result_rows = []
+            result.column_names = []
+        return result
+    client = MagicMock()
+    client.query = MagicMock(side_effect=fake_query)
+    src = ClickHouseSource(
+        database="psk", table="spots",
+        accepted_schema_versions=[99],
+        primary_key_columns=["host_call", "time", "frequency"],
+        cursor_column="ingested_at",
+        config=cfg, client_factory=lambda c: client,
+    )
+    list(src.iter_batches(b"", limit=10))
+    sql = captured["sql"]
+    assert "ingested_at AS __cursor__" in sql
+    assert "WHERE (ingested_at, cityHash64" in sql
+    assert "ORDER BY ingested_at, cityHash64" in sql
+    # Old behaviour must NOT leak — `time AS __cursor__` would mean the
+    # cursor advances on decode time, which is exactly the bug we're
+    # avoiding here.
+    assert "time AS __cursor__" not in sql
+
+
+# ---- extra_where ----
+
+def test_extra_where_filters_render_in_query():
+    cfg = _ConnectionConfig(url="http://localhost:8123")
+    columns = [("time", "DateTime"), ("radiod_id", "String"), ("mode", "String")]
+    import hashlib
+    h = hashlib.sha256()
+    for n, t in columns:
+        h.update(f"{n}\x00{t}\x00".encode("utf-8"))
+    schema.register("psk.spots", version=99, column_hash=h.hexdigest()[:16])
+
+    captured: dict = {}
+    def fake_query(sql, parameters=None):
+        captured["sql"] = sql
+        captured["params"] = parameters
+        result = MagicMock()
+        if "system.columns" in sql:
+            result.result_rows = columns
+            result.column_names = ["name", "type"]
+        else:
+            result.result_rows = []
+            result.column_names = []
+        return result
+    client = MagicMock()
+    client.query = MagicMock(side_effect=fake_query)
+    src = ClickHouseSource(
+        database="psk", table="spots",
+        accepted_schema_versions=[99],
+        primary_key_columns=["time"],
+        extra_where=[
+            ("radiod_id", "=", "my-rx888"),
+            ("tx_call", "!=", ""),
+            ("mode", "IN", ["ft8", "ft4"]),
+        ],
+        config=cfg, client_factory=lambda c: client,
+    )
+    list(src.iter_batches(b"", limit=10))
+    sql = captured["sql"]
+    params = captured["params"]
+    # Each filter renders one AND clause; values flow through params.
+    assert " AND radiod_id = %(extra_0)s" in sql
+    assert " AND tx_call != %(extra_1)s" in sql
+    assert " AND mode IN %(extra_2)s" in sql
+    assert params["extra_0"] == "my-rx888"
+    assert params["extra_1"] == ""
+    assert params["extra_2"] == ["ft8", "ft4"]
+
+
+def test_extra_where_rejects_disallowed_op():
+    with pytest.raises(ValueError, match="extra_where operator"):
+        ClickHouseSource(
+            database="x", table="y",
+            accepted_schema_versions=[1],
+            primary_key_columns=["t"],
+            extra_where=[("col", "LIKE", "%foo%")],
+            config=None,
+        )
+
+
+def test_extra_where_rejects_unsafe_column_name():
+    with pytest.raises(ValueError, match="alphanumeric"):
+        ClickHouseSource(
+            database="x", table="y",
+            accepted_schema_versions=[1],
+            primary_key_columns=["t"],
+            extra_where=[("col; DROP TABLE", "=", "x")],
+            config=None,
+        )
