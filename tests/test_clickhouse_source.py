@@ -335,3 +335,133 @@ def test_extra_where_rejects_unsafe_column_name():
             extra_where=[("col; DROP TABLE", "=", "x")],
             config=None,
         )
+
+
+# ---- start_at ----
+
+
+def _stub_schema_and_client(columns, captured):
+    """Helper: register schema, return a client that captures SQL."""
+    cfg = _ConnectionConfig(url="http://localhost:8123")
+    import hashlib
+    h = hashlib.sha256()
+    for n, t in columns:
+        h.update(f"{n}\x00{t}\x00".encode("utf-8"))
+    schema.register("foo.bar", version=1, column_hash=h.hexdigest()[:16])
+
+    def fake_query(sql, parameters=None):
+        captured.setdefault("sql_history", []).append(sql)
+        captured["params"] = parameters
+        result = MagicMock()
+        if "system.columns" in sql:
+            result.result_rows = columns
+            result.column_names = ["name", "type"]
+        else:
+            result.result_rows = []
+            result.column_names = []
+        return result
+    client = MagicMock()
+    client.query = MagicMock(side_effect=fake_query)
+    return cfg, client
+
+
+def test_start_at_now_skips_history_on_empty_watermark():
+    """An empty watermark + start_at='now' should produce a cursor at
+    'now' rather than epoch.  Bootstrap dup fix: prevents the new
+    uploader from re-shipping every historical row a previous
+    uploader has already shipped."""
+    columns = [("time", "DateTime"), ("call", "String")]
+    captured: dict = {}
+    cfg, client = _stub_schema_and_client(columns, captured)
+    src = ClickHouseSource(
+        database="foo", table="bar",
+        accepted_schema_versions=[1],
+        primary_key_columns=["time"],
+        start_at="now",
+        config=cfg, client_factory=lambda c: client,
+    )
+    before = datetime.now(timezone.utc)
+    list(src.iter_batches(b"", limit=10))
+    after = datetime.now(timezone.utc)
+
+    cursor_iso = captured["params"]["cursor_value"]
+    parsed = datetime.strptime(
+        cursor_iso, "%Y-%m-%d %H:%M:%S.%f"
+    ).replace(tzinfo=timezone.utc)
+    # The cursor format truncates microseconds to milliseconds; allow
+    # a 2 ms slack on either side so the comparison is meaningful.
+    from datetime import timedelta
+    assert before - timedelta(milliseconds=2) <= parsed <= after
+    # Tiebreak is MAX_UINT64 so rows AT exactly cursor_iso are excluded.
+    assert captured["params"]["tiebreak"] == (1 << 64) - 1
+
+
+def test_start_at_specific_datetime_used_verbatim():
+    columns = [("time", "DateTime"), ("call", "String")]
+    captured: dict = {}
+    cfg, client = _stub_schema_and_client(columns, captured)
+    when = datetime(2026, 5, 10, 17, 0, 0, tzinfo=timezone.utc)
+    src = ClickHouseSource(
+        database="foo", table="bar",
+        accepted_schema_versions=[1],
+        primary_key_columns=["time"],
+        start_at=when,
+        config=cfg, client_factory=lambda c: client,
+    )
+    list(src.iter_batches(b"", limit=10))
+    assert captured["params"]["cursor_value"] == "2026-05-10 17:00:00.000"
+    assert captured["params"]["tiebreak"] == (1 << 64) - 1
+
+
+def test_start_at_iso_string_used_verbatim():
+    columns = [("time", "DateTime"), ("call", "String")]
+    captured: dict = {}
+    cfg, client = _stub_schema_and_client(columns, captured)
+    src = ClickHouseSource(
+        database="foo", table="bar",
+        accepted_schema_versions=[1],
+        primary_key_columns=["time"],
+        start_at="2026-05-10 17:00:00.000",
+        config=cfg, client_factory=lambda c: client,
+    )
+    list(src.iter_batches(b"", limit=10))
+    assert captured["params"]["cursor_value"] == "2026-05-10 17:00:00.000"
+
+
+def test_start_at_ignored_when_watermark_non_empty():
+    """The persisted cursor wins.  start_at is only consulted when the
+    incoming cursor is empty — once a watermark exists, restarts should
+    resume from where they left off, not jump forward."""
+    columns = [("time", "DateTime"), ("call", "String")]
+    captured: dict = {}
+    cfg, client = _stub_schema_and_client(columns, captured)
+    src = ClickHouseSource(
+        database="foo", table="bar",
+        accepted_schema_versions=[1],
+        primary_key_columns=["time"],
+        start_at="now",
+        config=cfg, client_factory=lambda c: client,
+    )
+    persisted = _Cursor(
+        time_iso="2026-05-10 12:00:00.000", tiebreak=999,
+    ).to_bytes()
+    list(src.iter_batches(persisted, limit=10))
+    assert captured["params"]["cursor_value"] == "2026-05-10 12:00:00.000"
+    assert captured["params"]["tiebreak"] == 999
+
+
+def test_start_at_default_preserves_epoch_behaviour():
+    """Without start_at, empty watermark still means epoch.
+    Back-compat: existing callers' semantics unchanged."""
+    columns = [("time", "DateTime"), ("call", "String")]
+    captured: dict = {}
+    cfg, client = _stub_schema_and_client(columns, captured)
+    src = ClickHouseSource(
+        database="foo", table="bar",
+        accepted_schema_versions=[1],
+        primary_key_columns=["time"],
+        config=cfg, client_factory=lambda c: client,
+    )
+    list(src.iter_batches(b"", limit=10))
+    assert captured["params"]["cursor_value"] == "1970-01-01 00:00:00.000"
+    assert captured["params"]["tiebreak"] == 0

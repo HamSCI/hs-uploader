@@ -28,8 +28,9 @@ import json
 import logging
 import os
 from dataclasses import dataclass
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Callable, Iterator, Optional, Sequence
+from typing import Any, Callable, Iterator, Optional, Sequence, Union
 
 from ..core import Record, RecordBatch
 from .. import schema as schema_registry
@@ -135,6 +136,16 @@ class ClickHouseSource:
     "ft4"])]`` to scope a multi-instance daemon's poll to its own
     radiod's rows.  Each filter is rendered as ``AND <col> <op>
     <param>`` with the value passed through CH parameterization.
+
+    ``start_at`` controls the cursor when the watermark is empty (first
+    pump for a new (source, dest, table) tuple).  Default behaviour
+    starts from epoch — correct for "ship every historical row" but
+    catastrophic for tables that already have a long history of rows
+    a previous uploader has shipped (the new uploader would re-ship
+    them and cause duplicates upstream).  Set ``start_at="now"`` (or
+    a specific ``datetime`` / ISO string) to skip history and ship
+    only rows arriving after construction.  When the watermark is
+    non-empty, ``start_at`` is ignored — the persisted cursor wins.
     """
 
     def __init__(
@@ -147,6 +158,7 @@ class ClickHouseSource:
         select_columns: Optional[Sequence[str]] = None,
         cursor_column: str = "time",
         extra_where: Optional[Sequence[tuple[str, str, Any]]] = None,
+        start_at: Optional[Union[str, datetime]] = None,
         config: Optional[_ConnectionConfig] = None,
         client_factory: Optional[Callable[[_ConnectionConfig], Any]] = None,
     ):
@@ -156,6 +168,7 @@ class ClickHouseSource:
         self.primary_key_columns = list(primary_key_columns)
         self.select_columns = list(select_columns) if select_columns else None
         self.cursor_column = cursor_column
+        self.start_at = start_at
         self.extra_where = list(extra_where) if extra_where else []
         for col, op, _val in self.extra_where:
             if op not in _ALLOWED_EXTRA_OPS:
@@ -187,6 +200,7 @@ class ClickHouseSource:
         select_columns: Optional[Sequence[str]] = None,
         cursor_column: str = "time",
         extra_where: Optional[Sequence[tuple[str, str, Any]]] = None,
+        start_at: Optional[Union[str, datetime]] = None,
         env: Optional[dict] = None,
         client_factory: Optional[Callable[[_ConnectionConfig], Any]] = None,
     ) -> "ClickHouseSource":
@@ -199,6 +213,7 @@ class ClickHouseSource:
             select_columns=select_columns,
             cursor_column=cursor_column,
             extra_where=extra_where,
+            start_at=start_at,
             config=cfg,
             client_factory=client_factory,
         )
@@ -231,7 +246,15 @@ class ClickHouseSource:
             self._health = HEALTH_UNREACHABLE
             logger.warning("CH source unreachable: %s", exc)
             return iter([])
-        return self._iter_one_batch(_Cursor.from_bytes(cursor), limit)
+        cur = _Cursor.from_bytes(cursor)
+        if not cursor and self.start_at is not None:
+            cur = self._cursor_from_start_at()
+            logger.info(
+                "CH source %s.%s: empty watermark → starting at %s "
+                "(start_at=%r)",
+                self.database, self.table, cur.time_iso, self.start_at,
+            )
+        return self._iter_one_batch(cur, limit)
 
     # ---- internals ----
 
@@ -330,6 +353,25 @@ class ClickHouseSource:
             f"LIMIT %(limit)s"
         )
         return sql, params
+
+    def _cursor_from_start_at(self) -> "_Cursor":
+        """Build the synthetic first-pump cursor from ``self.start_at``.
+
+        Tiebreak is set to MAX_UINT64 so the SQL tuple comparison
+        ``(time, hash) > (start_iso, MAX_UINT64)`` strictly excludes
+        any row whose cursor-column equals ``start_iso`` (cityHash64
+        outputs uint64 ≤ MAX_UINT64).  In effect: "any row that
+        landed strictly after this instant".
+        """
+        sa = self.start_at
+        if isinstance(sa, str) and sa.lower() == "now":
+            iso = _format_time(datetime.now(timezone.utc))
+        elif isinstance(sa, datetime):
+            dt = sa if sa.tzinfo else sa.replace(tzinfo=timezone.utc)
+            iso = _format_time(dt.astimezone(timezone.utc))
+        else:
+            iso = str(sa)
+        return _Cursor(time_iso=iso, tiebreak=(1 << 64) - 1)
 
 
 class _SchemaMismatch(Exception):
