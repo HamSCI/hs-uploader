@@ -1,9 +1,4 @@
-"""hs-uploader transport implementations.
-
-Phase 2 ships the wsprdaemon.org pair (SFTP primary, FTP fallback).
-WsprnetMultipartPost, PskReporterTcp, PswsDigitalRfSftp land in later
-phases.
-"""
+"""hs-uploader transport implementations."""
 
 from .base import Transport
 from .pskreporter import PskReporterTcp
@@ -12,11 +7,13 @@ from .wsprdaemon import (
     WsprdaemonTarSftp,
     build_wsprdaemon_tar,
 )
+from .wsprnet import WsprNet
 
 __all__ = [
     "Transport",
     "PskReporterTcp",
     "WsprdaemonTarSftp",
     "WsprdaemonTarFtp",
+    "WsprNet",
     "build_wsprdaemon_tar",
 ]

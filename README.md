@@ -16,7 +16,8 @@ Active. Sources, transports, and watermark store are all working:
   or keep retention; per-file parsers may return one or many records
   per file).
 - **Transports:** `PskReporterTcp` (owns the socket; no external
-  `pskreporter` dependency), `WsprdaemonTarSftp` / `WsprdaemonTarFtp`.
+  `pskreporter` dependency), `WsprdaemonTarSftp` / `WsprdaemonTarFtp`,
+  `WsprNet` (HTTP multipart POST to `wsprnet.org/meptspots.php`).
 - **Watermark store:** `SqliteWatermarkStore` with deliverable retry +
   per-attempt audit table.
 - **Schema registry:** strict per-version column-hash check; producer

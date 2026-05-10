@@ -96,7 +96,7 @@ class PskReporterTcp:
 
     ACCEPTS = {
         "psk.spots": [2],
-        "wspr.spots": [3],
+        "wspr.spots": [1],
     }
 
     def __init__(

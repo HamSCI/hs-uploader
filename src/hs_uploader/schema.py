@@ -50,6 +50,14 @@ _BUILTINS: dict[str, list[tuple[int, str]]] = {
     # (pin UTC) lands, add a v3 entry with the new hash and update
     # PskReporterTcp.ACCEPTS to include [2, 3] during the transition.
     "psk.spots": [(2, "8ee544049db79fd0")],
+    # wsprdaemon-client v1: 39-column wspr.spots schema vendored
+    # verbatim from wsprdaemon-server@374514ee, defined in sigmond-
+    # clickhouse/schema/wsprdaemon/001_create_spots.sql.  Only
+    # migration in tree as of 2026-05-10.  Bump version when the
+    # upstream schema changes (added columns, type qualifiers) and
+    # update transports that ship from wspr.spots (WsprNet,
+    # WsprdaemonTar*) to accept the new version.
+    "wspr.spots": [(1, "be02c6d53af6ac8c")],
 }
 
 
