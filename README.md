@@ -9,9 +9,21 @@ destination — wsprdaemon.org, wsprnet.org, PSKReporter, PSWS, etc.
 
 ## Status
 
-**Phase 1 — scaffolding and core abstractions.** No transports yet; one
-working `SqliteWatermarkStore` and a `ClickHouseSource`. See the design plan
-for the full phase plan.
+Active. Sources, transports, and watermark store are all working:
+
+- **Sources:** `ClickHouseSource` (preferred, with `cursor_column`,
+  `extra_where`, and `start_at` knobs), `FileTreeSource` (delete-on-ack
+  or keep retention; per-file parsers may return one or many records
+  per file).
+- **Transports:** `PskReporterTcp` (owns the socket; no external
+  `pskreporter` dependency), `WsprdaemonTarSftp` / `WsprdaemonTarFtp`.
+- **Watermark store:** `SqliteWatermarkStore` with deliverable retry +
+  per-attempt audit table.
+- **Schema registry:** strict per-version column-hash check; producer
+  upgrades trigger a clean stale-schema halt rather than data corruption.
+
+Current consumer: `psk-recorder` ships `psk.spots` rows via
+`PskReporterTcp`, behind the `PSK_USE_HS_UPLOADER=1` feature flag.
 
 ## Architecture
 

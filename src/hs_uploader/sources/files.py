@@ -25,17 +25,22 @@ import json
 import logging
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Callable, Iterator, Mapping, Optional, Sequence
+from datetime import datetime, timezone
+from typing import Callable, Iterable, Iterator, Mapping, Optional, Sequence, Union
 
 from ..core import Record, RecordBatch
 
 logger = logging.getLogger(__name__)
 
 
-# Parser callback: (path, raw_bytes) -> Mapping[str, Any].
-# Trivial parsers may return ``{"path": str(path)}``; fancier parsers
-# can decode the file's contents into structured columns.
-ParserFn = Callable[[Path, bytes], Mapping]
+# Parser callback: (path, raw_bytes) -> Mapping or Iterable[Mapping].
+# A single Mapping yields one Record per file (the wsprdaemon shape).
+# An Iterable yields one Record per item — used by sources whose files
+# bundle N rows (e.g. psk-recorder's per-slot spots files: many decoded
+# spots per file, each a separate row at PskReporter).
+# If the mapping has a ``time`` key carrying a datetime, that becomes
+# ``Record.time`` for that row; otherwise the file's mtime is used.
+ParserFn = Callable[[Path, bytes], Union[Mapping, Iterable[Mapping]]]
 
 
 @dataclass
@@ -112,45 +117,61 @@ class FileTreeSource:
             spec = self._spec_for(path)
             if spec is None:
                 continue
-            payload = b""
-            cols: Mapping = {"path": str(path)}
-            if spec.parser is not None:
+            mtime = datetime.fromtimestamp(
+                path.stat().st_mtime, tz=timezone.utc
+            )
+            parsed: Iterable[Mapping]
+            if spec.parser is None:
+                parsed = ({"path": str(path)},)
+            else:
                 try:
                     payload = path.read_bytes()
-                    cols = dict(spec.parser(path, payload))
+                    raw = spec.parser(path, payload)
                 except OSError as exc:
                     logger.warning(
                         "FileTreeSource: cannot read %s: %s", path, exc
                     )
                     continue
-            from datetime import datetime, timezone
-            mtime = datetime.fromtimestamp(
-                path.stat().st_mtime, tz=timezone.utc
-            )
-            records.append(
-                Record(
-                    table=spec.table,
-                    time=mtime,
-                    columns=cols,
-                    payload_path=path,
+                except Exception as exc:  # noqa: BLE001
+                    logger.warning(
+                        "FileTreeSource: parser failed on %s: %s", path, exc
+                    )
+                    continue
+                parsed = (raw,) if isinstance(raw, Mapping) else raw
+
+            for cols_in in parsed:
+                cols = dict(cols_in)
+                row_time = cols.pop("time", None)
+                if not isinstance(row_time, datetime):
+                    row_time = mtime
+                records.append(
+                    Record(
+                        table=spec.table,
+                        time=row_time,
+                        columns=cols,
+                        payload_path=path,
+                    )
                 )
-            )
 
         if not records:
             return
 
         if self.retention == self.DELETE_ON_ACK:
-            commit_token = json.dumps(
-                [str(r.payload_path) for r in records]
-            ).encode("utf-8")
+            # Dedupe — multiple records may share one source file.
+            seen_paths: list[str] = []
+            seen_set: set[str] = set()
+            for r in records:
+                p = str(r.payload_path)
+                if p not in seen_set:
+                    seen_set.add(p)
+                    seen_paths.append(p)
+            commit_token = json.dumps(seen_paths).encode("utf-8")
             cursor_after = b"<delete-on-ack>"
         else:
             commit_token = b""
             # Cursor advances to the latest mtime in the batch.
-            latest_mtime = max(
-                r.payload_path.stat().st_mtime for r in records
-                if r.payload_path is not None
-            )
+            unique_paths = {r.payload_path for r in records if r.payload_path}
+            latest_mtime = max(p.stat().st_mtime for p in unique_paths)
             cursor_after = _encode_keep_cursor(latest_mtime)
 
         yield RecordBatch(
