@@ -217,25 +217,14 @@ class ClickHouseSource:
             self._client = self._client_factory(self._config)
 
     def _fetch_column_hash(self) -> str:
-        # Same shape as sigmond.hamsci_ch.writer's check: hash the
-        # ordered (name, type) tuples from system.columns.  This is
-        # stable across CH versions and across the way each producer
-        # declares its table.
-        rows = self._client.query(
-            "SELECT name, type FROM system.columns "
-            "WHERE database=%(db)s AND table=%(t)s "
-            "ORDER BY position",
-            parameters={"db": self.database, "t": self.table},
-        ).result_rows
-        if not rows:
+        column_hash = schema_registry.compute_column_hash(
+            self._client, self.database, self.table,
+        )
+        if not column_hash:
             raise _SchemaMismatch(
                 f"table {self.database}.{self.table} not found"
             )
-        import hashlib
-        h = hashlib.sha256()
-        for name, typ in rows:
-            h.update(f"{name}\x00{typ}\x00".encode("utf-8"))
-        return h.hexdigest()[:16]
+        return column_hash
 
     def _iter_one_batch(self, cur: _Cursor, limit: int) -> Iterator[RecordBatch]:
         sql, params = self._build_query(cur, limit)
