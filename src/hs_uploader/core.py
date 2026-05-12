@@ -224,6 +224,15 @@ class Uploader:
     * ``pump_until_idle(max_passes)`` — keep calling ``pump()`` until it
       returns ``False`` (or the pass count is hit).  Designed for cron
       use: a single shell invocation drains the queue and exits.
+
+    Optional ``on_batch_outcome`` is a callback invoked after each
+    first-attempt ship (``acked`` / ``partial_ack`` / ``retry_later`` /
+    ``permanent``) with ``(pipeline, batch, outcome)``.  Useful for
+    operator visibility — e.g., the psk-recorder shim uses it to count
+    ``RecordBatch.records`` per-mode (ft8/ft4) for its journal log
+    line, which works uniformly across CH / SQLite / file sources
+    (spool-dir delta counting only worked for the file source).
+    Defaults to no-op; existing callers are unaffected.
     """
 
     def __init__(
@@ -231,9 +240,11 @@ class Uploader:
         pipelines: Sequence[Pipeline],
         *,
         now_fn: _NowFn = time.time,
+        on_batch_outcome: Optional[Callable[["Pipeline", "RecordBatch", "Outcome"], None]] = None,
     ):
         self.pipelines: list[Pipeline] = list(pipelines)
         self._now = now_fn
+        self._on_batch_outcome = on_batch_outcome or (lambda *_a, **_kw: None)
 
     # -- public --
 
@@ -307,6 +318,14 @@ class Uploader:
         outcome: Outcome,
         now: float,
     ) -> None:
+        # Fire the operator-supplied callback up front so it observes
+        # every outcome kind (acked, partial_ack, retry_later, permanent)
+        # uniformly.  Exceptions in user code are swallowed to keep the
+        # pump loop alive — the callback is for visibility, not control.
+        try:
+            self._on_batch_outcome(pipe, batch, outcome)
+        except Exception:  # noqa: BLE001
+            logger.exception("on_batch_outcome callback raised; ignored")
         ts = _iso(now)
         table = pipe.transport.primary_table()
         if outcome.kind == "acked":

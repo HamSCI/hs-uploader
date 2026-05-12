@@ -216,6 +216,69 @@ def test_permanent_failure_dead_letters_immediately(tmp_path, memory_transport):
     assert wm.get_cursor("memory:test", "memory", "test.spots") == b""
 
 
+def test_on_batch_outcome_callback_fires_per_first_attempt(tmp_path, memory_transport):
+    """The optional callback gives the consumer (psk-recorder shim) a
+    per-batch hook to count `RecordBatch.records` so its journal log
+    is accurate regardless of source backend (file / SQLite / CH)."""
+    src = MemorySource(records=_records(5))
+    wm = SqliteWatermarkStore(tmp_path / "wm.db")
+    pipe = Pipeline(
+        name="test", source=src, transport=memory_transport,
+        watermark=wm, identity=_ident(),
+    )
+
+    seen: list[tuple[str, int, str]] = []
+
+    def cb(pipeline, batch, outcome):
+        seen.append((pipeline.name, len(batch.records), outcome.kind))
+
+    up = Uploader([pipe], on_batch_outcome=cb)
+    up.pump()
+
+    assert seen == [("test", 5, "acked")]
+
+
+def test_on_batch_outcome_callback_fires_on_retry_later(tmp_path, memory_transport):
+    """retry_later is a valid first-attempt outcome — the callback
+    must fire so the shim can log "we tried but it's being retried"
+    rather than miss the event entirely."""
+    src = MemorySource(records=_records(2))
+    wm = SqliteWatermarkStore(tmp_path / "wm.db")
+    memory_transport.next_outcomes = [Outcome.retry_later("server hiccup")]
+    pipe = Pipeline(
+        name="test", source=src, transport=memory_transport,
+        watermark=wm, identity=_ident(),
+    )
+
+    seen = []
+    Uploader(
+        [pipe],
+        on_batch_outcome=lambda p, b, o: seen.append(o.kind),
+    ).pump()
+
+    assert seen == ["retry_later"]
+
+
+def test_on_batch_outcome_callback_exception_does_not_break_pump(tmp_path, memory_transport):
+    """A buggy callback must not crash the pump loop — visibility hooks
+    are best-effort, not control flow."""
+    src = MemorySource(records=_records(3))
+    wm = SqliteWatermarkStore(tmp_path / "wm.db")
+    pipe = Pipeline(
+        name="test", source=src, transport=memory_transport,
+        watermark=wm, identity=_ident(),
+    )
+
+    def boom(*_a, **_kw):
+        raise RuntimeError("callback bug")
+
+    up = Uploader([pipe], on_batch_outcome=boom)
+    # Should not raise — the bad callback gets swallowed and logged.
+    assert up.pump() is True
+    # And the underlying batch still acked + advanced the cursor.
+    assert wm.get_cursor("memory:test", "memory", "test.spots") == b"3"
+
+
 def test_retry_policy_delay_for():
     rp = RetryPolicy(base=2.0, cap_sec=60.0, max_attempts=10)
     assert rp.delay_for(0) == 1.0
