@@ -101,10 +101,46 @@ class SqliteWatermarkStore:
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         self._init_schema()
+        # Make the db + its WAL/SHM sidecars group-writable so OTHER
+        # users in the same supplementary group (sigmond) can write
+        # to the same watermark store.  Multiple HamSCI clients
+        # (psk-recorder under pskrec, wsprdaemon-client under
+        # wsprdaemon, ...) share /var/lib/hs-uploader/watermarks.db;
+        # whichever opens it first creates it with the producer's
+        # umask (default 0o644), locking everyone else out with
+        # "sqlite3.OperationalError: attempt to write a readonly
+        # database" — observed on bee1 2026-05-12 during the wspr-
+        # uploader cutover.  Same mitigation pattern as sigmond's
+        # SqliteWriter._chmod_group_writable (sigmond 19a8ba1):
+        # best-effort + silent on PermissionError so a non-owner
+        # caller doesn't crash on every construct.
+        self._chmod_group_writable()
 
     def _init_schema(self) -> None:
         with self._lock, self._conn:
             self._conn.executescript(_SCHEMA_SQL)
+
+    def _chmod_group_writable(self) -> None:
+        """Add group-write bit to the watermark db + its WAL/SHM
+        sidecars.  No-op for ``:memory:``.  Idempotent and silent on
+        PermissionError (non-owner callers leave it to whoever owns
+        the file)."""
+        if self.path == ":memory:":
+            return
+        import stat as _stat
+        for suffix in ("", "-wal", "-shm"):
+            target = self.path + suffix
+            try:
+                st = os.stat(target)
+            except FileNotFoundError:
+                continue
+            new_mode = st.st_mode | _stat.S_IWGRP | _stat.S_IRGRP
+            if new_mode == st.st_mode:
+                continue
+            try:
+                os.chmod(target, new_mode & 0o7777)
+            except (PermissionError, OSError):
+                pass
 
     def close(self) -> None:
         with self._lock:

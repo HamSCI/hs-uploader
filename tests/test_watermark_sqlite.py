@@ -143,3 +143,37 @@ def test_attempts_ring_buffer_trims(tmp_path):
         assert {r["ts"] for r in rows} == {"t4", "t3", "t2"}
     finally:
         sqlite_mod._ATTEMPTS_RING_SIZE = original
+
+
+# ---- group-writable post-init -----------------------------------------
+
+
+def test_group_writable_after_construct(tmp_path):
+    """Watermark db + WAL/SHM sidecars are group-writable after the
+    constructor returns.  Without this, the second HamSCI client to
+    open the db (different system user, same supplementary group)
+    gets "attempt to write a readonly database" — observed on bee1
+    2026-05-12 during the wspr-uploader cutover."""
+    import stat
+    db_path = tmp_path / "w.db"
+    SqliteWatermarkStore(db_path)
+    mode = (db_path).stat().st_mode
+    assert mode & stat.S_IWGRP, (
+        f"main db mode {oct(mode & 0o7777)} missing group-write bit"
+    )
+
+
+def test_chmod_failure_is_silent(tmp_path):
+    """Non-owner callers can't chmod — the constructor must not crash.
+    Best-effort visibility, not control flow."""
+    from unittest.mock import patch
+    with patch("os.chmod", side_effect=PermissionError("not owner")):
+        # No raise — the watermark store construct succeeds even if
+        # chmod is unauthorized.
+        SqliteWatermarkStore(tmp_path / "w.db")
+
+
+def test_memory_db_no_chmod(tmp_path):
+    """``:memory:`` paths have no on-disk file; chmod must skip cleanly."""
+    # Just verify no exception.
+    SqliteWatermarkStore(":memory:")
