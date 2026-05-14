@@ -310,3 +310,210 @@ def test_ftp_falls_through_servers_on_error(tmp_path):
 
     assert outcome.kind == "retry_later"
     assert calls == ["gw1", "gw2"]
+
+
+# ---- SqliteSource (records carrying `columns`) path ----
+
+from hs_uploader.transports.wsprdaemon import (  # noqa: E402
+    build_wsprdaemon_tar_from_records,
+    _format_extended_line,
+    _format_short_line,
+    _derive_geo,
+    _ts_from_iso,
+)
+
+
+def _row_v2(
+    *,
+    band: str = "30",
+    mode: str = "W2",
+    time: str = "2026-05-14T11:58:00Z",
+    callsign: str = "VE7SAR",
+    grid: str = "CN89",
+    freq_hz: int = 10_140_125,
+    snr: int = -22,
+    dt: float = 0.27,
+    drift_hz_per_s: float = 0.0,
+    pwr_dbm: int = 33,
+    sync_quality: float = 0.27,
+    cycles: int = 1,
+    jitter: int = 0,
+    blocksize: int = 1,
+    metric: float = 0.32,
+    decodetype: int = 1,
+    ipass: int = 0,
+    nhardmin: int = 0,
+    pkt_mode: int = 2,
+) -> dict:
+    return {
+        "time": time, "band": band, "mode": mode,
+        "callsign": callsign, "grid": grid,
+        "frequency_hz": freq_hz, "snr_db": snr, "dt": dt,
+        "drift_hz_per_s": drift_hz_per_s, "pwr_dbm": pwr_dbm,
+        "sync_quality": sync_quality,
+        "cycles": cycles, "jitter": jitter, "blocksize": blocksize,
+        "metric": metric, "decodetype": decodetype, "ipass": ipass,
+        "nhardmin": nhardmin, "pkt_mode": pkt_mode,
+        "rx_call": "AC0G/B1", "rx_grid": "EM38ww",
+        "schema_version": 2,
+    }
+
+
+def _record_from_row(row: dict):
+    """SqliteSource yields a Record with columns set and payload_path=None."""
+    from datetime import datetime, timezone
+    return Record(
+        table="wspr.spots",
+        time=datetime.fromisoformat(row["time"].replace("Z", "+00:00")),
+        columns=row,
+        payload_path=None,
+    )
+
+
+def test_loc_to_lat_lon_matches_wd_extend_spots():
+    """Geodesy: parity with wsprdaemon-client/bin/wd-extend-spots.
+
+    EM38ww (AC0G's grid) should give the same lat/lon a v1 lookup
+    produces — see wd-extend-spots._loc_to_lat_lon for the canonical
+    formula.  We use the formula's output as ground truth here so any
+    future drift is visible.
+    """
+    from hs_uploader.transports.wsprdaemon import _loc_to_lat_lon
+    lat, lon = _loc_to_lat_lon("EM38ww")
+    # Known-good values produced by wd-extend-spots' formula for EM38ww:
+    assert abs(lat - 38.9375) < 0.01
+    assert abs(lon - (-92.125)) < 0.01
+
+
+def test_ts_from_iso_round_trip():
+    d, h, fn = _ts_from_iso("2026-05-14T11:58:00Z")
+    assert d == "260514"
+    assert h == "1158"
+    assert fn == "20260514_115800"
+
+
+def test_extended_line_w2_has_34_whitespace_fields():
+    line = _format_extended_line(_row_v2(), rx_call="AC0G/B1", rx_grid="EM38ww")
+    # whitespace-split must yield 34 columns (the extended-format invariant).
+    assert len(line.split()) == 34
+
+
+def test_short_line_f2_has_11_whitespace_fields():
+    line = _format_short_line(_row_v2(mode="F2", pkt_mode=3), w_mode=False)
+    # 11-field MEPT
+    assert len(line.split()) == 11
+    # F-mode line hardcodes drift = 0 (10th field).
+    parts = line.split()
+    assert parts[9] == "0"
+
+
+def test_tar_from_records_layout(tmp_path):
+    rows = [
+        _row_v2(band="30", mode="W2", callsign="VE7SAR"),
+        _row_v2(band="30", mode="W2", callsign="N0STR", time="2026-05-14T11:58:00Z"),
+        _row_v2(band="40", mode="F2", callsign="K2TQC",
+                time="2026-05-14T11:58:00Z", pkt_mode=3),
+    ]
+    records = [_record_from_row(r) for r in rows]
+    blob = build_wsprdaemon_tar_from_records(
+        records,
+        rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_T3FD",
+        rx_site="AC0G=B1_EM38ww",
+    )
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
+        names = set(tf.getnames())
+    assert "wsprdaemon/uploads_config.txt" in names
+    # W-mode rows are grouped into one _wd_spots.txt file
+    assert any(
+        n.startswith("wsprdaemon/spots/AC0G=B1_EM38ww/KA9Q_T3FD/30/")
+        and n.endswith("_W2_20260514_115800_wd_spots.txt")
+        for n in names
+    )
+    # F-mode rows produce a short _spots.txt file
+    assert any(
+        n.startswith("wsprdaemon/spots/AC0G=B1_EM38ww/KA9Q_T3FD/40/")
+        and n.endswith("_F2_20260514_115800_spots.txt")
+        for n in names
+    )
+
+
+def test_tar_from_records_per_band_grouping(tmp_path):
+    """Two W-mode rows from different bands at the same cycle land in
+    separate per-band files, not merged."""
+    records = [
+        _record_from_row(_row_v2(band="30", mode="W2", callsign="A")),
+        _record_from_row(_row_v2(band="40", mode="W2", callsign="B")),
+    ]
+    blob = build_wsprdaemon_tar_from_records(
+        records,
+        rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_T3FD",
+        rx_site="AC0G=B1_EM38ww",
+    )
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
+        bands = sorted(
+            n.split("/")[4] for n in tf.getnames()
+            if n.startswith("wsprdaemon/spots/")
+        )
+    assert bands == ["30", "40"]
+
+
+def test_sftp_ship_via_sqlite_source(tmp_path):
+    """End-to-end: WsprdaemonTarSftp with no spool_root, records carry
+    columns; receiver= is passed; SFTP fakery confirms upload happens."""
+    rows = [_row_v2(callsign="VE7SAR")]
+    records = [_record_from_row(r) for r in rows]
+    batch = RecordBatch(records=tuple(records), cursor_after=b"cursor1")
+
+    transport = WsprdaemonTarSftp(
+        servers=["gw1.example"],
+        receiver="KA9Q_T3FD",
+        # spool_root deliberately omitted — SqliteSource path takes over.
+    )
+
+    captured = {}
+    def fake_run(cmd, **kwargs):
+        captured["cmd"] = cmd
+        captured["stdin"] = kwargs.get("input", b"")
+        result = MagicMock()
+        result.returncode = 0
+        result.stdout = b""
+        result.stderr = b""
+        return result
+
+    with patch("subprocess.run", side_effect=fake_run):
+        outcome = transport.ship(batch, _ident())
+
+    assert outcome.kind == "acked"
+    assert "sftp" in captured["cmd"][0]
+
+
+def test_ship_falls_back_to_acked_when_batch_empty():
+    """No payload_path AND no columns → nothing to do, acked."""
+    transport = WsprdaemonTarSftp(servers=["gw1"], receiver="KA9Q_T3FD")
+    # Record with empty columns + no payload_path: nothing shippable.
+    empty = Record(
+        table="wspr.spots",
+        time=__import__("datetime").datetime.now(
+            tz=__import__("datetime").timezone.utc,
+        ),
+        columns={}, payload_path=None,
+    )
+    batch = RecordBatch(records=(empty,), cursor_after=b"")
+    outcome = transport.ship(batch, _ident())
+    assert outcome.kind == "acked"
+
+
+def test_sqlite_path_requires_receiver_set():
+    """If a SqliteSource record arrives but receiver wasn't configured,
+    surface the misconfiguration as a permanent failure rather than
+    tar-building with a bad arcname."""
+    transport = WsprdaemonTarSftp(servers=["gw1"])  # no receiver=
+    records = [_record_from_row(_row_v2())]
+    batch = RecordBatch(records=tuple(records), cursor_after=b"")
+    outcome = transport.ship(batch, _ident())
+    # Outcome.permanent_failure() sets kind="permanent"; the cause
+    # lives in .reason (not .message).
+    assert outcome.kind == "permanent"
+    assert "receiver=" in outcome.reason
