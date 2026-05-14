@@ -332,6 +332,28 @@ def test_commit_malformed_token_warns_no_delete(seeded: sqlite3.Connection, db_p
     assert n == 1
 
 
+def test_commit_with_delete_disabled_leaves_rows_in_place(
+    seeded: sqlite3.Connection, db_path: Path,
+) -> None:
+    """When two pipelines consume the same logical (database, table)
+    queue — wsprdaemon.org + wsprnet.org both reading wspr.spots —
+    DELETE-on-ack races them.  delete_on_commit=False makes commit() a
+    no-op so a separate retention janitor handles cleanup."""
+    for i in range(3):
+        _insert(seeded, target_db="psk", target_table="spots", payload={"i": i})
+    src = _src(db_path, delete_on_commit=False)
+    batches = list(src.iter_batches(b"", 10))
+    token = batches[0].commit_token
+    assert token  # batch produced a non-empty commit_token
+
+    src.commit(token)
+
+    rows = seeded.execute("SELECT COUNT(*) FROM pending_uploads").fetchone()[0]
+    # All 3 rows still present — the watermark cursor advances but
+    # the queue is untouched.
+    assert rows == 3
+
+
 # ---- start_at -------------------------------------------------------------
 
 

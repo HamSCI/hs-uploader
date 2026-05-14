@@ -181,6 +181,7 @@ class SqliteSource:
         cursor_column: str = "time",  # accepted for API parity; ignored (id is the cursor)
         extra_where: Optional[Sequence[tuple[str, str, Any]]] = None,
         start_at: Optional[Union[str, datetime]] = None,
+        delete_on_commit: bool = True,
         config: Optional[_ConnectionConfig] = None,
         connect_factory: Optional[Callable[[_ConnectionConfig], sqlite3.Connection]] = None,
     ):
@@ -192,6 +193,13 @@ class SqliteSource:
         self._cursor_column_hint = cursor_column
         self._primary_key_columns = list(primary_key_columns)
         self.start_at = start_at
+        # When False, commit() advances the watermark cursor but does NOT
+        # DELETE rows from pending_uploads.  Required when multiple
+        # pipelines consume the same logical (database, table) queue —
+        # e.g. wspr.spots feeding BOTH wsprnet.org and wsprdaemon.org
+        # transports.  In that case rely on a separate retention
+        # janitor (`smd storage trim`) to bound the queue size.
+        self.delete_on_commit = bool(delete_on_commit)
         self.extra_where = list(extra_where) if extra_where else []
         for col, op, _val in self.extra_where:
             if op not in _ALLOWED_EXTRA_OPS:
@@ -228,6 +236,7 @@ class SqliteSource:
         cursor_column: str = "time",
         extra_where: Optional[Sequence[tuple[str, str, Any]]] = None,
         start_at: Optional[Union[str, datetime]] = None,
+        delete_on_commit: bool = True,
         env: Optional[dict] = None,
         connect_factory: Optional[Callable[[_ConnectionConfig], sqlite3.Connection]] = None,
     ) -> "SqliteSource":
@@ -241,6 +250,7 @@ class SqliteSource:
             cursor_column=cursor_column,
             extra_where=extra_where,
             start_at=start_at,
+            delete_on_commit=delete_on_commit,
             config=cfg,
             connect_factory=connect_factory,
         )
@@ -287,14 +297,22 @@ class SqliteSource:
         return self._iter_one_batch(cur, limit)
 
     def commit(self, commit_token: bytes) -> None:
-        """Delete acked rows from `pending_uploads`.
+        """Delete acked rows from `pending_uploads` (when configured to).
 
-        This is the unbounded-growth-prevention mechanism — without it
-        the queue table grows with every shipped row.  Idempotent: rows
-        with id ≤ commit_token are deleted in one transaction; running
-        twice with the same token is a no-op the second time.
+        When ``delete_on_commit=True`` (default): rows with id ≤
+        commit_token are deleted in one transaction.  Idempotent.
+
+        When ``delete_on_commit=False``: this is a no-op — the
+        Uploader's watermark store still advances the cursor so rows
+        already shipped don't re-ship, but the rows themselves stay
+        in pending_uploads for other consumers of the same queue
+        (e.g. the wsprdaemon transport sharing the wspr.spots queue
+        with the wsprnet transport).  A separate retention janitor
+        (`smd storage trim`) must be configured to bound queue size.
         """
         if self._config is None or not commit_token:
+            return
+        if not self.delete_on_commit:
             return
         try:
             last_id = int(commit_token.decode("ascii"))
