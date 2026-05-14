@@ -181,6 +181,20 @@ _W_EXT_FMT = (
 _W_SHORT_FMT = "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d"
 _F_SHORT_FMT = "%-6s %4s %5.1f %3.0f %5.2f %12.7f %-14s %-6s %2d  0 %4d"
 
+# Noise line format — v1's `_compute_noise_line` writes 15 fields:
+#   pre[Pk RMS RMSpk RMStr] tx[Pk RMS RMSpk RMStr] post[Pk RMS RMSpk RMStr]
+#   rms_noise fft_noise overloads
+# The first 12 (sox-derived) fields are not stored in sink.db (only the
+# calibrated rms/fft/overloads survive); we emit 0.00 for them so the
+# wire format stays 15-field-wide and wsprdaemon-server's parser
+# (which keys off fields 13-15) sees what it expects.
+_NOISE_FMT = (
+    "%5.2f %5.2f %5.2f %5.2f "      # pre
+    "%5.2f %5.2f %5.2f %5.2f "      # tx
+    "%5.2f %5.2f %5.2f %5.2f "      # post
+    "%5.2f %5.2f %d"                # rms_noise fft_noise overloads
+)
+
 _ABSENT = -999.0       # wd-extend-spots sentinel for missing geodesy
 
 
@@ -325,6 +339,24 @@ def _format_extended_line(cols: dict, rx_call: str, rx_grid: str) -> str:
     )
 
 
+def _format_noise_line(cols: dict) -> str:
+    """Render a sink.db wspr.noise row → 15-field v1 noise.txt line.
+
+    Sink.db only carries the calibrated values (rms_noise_dbm,
+    fft_noise_dbm, overload_count); the 12 sox-derived stats are
+    zeroed since they weren't captured at producer time.  Server-side
+    parsers historically read fields 13-15 only.
+    """
+    return _NOISE_FMT % (
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        0.0, 0.0, 0.0, 0.0,
+        float(cols.get("rms_noise_dbm") or 0.0),
+        float(cols.get("fft_noise_dbm") or 0.0),
+        int(cols.get("overload_count") or 0),
+    )
+
+
 def _format_short_line(cols: dict, *, w_mode: bool) -> str:
     """Render one row as the 11-field MEPT short line — F-mode form
     for wsprdaemon.org (W-mode short goes to wsprnet via WsprNet
@@ -383,22 +415,38 @@ def build_wsprdaemon_tar_from_records(
     the noise/overload fields which stay 0 until Phase 2 ships the
     in-process noise measurement path.
     """
-    # Group by (band, mode, cycle_ts_filename).  Use the row's `time`
-    # field (cycle end UTC) as the canonical cycle key.
-    groups: dict = {}  # (band, mode, ts_filename) -> list[dict]
+    # Group records by category + bucket key:
+    #   spot records  → (band, mode, ts_filename) → spot rows
+    #   noise records → (band, ts_filename) → noise rows
+    # The row's `r.table` (set by SqliteSource from target_table) tells
+    # us which bucket — "wspr.spots" vs "wspr.noise".  Records without
+    # a `table` attribute are assumed to be spots for back-compat.
+    spot_groups: dict = {}
+    noise_groups: dict = {}
     for r in records:
         cols = getattr(r, "columns", None)
         if not cols:
             continue
+        table = getattr(r, "table", "wspr.spots") or "wspr.spots"
         try:
             band = cols["band"]
-            mode = cols["mode"]
             _, _, ts_filename = _ts_from_iso(cols["time"])
         except (KeyError, ValueError):
             logger.warning("wsprdaemon-tar: skipping malformed row: %r",
                            list(cols.keys()) if cols else cols)
             continue
-        groups.setdefault((band, mode, ts_filename), []).append(cols)
+        if table == "wspr.noise":
+            # One noise row per (band, cycle); last write wins inside
+            # a single batch (shouldn't happen but be defensive).
+            noise_groups[(band, ts_filename)] = cols
+        else:
+            try:
+                mode = cols["mode"]
+            except KeyError:
+                logger.warning("wsprdaemon-tar: spot row missing `mode`: %r",
+                               list(cols.keys()))
+                continue
+            spot_groups.setdefault((band, mode, ts_filename), []).append(cols)
 
     buf = io.BytesIO()
     with tarfile.open(fileobj=buf, mode="w:bz2") as tf:
@@ -410,7 +458,7 @@ def build_wsprdaemon_tar_from_records(
                 tf, "wsprdaemon/client_upload_info.txt",
                 _client_info_bytes(reporter_id, pubkey),
             )
-        for (band, mode, ts_filename), rows in groups.items():
+        for (band, mode, ts_filename), rows in spot_groups.items():
             is_w = mode.startswith("W")
             if is_w:
                 lines = [_format_extended_line(r, rx_call, rx_grid)
@@ -423,6 +471,14 @@ def build_wsprdaemon_tar_from_records(
             filename = f"{receiver}_{band}_{mode}_{ts_filename}{suffix}"
             arcname = (
                 f"wsprdaemon/spots/{rx_site}/{receiver}/{band}/{filename}"
+            )
+            _tar_add_bytes(tf, arcname, content)
+        for (band, ts_filename), row in noise_groups.items():
+            content = (_format_noise_line(row) + "\n").encode()
+            # Filename: <RECEIVER>_<BAND>_<YYYYMMDD>_<HHMMSS>_noise.txt
+            filename = f"{receiver}_{band}_{ts_filename}_noise.txt"
+            arcname = (
+                f"wsprdaemon/noise/{rx_site}/{receiver}/{band}/{filename}"
             )
             _tar_add_bytes(tf, arcname, content)
     return buf.getvalue()

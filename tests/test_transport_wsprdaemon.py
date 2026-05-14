@@ -505,6 +505,87 @@ def test_ship_falls_back_to_acked_when_batch_empty():
     assert outcome.kind == "acked"
 
 
+def _noise_row(
+    *,
+    band: str = "30",
+    time: str = "2026-05-14T11:58:00Z",
+    rms_noise_dbm: float = -85.5,
+    fft_noise_dbm: float = -148.3,
+    overload_count: int = 0,
+) -> dict:
+    return {
+        "time": time, "band": band,
+        "rms_noise_dbm": rms_noise_dbm,
+        "fft_noise_dbm": fft_noise_dbm,
+        "overload_count": overload_count,
+        "rx_call": "AC0G/B1", "rx_grid": "EM38ww",
+        "schema_version": 1,
+    }
+
+
+def _noise_record(row: dict):
+    from datetime import datetime
+    return Record(
+        table="wspr.noise",
+        time=datetime.fromisoformat(row["time"].replace("Z", "+00:00")),
+        columns=row,
+        payload_path=None,
+    )
+
+
+def test_noise_line_has_15_whitespace_fields():
+    """v1's `_compute_noise_line` writes 15 columns; emit the same."""
+    from hs_uploader.transports.wsprdaemon import _format_noise_line
+    line = _format_noise_line(_noise_row())
+    assert len(line.split()) == 15
+    # Field 13 = rms_noise_dbm; field 14 = fft_noise_dbm.
+    parts = line.split()
+    assert abs(float(parts[12]) - (-85.5)) < 0.01
+    assert abs(float(parts[13]) - (-148.3)) < 0.01
+    assert parts[14] == "0"
+
+
+def test_tar_from_records_includes_noise_files(tmp_path):
+    """Mixed batch (spots + noise) lands them in their respective
+    arcnames: wsprdaemon/spots/... and wsprdaemon/noise/..."""
+    records = [
+        _record_from_row(_row_v2(band="30", mode="W2", callsign="VE7SAR")),
+        _noise_record(_noise_row(band="30")),
+        _noise_record(_noise_row(band="40", rms_noise_dbm=-90.2)),
+    ]
+    blob = build_wsprdaemon_tar_from_records(
+        records,
+        rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_T3FD",
+        rx_site="AC0G=B1_EM38ww",
+    )
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
+        names = sorted(tf.getnames())
+    # Two noise arcnames under wsprdaemon/noise/.../<band>/
+    noise_arcs = [n for n in names if n.startswith("wsprdaemon/noise/")]
+    assert len(noise_arcs) == 2
+    assert any("/30/" in n and n.endswith("_noise.txt") for n in noise_arcs)
+    assert any("/40/" in n and n.endswith("_noise.txt") for n in noise_arcs)
+    # Spot arcname still present.
+    assert any(n.startswith("wsprdaemon/spots/") for n in names)
+
+
+def test_noise_only_batch_produces_only_noise_tar(tmp_path):
+    """A batch with no spot rows (just noise) is valid — produces a
+    noise-only tar.  wsprdaemon.org accepts it."""
+    records = [_noise_record(_noise_row())]
+    blob = build_wsprdaemon_tar_from_records(
+        records,
+        rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_T3FD",
+        rx_site="AC0G=B1_EM38ww",
+    )
+    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
+        names = tf.getnames()
+    assert any(n.startswith("wsprdaemon/noise/") for n in names)
+    assert not any(n.startswith("wsprdaemon/spots/") for n in names)
+
+
 def test_sqlite_path_requires_receiver_set():
     """If a SqliteSource record arrives but receiver wasn't configured,
     surface the misconfiguration as a permanent failure rather than
