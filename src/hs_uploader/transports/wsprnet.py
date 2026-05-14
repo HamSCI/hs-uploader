@@ -181,20 +181,46 @@ _HASH_UNRESOLVED = "<...>"
 
 
 def _record_to_mept(record) -> Optional[str]:
-    """Render one ``wspr.spots`` row as an MEPT text line.
+    """Render one ``wspr.spots`` row as a wsprnet.org MEPT line.
 
-    Returns None for rows that are not shippable (no callsign / no
-    frequency / unresolved-hash placeholder).  The Pipeline still
-    advances the watermark past these — they're silently filtered,
-    not failures.
+    Wire-compliant with v1 wsprdaemon-client/bin/wd-upload-wsprnet:
+    byte-identical lines for the same source data.  Format strings
+    match wd-decode's awk-printf at line 345 (W-mode) and 466 (F-mode)
+    exactly:
+
+      W2 mode (wsprd):
+        "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d"
+        date  time sync  snr   dt    freq        call         grid  pwr drift ntype
+
+      F2/F5/F15/F30 modes (jt9):
+        "%-6s %4s %5.1f %3.0f %5.2f %12.7f %-14s %-6s %2d  0 %4d"
+        (sync is float-but-integer-valued; drift hardcoded "0";
+         snr is %3.0f because jt9 outputs float-valued integers)
+
+    Accepts BOTH schema shapes:
+      * legacy ClickHouse / file row: tx_sign, frequency_mhz, snr,
+        power, drift, code, tx_loc
+      * v2 sink.db / wspr-recorder ``spot_to_row`` row: callsign,
+        frequency_hz, snr_db, pwr_dbm, drift_hz_per_s, pkt_mode, grid
+
+    Filter rules (matching v1 wd-upload-wsprnet._has_hash_callsign):
+      * "<...>" literal unresolved-hash placeholder is dropped.
+      * "<CALLSIGN>" angle-bracketed RESOLVED callsigns PASS THROUGH —
+        wsprnet.org accepts them; the server strips brackets.
+
+    Bug fix 2026-05-14: prior versions only knew the legacy field
+    names AND used loose `%d`/`%.1f` formatting.  v2 sink.db records
+    produced empty bodies (silent acked) AND for legacy records the
+    on-the-wire format diverged from v1's bytes.  Both fixed here.
     """
     cols = record.columns or {}
-    call = (cols.get("tx_sign") or cols.get("tx_call") or "").strip()
+    call = (cols.get("tx_sign") or cols.get("tx_call")
+            or cols.get("callsign") or "").strip()
     if not call or call == _HASH_UNRESOLVED:
         return None
     freq_mhz = cols.get("frequency_mhz")
     if freq_mhz is None:
-        freq_hz = cols.get("frequency")
+        freq_hz = cols.get("frequency") or cols.get("frequency_hz")
         if not freq_hz:
             return None
         freq_mhz = float(freq_hz) / 1_000_000.0
@@ -207,31 +233,40 @@ def _record_to_mept(record) -> Optional[str]:
     date_str = t.strftime("%y%m%d")
     time_str = t.strftime("%H%M")
 
-    sync = _int_or_zero(cols.get("sync_quality"))
-    snr = _int_or_zero(cols.get("snr"))
+    sync = _float_or_zero(cols.get("sync_quality"))    # NOT int — v1 prints %.Nf
+    # snr: take it as a float so the F-mode %3.0f path also works.
+    raw_snr = cols.get("snr") if cols.get("snr") is not None else cols.get("snr_db")
+    snr = _float_or_zero(raw_snr)
     dt = _float_or_zero(cols.get("dt"))
-    power = _int_or_zero(cols.get("power"))
-    drift = _int_or_zero(cols.get("drift"))
-    ntype = _int_or_zero(cols.get("code"))
+    power = _int_or_zero(cols.get("power") if cols.get("power") is not None
+                         else cols.get("pwr_dbm"))
+    # drift: legacy is integer Hz/min; v2 sink.db carries Hz/s float.
+    # MEPT wants integer Hz/min — multiply v2's Hz/s by 60.
+    if cols.get("drift") is not None:
+        drift = _int_or_zero(cols.get("drift"))
+    elif cols.get("drift_hz_per_s") is not None:
+        drift = int(round(float(cols.get("drift_hz_per_s") or 0.0) * 60.0))
+    else:
+        drift = 0
+    ntype = _int_or_zero(cols.get("code") if cols.get("code") is not None
+                         else cols.get("pkt_mode"))
     grid = (cols.get("tx_loc") or cols.get("grid") or "").strip()
 
-    fields = [
-        date_str,
-        time_str,
-        f"{sync:d}",
-        f"{snr:d}",
-        f"{dt:.1f}",
-        f"{freq_mhz:.6f}",
-        call,
-    ]
-    if grid:
-        fields.append(grid)
-    fields.extend([
-        f"{power:d}",
-        f"{drift:d}",
-        f"{ntype:d}",
-    ])
-    return " ".join(fields)
+    # Mode-aware format — W2 (pkt_mode=2) vs F-modes (pkt_mode>=3).
+    # `mode` column ("W2", "F2", "F5", ...) takes precedence; fall
+    # back to ntype/pkt_mode (2 is W2, anything else F-family).
+    mode_token = (cols.get("mode") or "").strip().upper()
+    is_w_mode = (mode_token.startswith("W") if mode_token
+                 else (ntype == 2))
+    if is_w_mode:
+        # v1 wd-decode line 345 (W-mode short format):
+        return ("%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d"
+                % (date_str, time_str, sync, int(snr), dt, freq_mhz,
+                   call, grid, power, drift, ntype))
+    # v1 wd-decode line 466 (F-mode short format — drift hardcoded 0):
+    return ("%-6s %4s %5.1f %3.0f %5.2f %12.7f %-14s %-6s %2d  0 %4d"
+            % (date_str, time_str, sync, snr, dt, freq_mhz,
+               call, grid, power, ntype))
 
 
 def _mept_sort_key(line: str) -> tuple:

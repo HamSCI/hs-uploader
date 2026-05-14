@@ -41,7 +41,7 @@ def _spot(
     dt=0.2,
     power=23,
     drift=0,
-    code=1,
+    code=2,    # 2 = WSPR-2 (W-mode); was 1 before but no real WSPR mode is 1
 ):
     return Record(
         table="wspr.spots",
@@ -64,18 +64,26 @@ def _spot(
 
 
 def test_record_to_mept_renders_canonical_line():
+    """Byte-identical W-mode format vs v1 wd-decode line 345:
+       "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d"
+    """
     line = _record_to_mept(_spot())
-    assert line == "260507 0042 1 -22 0.2 18.106073 KC1KOP FN41 23 0 1"
+    assert line == (
+        "260507 0042  1.00 -22  0.20   18.1060730 KC1KOP         FN41   23  0    2"
+    )
 
 
 def test_record_to_mept_drops_grid_when_absent():
     """Compound calls (e.g. ``W1/AJ8S``) frequently have no grid;
-    wsprnet's MEPT format omits the grid field rather than embeds an
-    empty placeholder.  Matches what wd-upload-wsprnet reads from the
-    short ``_spots.txt`` files."""
+    v1 still emits the grid field as left-padded empty (6 chars wide)
+    matching wd-decode's `%-6s` format — wsprnet.org tolerates an
+    empty grid column.  Drop-in compatibility means we emit the
+    same wire bytes, not a different shape."""
     line = _record_to_mept(_spot(tx_sign="W1/AJ8S", tx_loc="", snr=-16,
-                                 dt=0.8, freq_mhz=18.106155, code=1))
-    assert line == "260507 0042 1 -16 0.8 18.106155 W1/AJ8S 23 0 1"
+                                 dt=0.8, freq_mhz=18.106155, code=2))
+    assert line == (
+        "260507 0042  1.00 -16  0.80   18.1061550 W1/AJ8S               23  0    2"
+    )
 
 
 def test_record_to_mept_skips_unresolved_hash():
@@ -86,6 +94,84 @@ def test_record_to_mept_skips_unresolved_hash():
 
 def test_record_to_mept_skips_missing_call():
     assert _record_to_mept(_spot(tx_sign="")) is None
+
+
+def _v2_spot(
+    *,
+    when=datetime(2026, 5, 7, 0, 42, tzinfo=timezone.utc),
+    callsign="KC1KOP",
+    grid="FN41",
+    freq_hz=18_106_073,
+    sync_quality=1.0,
+    snr_db=-22,
+    dt=0.2,
+    pwr_dbm=23,
+    drift_hz_per_s=0.0,
+    pkt_mode=2,
+    mode="W2",
+):
+    """v2 sink.db row shape (wspr-recorder's `spot_to_row` output)."""
+    return Record(
+        table="wspr.spots",
+        time=when,
+        columns={
+            "callsign":       callsign,
+            "grid":           grid,
+            "frequency_hz":   freq_hz,
+            "sync_quality":   sync_quality,
+            "snr_db":         snr_db,
+            "dt":             dt,
+            "pwr_dbm":        pwr_dbm,
+            "drift_hz_per_s": drift_hz_per_s,
+            "pkt_mode":       pkt_mode,
+            "mode":           mode,
+        },
+    )
+
+
+def test_v2_schema_row_renders_same_wire_bytes():
+    """Regression: v2 sink.db row (callsign / frequency_hz / snr_db /
+    pwr_dbm / drift_hz_per_s / pkt_mode / mode) must produce identical
+    wire bytes to the equivalent legacy row.  Before this fix, v2
+    rows produced empty bodies (silent acked) because the transport
+    only knew the legacy field names — wsprnet.org received nothing
+    after the Pipeline-v2 cutover."""
+    legacy = _spot()
+    v2 = _v2_spot()
+    assert _record_to_mept(legacy) == _record_to_mept(v2)
+
+
+def test_v2_drift_hz_per_s_converted_to_hz_per_min():
+    """Producer stores drift as Hz/s float; wire format wants Hz/min
+    integer.  Multiply by 60 and round."""
+    r = _v2_spot(drift_hz_per_s=0.1)   # 0.1 Hz/s = 6 Hz/min
+    line = _record_to_mept(r)
+    # The drift field is the 10th whitespace-token in W-mode output.
+    parts = line.split()
+    assert parts[9] == "6"
+
+
+def test_v2_fmode_uses_jt9_format():
+    """F-mode (FST4W) rows use a different format: %5.1f for sync
+    (one decimal) and %3.0f for snr (zero decimals), drift hardcoded
+    to 0.  Matches v1 wd-decode line 466."""
+    r = _v2_spot(mode="F2", pkt_mode=3,
+                 sync_quality=77.0, snr_db=-1, freq_hz=10_140_101)
+    line = _record_to_mept(r)
+    # F-mode wire format from v1:
+    #   "260514 1158  77.0  -1  0.20   10.1401010 KC1KOP         FN41   23  0    3"
+    assert line == (
+        "260507 0042  77.0  -1  0.20   10.1401010 KC1KOP         FN41   23  0    3"
+    )
+
+
+def test_v2_bracketed_resolved_callsign_passes_through():
+    """Type-3 hash-resolved calls like ``<AK4MI>`` are valid spots
+    (v1 wd-upload-wsprnet._has_hash_callsign drops only ``<...>``).
+    The brackets ride on the wire; wsprnet.org's server strips them."""
+    r = _v2_spot(callsign="<AK4MI>")
+    line = _record_to_mept(r)
+    assert "<AK4MI>" in line
 
 
 def test_record_to_mept_falls_back_to_frequency_hz():
@@ -289,7 +375,10 @@ def test_serialize_for_retry_is_byte_stable():
     t = WsprNet()
     blob = t.serialize_for_retry(batch, _ident())
     assert blob == t._build_mept_body(batch.records)  # noqa: SLF001
-    assert blob.startswith(b"260507 0042 1 -22 0.2 18.106073 KC1KOP FN41")
+    # v1 wd-decode line-345 wire format — byte-identical match.
+    assert blob.startswith(
+        b"260507 0042  1.00 -22  0.20   18.1060730 KC1KOP         FN41"
+    )
 
 
 def test_replay_posts_the_stored_blob_verbatim():
