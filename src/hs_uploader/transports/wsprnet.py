@@ -151,27 +151,50 @@ class WsprNet:
                 status = getattr(resp, "status", 200)
                 response_body = resp.read().decode(errors="replace")
         except urllib.error.HTTPError as exc:
+            # HTTP 4xx/5xx: server received our request and chose to
+            # reject.  Per policy (operator @rrobinett 2026-05-14):
+            # `hs_uploader should only retry upload spots if there is
+            # a curl error.  whatever wsprnet reports in a successful
+            # curl transfer, hs-uploader should never retry them` — so
+            # ack the batch (advance watermark, no retry).  Retrying
+            # would just resend identical payload to the same server
+            # for the same rejection; better to move on to fresh spots.
             response_body = ""
             try:
                 response_body = exc.read().decode(errors="replace")
             except Exception:  # noqa: BLE001
                 pass
-            return Outcome.retry_later(
-                f"wsprnet: HTTP {exc.code} — {response_body[:200]}"
+            return Outcome(
+                kind="acked",
+                reason=f"HTTP {exc.code} (no retry): {response_body[:200]}",
             )
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            # Network-level failure (no HTTP response received) — retry.
             return Outcome.retry_later(f"wsprnet: network error — {exc}")
 
         if not (200 <= status < 300):
-            return Outcome.retry_later(
-                f"wsprnet: HTTP {status} — {response_body[:200]}"
+            # Defensive — _urlopen normally raises HTTPError for non-2xx,
+            # but if a custom opener delivers the response object instead,
+            # apply the same no-retry policy as the HTTPError branch.
+            return Outcome(
+                kind="acked",
+                reason=f"HTTP {status} (no retry): {response_body[:200]}",
             )
         # The server returns plain text along the lines of
-        # ``200 OK <n> spots added``.  Treat any 2xx as success; the
-        # exact count isn't load-bearing here (the watermark already
-        # encodes which rows we've shipped).  Bad-format bodies show
-        # up in the deliverables audit log via ``response_body[:200]``.
-        return Outcome.acked()
+        # ``N out of M spot(s) added``.  We still treat any 2xx as
+        # success (the watermark advances regardless — duplicates and
+        # silently-dropped rows aren't worth retrying), but stash the
+        # "N out of M" count in Outcome.reason so the on_batch_outcome
+        # callback can log the true acceptance rate.  Without this the
+        # operator sees `shipped wsprnet=900` in the journal while
+        # wsprnet may have actually added only ~38 of them (the rest
+        # dropped as duplicates or hitting MAX_SPOTS_PER_UPLOAD
+        # truncation).  Observed on B4-100 2026-05-14 — production was
+        # POSTing 900-spot batches but only ~38% were added per body.
+        import re
+        m = re.search(r"(\d+)\s+out\s+of\s+(\d+)\s+spot", response_body)
+        reason = f"{m.group(1)}/{m.group(2)} added" if m else ""
+        return Outcome(kind="acked", reason=reason)
 
 
 # ----- record → MEPT line -----
