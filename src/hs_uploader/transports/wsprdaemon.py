@@ -511,6 +511,7 @@ class WsprdaemonTarSftp:
         upload_id: Optional[str] = None,
         name: Optional[str] = None,
         receiver: Optional[str] = None,
+        fallback_ftp: Optional["WsprdaemonTarFtp"] = None,
     ):
         self.servers = list(servers)
         self.spool_root = Path(spool_root) if spool_root else None
@@ -525,6 +526,12 @@ class WsprdaemonTarSftp:
         # forms the per-band tar-arcname segment.  The legacy file path
         # derives it from the spool_root directory layout instead.
         self.receiver = receiver
+        # Optional FTP fallback used only when every SFTP server fails
+        # (typically first-time bootstrap before the gateway has the
+        # reporter's pubkey).  When wired, the FTP path includes
+        # ``client_upload_info.txt`` so the gateway can auto-provision
+        # SFTP access for the next cycle.
+        self.fallback_ftp = fallback_ftp
 
     # -- Transport protocol --
 
@@ -547,7 +554,15 @@ class WsprdaemonTarSftp:
         if tar_bytes is None:
             return Outcome.acked()       # nothing to ship in this batch
         tar_name = self._tar_name(identity)
-        return self._upload_tar(tar_bytes, tar_name, identity)
+        outcome = self._upload_tar(tar_bytes, tar_name, identity)
+        if outcome.kind == "retry_later" and self.fallback_ftp is not None:
+            logger.warning(
+                "WsprdaemonTarSftp: all SFTP servers failed — "
+                "attempting FTP fallback (will include client_upload_info.txt "
+                "so the gateway can auto-provision SFTP for the next cycle)"
+            )
+            return self.fallback_ftp.ship(batch, identity)
+        return outcome
 
     def serialize_for_retry(self, batch: RecordBatch, identity) -> bytes:
         # Rebuild deterministically so a replay re-sends bit-identical bytes.
@@ -591,6 +606,15 @@ class WsprdaemonTarSftp:
         return None
 
     def replay(self, payload_blob: bytes, identity) -> Outcome:
+        # NB: replay's payload_blob is whatever ``serialize_for_retry``
+        # produced when the deliverable was first queued — an SFTP-flavor
+        # tar without ``client_upload_info.txt``.  We deliberately do NOT
+        # chain to ``fallback_ftp.replay`` here: handing an SFTP-flavor
+        # blob to FTP would bypass the gateway's auto-provisioning hook
+        # (the whole point of the FTP fallback is to deliver
+        # ``client_upload_info.txt``).  The FTP fallback only fires from
+        # ``ship()``, where the batch is still available to rebuild a
+        # proper FTP-shaped tar.
         tar_name = self._tar_name(identity)
         return self._upload_tar(payload_blob, tar_name, identity)
 
@@ -770,7 +794,15 @@ class WsprdaemonTarFtp:
         between FileTreeSource records (payload_path) and SqliteSource
         records (columns).  FTP path always includes client_info."""
         rx_site = _build_rx_site(identity.call, identity.grid)
-        client_info = (identity.call, identity.public_key())
+        # reporter_id must be a valid Linux username (the gateway runs
+        # ``useradd $reporter_id`` to provision SFTP).  Apply the same
+        # ``/`` → ``_`` transform that WsprdaemonTarSftp._sftp_user uses
+        # so the linux user the gateway creates exactly matches the
+        # SFTP login user the client will later try to authenticate as.
+        reporter_id = (
+            identity.call.replace("/", "_") if identity.call else "wsprdaemon"
+        )
+        client_info = (reporter_id, identity.public_key())
         paths = [r.payload_path for r in batch.records if getattr(r, "payload_path", None)]
         col_records = [r for r in batch.records
                        if getattr(r, "columns", None)
