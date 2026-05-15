@@ -245,23 +245,77 @@ class Uploader:
         self.pipelines: list[Pipeline] = list(pipelines)
         self._now = now_fn
         self._on_batch_outcome = on_batch_outcome or (lambda *_a, **_kw: None)
+        # Per-pipeline dedicated executor (max_workers=1) so each
+        # pipeline's pump always runs on the same worker thread.  This
+        # is required because SqliteSource holds a sqlite3.Connection
+        # that's pinned to its creator thread — bouncing across pool
+        # workers raises ProgrammingError.  A persistent thread per
+        # pipeline also lets us run the SFTP-to-wsprdaemon and
+        # HTTP-to-wsprnet uploads in parallel (the user-stated goal),
+        # since each pump iteration submits one task per pipeline to
+        # its own executor and joins them at the end.
+        from concurrent.futures import ThreadPoolExecutor
+        self._pump_executors: list[ThreadPoolExecutor] = [
+            ThreadPoolExecutor(
+                max_workers=1,
+                thread_name_prefix=f"hs-uploader-{p.name}",
+            )
+            for p in self.pipelines
+        ]
+
+    def close(self) -> None:
+        for ex in getattr(self, "_pump_executors", []):
+            ex.shutdown(wait=False)
 
     # -- public --
 
     def pump(self) -> bool:
-        did_work = False
-        for pipe in self.pipelines:
-            drained = self._drain_deliverables(pipe)
-            did_work |= drained
-            # Don't drain the source while deliverables are queued —
-            # the cursor hasn't advanced, so a fresh source pull would
-            # re-ship the same records the deliverable already owns.
-            # Wait for the in-flight batch to ack (or dead-letter)
-            # before pulling the next slice.
-            if pipe.watermark.deliverable_count(pipe.name) > 0:
-                continue
-            did_work |= self._drain_source(pipe)
-        return did_work
+        # Parallel pipeline drain.  Each pipeline owns its own source,
+        # transport, and watermark store — no shared mutable state
+        # between them — so they can run concurrently.  This matters
+        # most when one pipeline is slow (e.g., wsprdaemon-tar's SFTP
+        # round-trip vs. wsprnet's HTTP POST): without parallelism the
+        # 60 s pump interval can be eaten by one pipeline's network
+        # latency, starving the others.
+        #
+        # Per-pipeline state isolation:
+        #   - SqliteWatermarkStore opens a fresh connection per call
+        #     (thread-safe).
+        #   - SqliteSource keeps a sqlite3.Connection pinned to its
+        #     creator thread; we honor that by giving each pipeline a
+        #     dedicated single-worker executor (see __init__).
+        #   - Transports hold per-instance buffers but are not shared.
+        # The on_batch_outcome callback IS shared — caller must make it
+        # thread-safe if it mutates state (see hs_uploader_shim's
+        # callback which uses simple += under the GIL).
+        if len(self.pipelines) <= 1:
+            # Skip the executor hop for the one-pipeline case.
+            did_work = False
+            for pipe in self.pipelines:
+                did_work |= self._pump_one(pipe)
+            return did_work
+
+        futures = [
+            ex.submit(self._pump_one, pipe)
+            for ex, pipe in zip(self._pump_executors, self.pipelines)
+        ]
+        # Join all (don't short-circuit) so every pipeline gets its turn
+        # this pump.  any() on a generator of f.result() would still
+        # block until each future completes, but using a list keeps the
+        # ordering deterministic and the intent obvious.
+        return any(f.result() for f in futures)
+
+    def _pump_one(self, pipe: "Pipeline") -> bool:
+        """Drain one pipeline (deliverables first, then source)."""
+        did_work = self._drain_deliverables(pipe)
+        # Don't drain the source while deliverables are queued —
+        # the cursor hasn't advanced, so a fresh source pull would
+        # re-ship the same records the deliverable already owns.
+        # Wait for the in-flight batch to ack (or dead-letter)
+        # before pulling the next slice.
+        if pipe.watermark.deliverable_count(pipe.name) > 0:
+            return did_work
+        return did_work | self._drain_source(pipe)
 
     def pump_until_idle(self, max_passes: int = 100) -> int:
         passes = 0
