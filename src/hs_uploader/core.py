@@ -299,11 +299,19 @@ class Uploader:
             ex.submit(self._pump_one, pipe)
             for ex, pipe in zip(self._pump_executors, self.pipelines)
         ]
-        # Join all (don't short-circuit) so every pipeline gets its turn
-        # this pump.  any() on a generator of f.result() would still
-        # block until each future completes, but using a list keeps the
-        # ordering deterministic and the intent obvious.
-        return any(f.result() for f in futures)
+        # Materialise every future's result BEFORE folding with any().
+        # `any(f.result() for f in futures)` short-circuits the moment the
+        # first future returns True, leaving the slower pipelines still
+        # running in their executors while pump() returns.  The shim's
+        # ``shipped wsprdaemon=N wsprnet=M`` log line fires right after
+        # pump() returns, so any pipeline that hadn't yet completed when
+        # the short-circuit triggered shows zero in that pump's tally
+        # even though its records were ack'd a few seconds later.
+        # Observed B4-100 2026-05-15: wsprnet=0 logged at 13:22:34.229
+        # while wsprnet's on_batch_outcome fired at 13:22:37.743 with
+        # 38/38 added — the actual ship was healthy, the log lied.
+        results = [f.result() for f in futures]
+        return any(results)
 
     def _pump_one(self, pipe: "Pipeline") -> bool:
         """Drain one pipeline (deliverables first, then source)."""
