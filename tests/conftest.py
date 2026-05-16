@@ -1,8 +1,8 @@
 """Shared test fixtures for hs-uploader.
 
-The tests deliberately avoid network: ClickHouseSource is exercised
-through a stub client factory; transports are mocked via in-memory
-implementations.
+The tests deliberately avoid network and external services: sources are
+exercised against temp files / in-memory SQLite, and transports are
+mocked via in-memory implementations.
 """
 
 from __future__ import annotations

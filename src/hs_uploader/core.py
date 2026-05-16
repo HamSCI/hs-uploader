@@ -47,8 +47,8 @@ class Record:
     is the routing key transports use to decide whether they accept this
     record (see ``Transport.ACCEPTS``).
 
-    `time` is the canonical observation time in UTC.  It is what the CH
-    source orders by and what the watermark cursor is keyed on.
+    `time` is the canonical observation time in UTC — the timestamp
+    transports stamp onto outgoing records.
 
     `columns` is a row-shaped payload (str → JSON-compatible value) for
     spot transports.  ``payload_path`` is set instead for dataset-shaped
@@ -230,7 +230,7 @@ class Uploader:
     ``permanent``) with ``(pipeline, batch, outcome)``.  Useful for
     operator visibility — e.g., the psk-recorder shim uses it to count
     ``RecordBatch.records`` per-mode (ft8/ft4) for its journal log
-    line, which works uniformly across CH / SQLite / file sources
+    line, which works uniformly across SQLite / file sources
     (spool-dir delta counting only worked for the file source).
     Defaults to no-op; existing callers are unaffected.
     """
@@ -468,7 +468,7 @@ class Uploader:
             # Replay-ack advances the cursor and triggers source cleanup
             # using the (cursor_after, commit_token) tuple captured at
             # enqueue time.  This is the correctness path that v1 was
-            # missing: without it, a CH source's cursor would never
+            # missing: without it, a source's cursor would never
             # advance for a batch that succeeded only on retry.
             if deliverable.cursor_after:
                 pipe.watermark.advance_cursor(

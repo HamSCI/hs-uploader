@@ -41,10 +41,10 @@ class Source(Protocol):
 
     def commit(self, commit_token: bytes) -> None:
         """Optional cleanup hook called by the orchestrator after a
-        successful ack.  Sources that work purely by cursor advance
-        (e.g. ``ClickHouseSource``) leave this as a no-op; sources
-        that need to clean up external state — like ``FileTreeSource``
-        deleting acked files — override.
+        successful ack.  Sources that work purely by cursor advance can
+        leave this as a no-op; sources that need to clean up external
+        state — ``SqliteSource`` deleting acked queue rows,
+        ``FileTreeSource`` deleting acked files — override.
 
         ``commit_token`` is whatever the source put into the
         ``RecordBatch.commit_token`` field; opaque to the orchestrator.

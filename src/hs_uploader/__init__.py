@@ -12,7 +12,6 @@ See README.md / the design plan for architecture.  Public API:
   subpackages.
 """
 
-from . import schema
 from .config import StationIdentity
 from .core import (
     BatchPolicy,
@@ -35,6 +34,5 @@ __all__ = [
     "RetryPolicy",
     "StationIdentity",
     "Uploader",
-    "schema",
     "__version__",
 ]

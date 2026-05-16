@@ -221,7 +221,7 @@ def _record_to_mept(record) -> Optional[str]:
          snr is %3.0f because jt9 outputs float-valued integers)
 
     Accepts BOTH schema shapes:
-      * legacy ClickHouse / file row: tx_sign, frequency_mhz, snr,
+      * legacy / file-source row: tx_sign, frequency_mhz, snr,
         power, drift, code, tx_loc
       * v2 sink.db / wspr-recorder ``spot_to_row`` row: callsign,
         frequency_hz, snr_db, pwr_dbm, drift_hz_per_s, pkt_mode, grid

@@ -27,7 +27,6 @@ dependencies = [
 ]
 
 [project.optional-dependencies]
-clickhouse  = ["clickhouse-connect>=0.7"]
 psws        = []
 wsprnet     = []
 wsprdaemon  = []

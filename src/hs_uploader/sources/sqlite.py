@@ -1,10 +1,10 @@
 """SQLite source — reads from `sigmond.hamsci_ch.SqliteWriter`'s
 `pending_uploads` queue.
 
-Mirrors `ClickHouseSource`'s role and shape: yields `RecordBatch`es
+This is hs-uploader's database source: it yields `RecordBatch`es
 starting strictly after the supplied opaque cursor, with strict
-schema-version checking.  Drop-in replacement on hosts that have
-flipped to SQLite via `smd storage migrate-to-sqlite`.
+schema-version checking.  `sigmond.hamsci_ch.Writer.from_env()` stages
+rows into this queue by default (`/var/lib/sigmond/sink.db`).
 
 Pipeline shape::
 
@@ -27,13 +27,11 @@ Opaque bytes; internally an ASCII decimal integer encoding the last
 consumed ``id``.  Empty cursor (``b""``) means "from the beginning of
 the queue" — translated to ``0``.
 
-Schema-version handling differs from CH
----------------------------------------
+Schema-version handling
+-----------------------
 
-The CH source can compute a column hash over the live table and look
-that up against `hs_uploader.schema._BUILTINS`.  SQLite payloads are
-JSON, so there is no "table schema" to hash — but every row carries
-the producer's `schema_version` int.  Strict mode here is:
+SQLite payloads are JSON, so there is no "table schema" to hash — but
+every row carries the producer's `schema_version` int.  Strict mode is:
 
 1. SELECT filters on `schema_version IN (accepted_schema_versions)`.
 2. If any row exists with a non-accepted schema_version, health is
@@ -44,11 +42,10 @@ the producer's `schema_version` int.  Strict mode here is:
 -------------
 
 `[("radiod_id", "=", "my-rx888"), ("mode", "IN", ["ft8","ft4"])]`
-is rendered against `json_extract(payload_json, '$.<col>')` so
-multi-instance scoping works the same way it does on CH.  The same
-restricted operator set applies as in the CH source — values pass
-through SQLite parameterization, column names are validated alnum
-before being inlined.
+is rendered against `json_extract(payload_json, '$.<col>')` so a
+multi-instance host can scope a pipeline to one producer.  Values
+pass through SQLite parameterization; column names are validated
+alnum before being inlined.
 
 `start_at`
 ----------
@@ -124,8 +121,8 @@ class _ConnectionConfig:
         """Resolve from coordination.env.
 
         Returns ``None`` (→ no-op source) when neither `SIGMOND_SQLITE_PATH`
-        is set nor the default sink db exists.  Matches the no-op semantics
-        of the CH source when no `SIGMOND_CLICKHOUSE_URL` is set.
+        is set nor the default sink db exists — the standalone-safe no-op
+        that mirrors `sigmond.hamsci_ch.Writer.from_env()`.
         """
         e = env if env is not None else os.environ
         path = (e.get("SIGMOND_SQLITE_PATH") or "").strip()
@@ -164,10 +161,8 @@ class SqliteSource:
     single watermark store can host cursors for many sources without
     collision.
 
-    Construction args mirror `ClickHouseSource` for shim-side
-    symmetry.  CH-specific args (`cursor_column`, `primary_key_columns`)
-    are accepted but ignored — `id` is the natural monotone cursor and
-    SQLite needs no tiebreak hash.
+    The queue's autoincrement `id` is the natural monotone cursor, so
+    there is no cursor-column or tiebreak-hash configuration to supply.
     """
 
     def __init__(
@@ -176,9 +171,7 @@ class SqliteSource:
         table: str,
         *,
         accepted_schema_versions: Sequence[int],
-        primary_key_columns: Sequence[str] = (),  # accepted for API parity; ignored
         select_columns: Optional[Sequence[str]] = None,
-        cursor_column: str = "time",  # accepted for API parity; ignored (id is the cursor)
         extra_where: Optional[Sequence[tuple[str, str, Any]]] = None,
         start_at: Optional[Union[str, datetime]] = None,
         delete_on_commit: bool = True,
@@ -189,9 +182,6 @@ class SqliteSource:
         self.table = table
         self.accepted_schema_versions = list(accepted_schema_versions)
         self.select_columns = list(select_columns) if select_columns else None
-        # CH-isms accepted for API parity, retained for diagnostics only.
-        self._cursor_column_hint = cursor_column
-        self._primary_key_columns = list(primary_key_columns)
         self.start_at = start_at
         # When False, commit() advances the watermark cursor but does NOT
         # DELETE rows from pending_uploads.  Required when multiple
@@ -215,10 +205,9 @@ class SqliteSource:
         self._connect_factory = connect_factory or _default_connect_factory
         self._conn: Optional[sqlite3.Connection] = None
         self._schema_checked = False
-        # Synthetic-cursor cache for start_at.  Unlike CH's time-based
-        # start_at (stable across calls), SQLite's max(id) anchor would
-        # drift on every empty poll, silently skipping rows that
-        # arrived between polls.  Cache once at first evaluation.
+        # Synthetic-cursor cache for start_at.  The max(id) anchor would
+        # drift on every empty poll, silently skipping rows that arrived
+        # between polls — so cache it once at first evaluation.
         self._start_at_cursor: Optional[_Cursor] = None
         self._health = HEALTH_NOOP if config is None else HEALTH_OK
 
@@ -231,9 +220,7 @@ class SqliteSource:
         table: str,
         *,
         accepted_schema_versions: Sequence[int],
-        primary_key_columns: Sequence[str] = (),
         select_columns: Optional[Sequence[str]] = None,
-        cursor_column: str = "time",
         extra_where: Optional[Sequence[tuple[str, str, Any]]] = None,
         start_at: Optional[Union[str, datetime]] = None,
         delete_on_commit: bool = True,
@@ -245,9 +232,7 @@ class SqliteSource:
             database=database,
             table=table,
             accepted_schema_versions=accepted_schema_versions,
-            primary_key_columns=primary_key_columns,
             select_columns=select_columns,
-            cursor_column=cursor_column,
             extra_where=extra_where,
             start_at=start_at,
             delete_on_commit=delete_on_commit,
@@ -478,10 +463,10 @@ class SqliteSource:
     def _extract_record_time(self, payload: dict, queued_at: str) -> datetime:
         """Pick the canonical observation time for the Record.
 
-        Convention matches CH: prefer a `time` field in the payload
-        (the producer's decode timestamp), fall back to `queued_at`
-        (the writer's wallclock at flush time) when absent.  Both are
-        ISO 8601 strings produced by sqlite_writer's `_json_default`.
+        Prefer a `time` field in the payload (the producer's decode
+        timestamp), fall back to `queued_at` (the writer's wallclock at
+        flush time) when absent.  Both are ISO 8601 strings produced by
+        sqlite_writer's `_json_default`.
         """
         for key in ("time", "decode_time", "utc"):
             v = payload.get(key)
@@ -500,9 +485,8 @@ class SqliteSource:
     def _project_columns(self, payload: dict) -> dict:
         """If select_columns was provided, restrict to that subset.
 
-        Mirrors CH's `SELECT cols, ...` behaviour from the consumer's
-        point of view — transports get the same column projection
-        regardless of backend.
+        Gives transports a stable column projection regardless of what
+        extra fields the producer happened to stage in the payload.
         """
         if not self.select_columns:
             return dict(payload)
