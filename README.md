@@ -15,7 +15,10 @@ Active. Sources, transports, and watermark store are all working:
 - **Sources:** `SqliteSource` (preferred — reads
   `sigmond.hamsci_ch.SqliteWriter`'s `pending_uploads` queue, with
   `extra_where` and `start_at` knobs and a strict `schema_version`
-  check), `FileTreeSource` (delete-on-ack or keep retention; per-file
+  check), `WsprCycleSource` (cycle-aligned variant over the same
+  queue — yields one `RecordBatch` per 2-minute WSPR cycle, bundling
+  `wspr.spots` and `wspr.noise` for a single per-cycle tar),
+  `FileTreeSource` (delete-on-ack or keep retention; per-file
   parsers may return one or many records per file).
 - **Transports:** `PskReporterTcp` (owns the socket; no external
   `pskreporter` dependency), `WsprdaemonTarSftp` / `WsprdaemonTarFtp`,
@@ -47,7 +50,8 @@ Current consumer: `psk-recorder` ships `psk.spots` rows via
 Three orthogonal abstractions:
 
 - **Source** — yields `Record`s starting from an opaque cursor.
-  `SqliteSource` is preferred; `FileTreeSource` is the fallback.
+  `SqliteSource` is preferred (`WsprCycleSource` is its cycle-aligned
+  variant for wsprdaemon.org tars); `FileTreeSource` is the fallback.
 - **Transport** — accepts a batch and reports an `Outcome` (acked, partial-ack,
   retry-later, dead). One per upstream destination.
 - **WatermarkStore** — owns per-`(source, destination, table)` cursor and
