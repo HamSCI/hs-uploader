@@ -512,6 +512,7 @@ class WsprdaemonTarSftp:
         name: Optional[str] = None,
         receiver: Optional[str] = None,
         fallback_ftp: Optional["WsprdaemonTarFtp"] = None,
+        primary_table_name: str = "wspr.spots",
     ):
         self.servers = list(servers)
         self.spool_root = Path(spool_root) if spool_root else None
@@ -526,6 +527,12 @@ class WsprdaemonTarSftp:
         # forms the per-band tar-arcname segment.  The legacy file path
         # derives it from the spool_root directory layout instead.
         self.receiver = receiver
+        # The "primary" logical table this transport's watermark is keyed
+        # on.  Defaults to "wspr.spots" for backward compat with the old
+        # single-table SqliteSource pipeline; pass "wspr.cycle" when wired
+        # behind a WsprCycleSource so the cycle-aligned watermark gets a
+        # distinct key.  See sources/wspr_cycle.py for the rationale.
+        self._primary_table = primary_table_name
         # Optional FTP fallback used only when every SFTP server fails
         # (typically first-time bootstrap before the gateway has the
         # reporter's pubkey).  When wired, the FTP path includes
@@ -536,12 +543,10 @@ class WsprdaemonTarSftp:
     # -- Transport protocol --
 
     def primary_table(self) -> str:
-        # Spots + noise both flow through the same pipeline; the
-        # cursor key is the spots table (the noise side has its own
-        # source/cursor in v1 if a caller chooses to set it up that
-        # way, but the typical wsprdaemon pipeline binds one source
-        # that yields both file kinds).
-        return "wspr.spots"
+        # Caller-configurable so a cycle-aligned source (WsprCycleSource)
+        # can park its watermark on "wspr.cycle" rather than colliding
+        # with the table-keyed pipelines that read raw rows.
+        return self._primary_table
 
     def batch_policy(self) -> BatchPolicy:
         return BatchPolicy(max_records=10_000)
@@ -553,7 +558,7 @@ class WsprdaemonTarSftp:
             return Outcome.permanent_failure(f"tar build failed: {exc}")
         if tar_bytes is None:
             return Outcome.acked()       # nothing to ship in this batch
-        tar_name = self._tar_name(identity)
+        tar_name = self._tar_name(identity, batch=batch)
         outcome = self._upload_tar(tar_bytes, tar_name, identity)
         if outcome.kind == "retry_later" and self.fallback_ftp is not None:
             logger.warning(
@@ -625,12 +630,21 @@ class WsprdaemonTarSftp:
             return self.sftp_user_override
         return identity.call.replace("/", "_") if identity.call else "wsprdaemon"
 
-    def _tar_name(self, identity) -> str:
-        ts = time.strftime("%y%m%d_%H%M_%S", time.gmtime())
+    def _tar_name(self, identity, batch: Optional[RecordBatch] = None) -> str:
+        # Cycle-aligned tar name when batch.records are available:
+        # ``<upload_id>_YYMMDD_HHMM.tbz`` derived from the records'
+        # WSPR cycle time.  This gives one stable name per cycle so
+        # concurrent pipeline pumps can't collide on the SFTP side.
+        # Falls back to upload-time only when no records are available
+        # (replay path, or empty batch).
         upload_id = (
             self.upload_id
             or (identity.call.replace("/", "_") if identity.call else "wsprdaemon")
         )
+        if batch is not None and batch.records:
+            ts = batch.records[0].time.strftime("%y%m%d_%H%M")
+        else:
+            ts = time.strftime("%y%m%d_%H%M_%S", time.gmtime())
         return f"{upload_id}_{ts}.tbz"
 
     def _upload_tar(
@@ -783,7 +797,7 @@ class WsprdaemonTarFtp:
             return Outcome.permanent_failure(f"tar build failed: {exc}")
         if tar_bytes is None:
             return Outcome.acked()
-        return self._upload(tar_bytes, self._tar_name(identity))
+        return self._upload(tar_bytes, self._tar_name(identity, batch=batch))
 
     def serialize_for_retry(self, batch: RecordBatch, identity) -> bytes:
         tar_bytes = self._build_tar(batch, identity)
@@ -842,12 +856,16 @@ class WsprdaemonTarFtp:
             return self.ftp_password_file.read_text().strip()
         return self.ftp_password or ""
 
-    def _tar_name(self, identity) -> str:
-        ts = time.strftime("%y%m%d_%H%M_%S", time.gmtime())
+    def _tar_name(self, identity, batch: Optional[RecordBatch] = None) -> str:
+        # Same cycle-aligned tar name policy as WsprdaemonTarSftp.
         upload_id = (
             self.upload_id
             or (identity.call.replace("/", "_") if identity.call else "wsprdaemon")
         )
+        if batch is not None and batch.records:
+            ts = batch.records[0].time.strftime("%y%m%d_%H%M")
+        else:
+            ts = time.strftime("%y%m%d_%H%M_%S", time.gmtime())
         return f"{upload_id}_{ts}.tbz"
 
     def _upload(self, tar_bytes: bytes, tar_name: str) -> Outcome:
