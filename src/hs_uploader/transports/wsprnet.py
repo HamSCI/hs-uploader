@@ -73,12 +73,23 @@ class WsprNet:
         upload_timeout_sec: float = 300.0,
         urlopen=None,
         name: Optional[str] = None,
+        max_spots_per_upload: int = MAX_SPOTS_PER_UPLOAD,
     ):
         self.url = url
         self.version = version
         self.upload_timeout_sec = upload_timeout_sec
         self._urlopen = urlopen or urllib.request.urlopen
         self.name = name or f"wsprnet:{url}"
+        # Caller-controlled batch ceiling so an operator can opt into
+        # per-spot POSTs (``max_spots_per_upload=1``) for diagnostic
+        # tracking — wsprnet's "M out of N added" response then
+        # answers per-spot rather than per-batch.  Default 999 matches
+        # the legacy ``wd-upload-wsprnet`` behaviour.
+        if max_spots_per_upload < 1:
+            max_spots_per_upload = 1
+        if max_spots_per_upload > MAX_SPOTS_PER_UPLOAD:
+            max_spots_per_upload = MAX_SPOTS_PER_UPLOAD
+        self._max_spots_per_upload = max_spots_per_upload
 
     # -- Transport protocol --
 
@@ -86,7 +97,7 @@ class WsprNet:
         return "wspr.spots"
 
     def batch_policy(self) -> BatchPolicy:
-        return BatchPolicy(max_records=MAX_SPOTS_PER_UPLOAD)
+        return BatchPolicy(max_records=self._max_spots_per_upload)
 
     def ship(self, batch: RecordBatch, identity) -> Outcome:
         body = self._build_mept_body(batch.records)
