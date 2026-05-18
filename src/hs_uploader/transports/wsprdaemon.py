@@ -58,6 +58,19 @@ COMPRESSION_ZSTD = "zstd"
 COMPRESSION_BZ2  = "bz2"
 
 
+# Phase 2 PR 5 also flipped the tar root from `wsprdaemon/` to `wspr/`
+# (modes as peers, not WSPR-specific service nesting). The
+# wsprdaemon-server PR accepts BOTH roots on the read side — but only
+# AFTER the wd{10,20,30} processes have been restarted with the new
+# code. Producers shipping to a wd still running the old daemon must
+# stay on `wsprdaemon/` or the daemon silently drops the spots
+# (its `spots_root.exists()` check returns False on `wspr/spots/...`).
+#
+# Knob: `WSPRDAEMON_TAR_ROOT=wspr` (new, default) or `wsprdaemon` (legacy).
+TAR_ROOT_NEW    = "wspr"
+TAR_ROOT_LEGACY = "wsprdaemon"
+
+
 def _compress_tar_bytes(raw: bytes, *, compression: str, level: int) -> bytes:
     """Compress an in-memory uncompressed tar.
 
@@ -128,19 +141,22 @@ def _tar_add_bytes(tf: tarfile.TarFile, arcname: str, data: bytes) -> None:
     tf.addfile(ti, io.BytesIO(data))
 
 
-def _arcname_for(path: Path, root: Path, rx_site: str) -> str:
+def _arcname_for(path: Path, root: Path, rx_site: str,
+                 *, tar_root: str = TAR_ROOT_NEW) -> str:
     """Map a queued file's path under ``root`` to the canonical
     server-expected arcname under the Phase 2 layout.
 
-    Input: ``<root>/<RECEIVER>/<BAND>/[noise/]<filename>``.
-    Output:
-      * spots: ``wspr/spots/RX_SITE/RECEIVER/BAND/<filename>``
-      * noise: ``wspr/noise/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_noise.txt``
+    `tar_root` selects which top-level dir name is used:
+      * "wspr"       (Phase 2 default) — modes as peers at the tar root.
+      * "wsprdaemon" (legacy)          — for shipping to a wd* whose
+        wsprdaemon-server process hasn't picked up the dual-root patch
+        yet.  Both produce server-identical content; only the leading
+        path component differs.
     """
     try:
         rel = path.relative_to(root)
     except ValueError:
-        return f"wspr/{path.name}"
+        return f"{tar_root}/{path.name}"
     parts = rel.parts
     is_noise = path.name.endswith("_noise.txt")
 
@@ -154,14 +170,13 @@ def _arcname_for(path: Path, root: Path, rx_site: str) -> str:
             )
         else:
             ts_name = path.name
-        return f"wspr/noise/{rx_site}/{receiver}/{band}/{ts_name}"
+        return f"{tar_root}/noise/{rx_site}/{receiver}/{band}/{ts_name}"
 
     if not is_noise and len(parts) >= 3:
         receiver, band = parts[0], parts[1]
-        return f"wspr/spots/{rx_site}/{receiver}/{band}/{path.name}"
+        return f"{tar_root}/spots/{rx_site}/{receiver}/{band}/{path.name}"
 
-    # Fallback: copy under wspr/ preserving the relative tail.
-    return f"wspr/{rel.as_posix()}"
+    return f"{tar_root}/{rel.as_posix()}"
 
 
 def build_wsprdaemon_tar(
@@ -173,6 +188,7 @@ def build_wsprdaemon_tar(
     client_info: Optional[tuple[str, str]] = None,
     compression: str = COMPRESSION_ZSTD,
     compression_level: int = 9,
+    tar_root: str = TAR_ROOT_NEW,
 ) -> bytes:
     """Return an in-memory compressed tar of the Phase 2 wsprdaemon shape.
 
@@ -194,7 +210,8 @@ def build_wsprdaemon_tar(
                 _client_info_bytes(reporter_id, pubkey),
             )
         for path in paths:
-            arcname = _arcname_for(path, root=root, rx_site=rx_site)
+            arcname = _arcname_for(path, root=root, rx_site=rx_site,
+                                    tar_root=tar_root)
             try:
                 tf.add(str(path), arcname=arcname, recursive=False)
             except OSError as exc:
@@ -499,6 +516,7 @@ def build_wsprdaemon_tar_from_records(
     client_info: Optional[tuple[str, str]] = None,
     compression: str = COMPRESSION_ZSTD,
     compression_level: int = 9,
+    tar_root: str = TAR_ROOT_NEW,
 ) -> bytes:
     """Build a Phase 2 wsprdaemon tar from sink.db-style records.
 
@@ -594,13 +612,13 @@ def build_wsprdaemon_tar_from_records(
                 suffix = "_spots.txt"
             content = ("\n".join(lines) + "\n").encode()
             filename = f"{receiver}_{band}_{mode}_{ts_filename}{suffix}"
-            arcname = f"wspr/spots/{rx_site}/{receiver}/{band}/{filename}"
+            arcname = f"{tar_root}/spots/{rx_site}/{receiver}/{band}/{filename}"
             _tar_add_bytes(tf, arcname, content)
         for (band, ts_filename), row in noise_groups.items():
             content = (_format_noise_line(row) + "\n").encode()
             # Filename: <RECEIVER>_<BAND>_<YYYYMMDD>_<HHMMSS>_noise.txt
             filename = f"{receiver}_{band}_{ts_filename}_noise.txt"
-            arcname = f"wspr/noise/{rx_site}/{receiver}/{band}/{filename}"
+            arcname = f"{tar_root}/noise/{rx_site}/{receiver}/{band}/{filename}"
             _tar_add_bytes(tf, arcname, content)
         for (mode, band, cycle), rows in psk_groups.items():
             psk_receiver = (rows[0].get("receiver") or receiver)
@@ -654,6 +672,7 @@ class WsprdaemonTarSftp:
         primary_table_name: str = "wspr.spots",
         compression: str = COMPRESSION_ZSTD,
         compression_level: int = 9,
+        tar_root: str = TAR_ROOT_NEW,
     ):
         self.servers = list(servers)
         self.spool_root = Path(spool_root) if spool_root else None
@@ -664,6 +683,7 @@ class WsprdaemonTarSftp:
         self.version = version
         self.upload_id = upload_id
         self.name = name or f"wsprdaemon-tar-sftp:{','.join(servers)}"
+        self.tar_root = tar_root
         # Compression knobs. zstd-9 is the post-PR-5 default after the
         # B4-100 benchmark; bz2 stays selectable for hosts shipping to
         # an older wsprdaemon-server build.
@@ -739,6 +759,7 @@ class WsprdaemonTarSftp:
                 version=self.version,
                 compression=self.compression,
                 compression_level=self.compression_level,
+                tar_root=self.tar_root,
             )
         if col_records:
             if not self.receiver:
@@ -757,6 +778,7 @@ class WsprdaemonTarSftp:
                 version=self.version,
                 compression=self.compression,
                 compression_level=self.compression_level,
+                tar_root=self.tar_root,
             )
         return None
 
@@ -918,6 +940,7 @@ class WsprdaemonTarFtp:
         receiver: Optional[str] = None,
         compression: str = COMPRESSION_ZSTD,
         compression_level: int = 9,
+        tar_root: str = TAR_ROOT_NEW,
     ):
         self.servers = list(servers)
         self.spool_root = Path(spool_root) if spool_root else None
@@ -940,6 +963,7 @@ class WsprdaemonTarFtp:
         # same wire format the server would have received via SFTP.
         self.compression = compression
         self.compression_level = int(compression_level)
+        self.tar_root = tar_root
 
     def primary_table(self) -> str:
         return "wspr.spots"
@@ -987,6 +1011,7 @@ class WsprdaemonTarFtp:
                 client_info=client_info,
                 compression=self.compression,
                 compression_level=self.compression_level,
+                tar_root=self.tar_root,
             )
         if col_records:
             if not self.receiver:
@@ -1004,6 +1029,7 @@ class WsprdaemonTarFtp:
                 client_info=client_info,
                 compression=self.compression,
                 compression_level=self.compression_level,
+                tar_root=self.tar_root,
             )
         return None
 
