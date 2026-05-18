@@ -196,6 +196,15 @@ class Pipeline:
     retry: RetryPolicy = field(default_factory=RetryPolicy)
     fallback_transport: Optional["Transport"] = None
     batch_limit: int = 1000
+    # Per-pump record budget across multiple batches.  Default ``None``
+    # preserves the historical "one batch per pump-pass" cadence —
+    # safe for sources with batch_limit-sized batches (typically
+    # 30-1000 records).  Set explicitly when batches are deliberately
+    # small (e.g. wsprnet diagnostic mode with one spot per POST):
+    # the orchestrator then drains the source until ``max_records_per_pump``
+    # records have shipped or the source is exhausted, instead of
+    # stopping after one batch.
+    max_records_per_pump: Optional[int] = None
 
     def source_id(self) -> str:
         return self.source.source_id()
@@ -356,22 +365,59 @@ class Uploader:
         return any_attempted
 
     def _drain_source(self, pipe: Pipeline) -> bool:
-        """Pull a fresh batch from the source and ship it."""
-        cursor = pipe.watermark.get_cursor(
-            pipe.source_id(), pipe.dest_id(), pipe.transport.primary_table()
-        )
-        for batch in pipe.source.iter_batches(
-            cursor=cursor,
-            limit=min(pipe.batch_limit, pipe.transport.batch_policy().max_records),
-        ):
-            if not batch.records:
-                continue
-            outcome = pipe.transport.ship(batch, pipe.identity)
-            now = self._now()
-            self._handle_first_attempt(pipe, batch, outcome, now)
-            # Stop after one batch per pump-pass to keep cadence bounded.
-            return True
-        return False
+        """Pull batches from the source and ship them, up to the
+        pipeline's per-pump record budget.
+
+        Historical behaviour (``max_records_per_pump is None``): ship
+        ONE batch then return.  Keeps the pump cadence predictable for
+        large-batch transports — one wsprdaemon tar per pump, one
+        wsprnet POST of up to 999 spots per pump, etc.
+
+        Drain-mode (``max_records_per_pump`` set): keep shipping
+        batches until either the budget is exhausted or
+        ``iter_batches`` runs out of work.  Designed for small-batch
+        diagnostic modes (e.g. ``WsprNet(max_spots_per_upload=1)`` —
+        one spot per POST) where the historical one-batch-per-pump
+        cap would crater throughput to 1 record / pump-interval and
+        the queue would grow without bound.
+
+        The drain loop re-queries ``iter_batches`` between iterations
+        because the watermark advances inside ``_handle_first_attempt``
+        — the next call sees the next slice of pending work.
+        """
+        budget = pipe.max_records_per_pump
+        shipped = 0
+        any_shipped = False
+        while budget is None or shipped < budget:
+            cursor = pipe.watermark.get_cursor(
+                pipe.source_id(), pipe.dest_id(),
+                pipe.transport.primary_table(),
+            )
+            progressed = False
+            for batch in pipe.source.iter_batches(
+                cursor=cursor,
+                limit=min(
+                    pipe.batch_limit,
+                    pipe.transport.batch_policy().max_records,
+                ),
+            ):
+                if not batch.records:
+                    continue
+                outcome = pipe.transport.ship(batch, pipe.identity)
+                now = self._now()
+                self._handle_first_attempt(pipe, batch, outcome, now)
+                shipped += len(batch.records)
+                any_shipped = True
+                progressed = True
+                if budget is None:
+                    # Historical mode: one batch per pump and out.
+                    return True
+                if shipped >= budget:
+                    return True
+            if not progressed:
+                # Source exhausted — no more work.
+                return any_shipped
+        return any_shipped
 
     def _handle_first_attempt(
         self,
