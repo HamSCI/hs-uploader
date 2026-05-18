@@ -1,27 +1,38 @@
 """wsprdaemon.org transports — SFTP primary, FTP fallback.
 
-Ported from ``wsprdaemon-client/bin/wd-upload-wsprdaemon`` so the wire
-behaviour stays identical:
+Phase 2 (PR 5, 2026-05-18) layout:
 
-  * Bzip2 tar with the canonical layout
-    ``wsprdaemon/{spots,noise}/RX_SITE/RECEIVER/BAND/<filename>``.
-  * SFTP via ``subprocess(sftp -b -)`` — no paramiko dependency.
-    `.part`-then-rename to keep the server from processing partial
-    files.  Host-key rotation is handled with one auto-retry.
-  * FTP fallback rebuilds the tar with ``client_upload_info.txt`` so
-    the gateway can auto-provision SFTP for this reporter on the
-    next cycle.
+  <tar root>/
+  ├── uploads_config.txt                                       (sigmond metadata)
+  ├── client_upload_info.txt                                   (FTP-bootstrap only)
+  ├── routing.json                                             (per-receiver forwarding flags; only when ft* present)
+  ├── wspr/spots/<RX_SITE>/<RECEIVER>/<BAND>/<filename>        (WSPR spots)
+  ├── wspr/noise/<RX_SITE>/<RECEIVER>/<BAND>/<filename>        (WSPR noise)
+  ├── ft8/<RX_SITE>/<RECEIVER>/<BAND>/<filename>.jsonl         (FT8 spots)
+  ├── ft4/<RX_SITE>/<RECEIVER>/<BAND>/<filename>.jsonl         (FT4 spots)
+  └── msk144/...                                                (future)
 
-The transport reads a batch of file-shaped Records (each with
-``payload_path`` set by ``FileTreeSource``) and bundles them.  The
-batch's ``commit_token`` (the path list to delete on ack) flows
-through the orchestrator via the deliverable; the source's
-``commit()`` does the deletion.
+The wsprdaemon-server (Phase 2 PR 1) accepts both this layout and the
+legacy ``wsprdaemon/spots/...`` root during transition.
+
+Compression: zstd -9 by default (chosen after a 859 MB B4-100 benchmark
+that showed ~14× faster compress and ~47× faster decompress vs bzip2,
+with a 25% larger wire size).  Filename suffix stays ``.tbz`` for
+discovery-loop compatibility — the server sniffs leading magic bytes.
+
+The transport reads a batch of Records (mix of FileTreeSource records
+with ``payload_path`` and SqliteSource records with ``columns``) and
+bundles them.  The batch's ``commit_token`` flows through the
+orchestrator via the deliverable; the source's ``commit()`` does the
+cleanup (no-op when delete_on_commit=False — sigmond's storage trim is
+the actual cleanup).
 """
 
 from __future__ import annotations
 
+import datetime as _dt
 import io
+import json
 import logging
 import os
 import re
@@ -30,11 +41,48 @@ import tarfile
 import tempfile
 import time
 from pathlib import Path
-from typing import Iterable, Optional, Sequence
+from typing import Iterable, List, Optional, Sequence
 
 from ..core import BatchPolicy, Outcome, RecordBatch
 
 logger = logging.getLogger(__name__)
+
+
+# Phase 2 PR 5: per-tar compression. zstd-9 is the default after the
+# B4-100 benchmark; bz2 stays selectable for hosts running on
+# wsprdaemon-server builds pre-zstd-sniff. The server sniffs leading
+# magic bytes (not the filename suffix), so a producer flipping
+# `compression` mid-stream is safe as long as every active wd{10,20,30}
+# is running >= Phase 2 PR 1.
+COMPRESSION_ZSTD = "zstd"
+COMPRESSION_BZ2  = "bz2"
+
+
+def _compress_tar_bytes(raw: bytes, *, compression: str, level: int) -> bytes:
+    """Compress an in-memory uncompressed tar.
+
+    `compression` selects the codec; `level` is the codec-specific
+    quality (1..22 for zstd, 1..9 for bz2). On import failure for
+    zstd we fall back to bz2 with a one-shot warning — running
+    without a producer ever blocking on a missing package is more
+    important than the marginal wire-size win.
+    """
+    if compression == COMPRESSION_ZSTD:
+        try:
+            import zstandard
+        except ImportError:
+            logger.warning(
+                "wsprdaemon-tar: `zstandard` not installed, "
+                "falling back to bz2 -9 for this tar",
+            )
+            compression = COMPRESSION_BZ2
+            level = 9
+        else:
+            return zstandard.ZstdCompressor(level=level).compress(raw)
+    # bz2 path (default 9 — only choice that was production-tested
+    # before PR 5).
+    import bz2
+    return bz2.compress(raw, compresslevel=max(1, min(9, level)))
 
 
 _NOISE_TS_RE = re.compile(
@@ -82,17 +130,17 @@ def _tar_add_bytes(tf: tarfile.TarFile, arcname: str, data: bytes) -> None:
 
 def _arcname_for(path: Path, root: Path, rx_site: str) -> str:
     """Map a queued file's path under ``root`` to the canonical
-    server-expected arcname.
+    server-expected arcname under the Phase 2 layout.
 
     Input: ``<root>/<RECEIVER>/<BAND>/[noise/]<filename>``.
     Output:
-      * spots: ``wsprdaemon/spots/RX_SITE/RECEIVER/BAND/<filename>``
-      * noise: ``wsprdaemon/noise/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_noise.txt``
+      * spots: ``wspr/spots/RX_SITE/RECEIVER/BAND/<filename>``
+      * noise: ``wspr/noise/RX_SITE/RECEIVER/BAND/YYMMDD_HHMM_noise.txt``
     """
     try:
         rel = path.relative_to(root)
     except ValueError:
-        return f"wsprdaemon/{path.name}"
+        return f"wspr/{path.name}"
     parts = rel.parts
     is_noise = path.name.endswith("_noise.txt")
 
@@ -106,14 +154,14 @@ def _arcname_for(path: Path, root: Path, rx_site: str) -> str:
             )
         else:
             ts_name = path.name
-        return f"wsprdaemon/noise/{rx_site}/{receiver}/{band}/{ts_name}"
+        return f"wspr/noise/{rx_site}/{receiver}/{band}/{ts_name}"
 
     if not is_noise and len(parts) >= 3:
         receiver, band = parts[0], parts[1]
-        return f"wsprdaemon/spots/{rx_site}/{receiver}/{band}/{path.name}"
+        return f"wspr/spots/{rx_site}/{receiver}/{band}/{path.name}"
 
-    # Fallback: copy under wsprdaemon/ preserving the relative tail.
-    return f"wsprdaemon/{rel.as_posix()}"
+    # Fallback: copy under wspr/ preserving the relative tail.
+    return f"wspr/{rel.as_posix()}"
 
 
 def build_wsprdaemon_tar(
@@ -123,22 +171,26 @@ def build_wsprdaemon_tar(
     rx_site: str,
     version: str = "4.0",
     client_info: Optional[tuple[str, str]] = None,
+    compression: str = COMPRESSION_ZSTD,
+    compression_level: int = 9,
 ) -> bytes:
-    """Return an in-memory bzip2 tar of the canonical wsprdaemon shape.
+    """Return an in-memory compressed tar of the Phase 2 wsprdaemon shape.
 
     ``client_info`` is ``(reporter_id, ssh_pubkey)`` when included
     (FTP-fallback path so the gateway can provision SFTP for the
     reporter); ``None`` otherwise (SFTP-primary path uses the SSH key
     as identity).
+
+    Metadata files (uploads_config.txt, client_upload_info.txt) live at
+    the tar root — they describe the SHIPMENT, not a single mode.
     """
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:bz2") as tf:
-        _tar_add_bytes(tf, "wsprdaemon/uploads_config.txt",
-                       _config_bytes(version))
+    raw_buf = io.BytesIO()
+    with tarfile.open(fileobj=raw_buf, mode="w:") as tf:
+        _tar_add_bytes(tf, "uploads_config.txt", _config_bytes(version))
         if client_info is not None:
             reporter_id, pubkey = client_info
             _tar_add_bytes(
-                tf, "wsprdaemon/client_upload_info.txt",
+                tf, "client_upload_info.txt",
                 _client_info_bytes(reporter_id, pubkey),
             )
         for path in paths:
@@ -147,7 +199,10 @@ def build_wsprdaemon_tar(
                 tf.add(str(path), arcname=arcname, recursive=False)
             except OSError as exc:
                 logger.warning("wsprdaemon-tar: cannot add %s: %s", path, exc)
-    return buf.getvalue()
+    return _compress_tar_bytes(
+        raw_buf.getvalue(),
+        compression=compression, level=compression_level,
+    )
 
 
 # ---------- SqliteSource path (records carrying columns dict) ----------
@@ -389,6 +444,50 @@ def _format_short_line(cols: dict, *, w_mode: bool) -> str:
     return fmt % args
 
 
+def _psk_cycle_key(time_iso: str) -> str:
+    """Floor a psk row's ISO time to the 2-min wsprdaemon cycle boundary.
+
+    Mirrors the wspr cycle alignment so a single tar can carry every
+    mode's spots from the same upload window with consistent filenames.
+    Falls back to the raw timestamp if parsing fails.
+    """
+    try:
+        dt = _dt.datetime.fromisoformat(time_iso.replace("Z", "+00:00"))
+    except (ValueError, AttributeError):
+        return "000000_0000"
+    cycle_minute = (dt.minute // 2) * 2
+    return dt.strftime("%y%m%d_%H") + f"{cycle_minute:02d}"
+
+
+def _render_routing_json(receivers_forward: dict) -> bytes:
+    """Emit routing.json from a {receiver_key: forward_bool} map.
+
+    Receiver key: ``<RX_SITE>/<RECEIVER>``. When every receiver shares
+    the same flag, collapse to a single ``default`` entry; otherwise
+    emit ``default`` + per-receiver overrides. Producer always biases
+    `default` toward True so an older server defaults to forwarding.
+    """
+    if not receivers_forward:
+        return json.dumps(
+            {"default": {"forward_to_pskreporter": True}}
+        ).encode() + b"\n"
+    flags = set(receivers_forward.values())
+    if len(flags) == 1:
+        only = flags.pop()
+        return json.dumps(
+            {"default": {"forward_to_pskreporter": bool(only)}}
+        ).encode() + b"\n"
+    # Mixed: pick the majority as default, override the minority. Keeps
+    # routing.json compact even on a host with many receivers.
+    n_true = sum(1 for v in receivers_forward.values() if v)
+    default_flag = n_true >= (len(receivers_forward) / 2)
+    obj = {"default": {"forward_to_pskreporter": bool(default_flag)}}
+    for key, val in sorted(receivers_forward.items()):
+        if bool(val) != default_flag:
+            obj[key] = {"forward_to_pskreporter": bool(val)}
+    return json.dumps(obj, sort_keys=True).encode() + b"\n"
+
+
 def build_wsprdaemon_tar_from_records(
     records: Iterable,
     *,
@@ -398,36 +497,58 @@ def build_wsprdaemon_tar_from_records(
     rx_site: str,
     version: str = "4.0",
     client_info: Optional[tuple[str, str]] = None,
+    compression: str = COMPRESSION_ZSTD,
+    compression_level: int = 9,
 ) -> bytes:
-    """Build a wsprdaemon.org bzip2 tar from sink.db-style records.
+    """Build a Phase 2 wsprdaemon tar from sink.db-style records.
 
-    Each record's ``columns`` dict is a schema-v2 wspr.spots row
-    (see wspr-recorder/wspr_recorder/spot_sink.py:spot_to_row).
-    Rows are grouped by (band, mode, cycle-end-time) and rendered
-    into per-group files matching v1's layout:
+    Records are split by `r.table`:
 
-      wsprdaemon/spots/<RX_SITE>/<RECEIVER>/<BAND>/
-        <RECEIVER>_<BAND>_W2_YYYYMMDD_HHMMSS_wd_spots.txt    (W-modes)
-        <RECEIVER>_<BAND>_F2_YYYYMMDD_HHMMSS_spots.txt        (F-modes)
+      wspr.spots → grouped by (band, mode, cycle) →
+                   wspr/spots/<RX_SITE>/<RECEIVER>/<BAND>/<filename>
+      wspr.noise → grouped by (band, cycle) →
+                   wspr/noise/<RX_SITE>/<RECEIVER>/<BAND>/<filename>
+      psk.spots  → grouped by (mode, band, cycle) →
+                   <mode>/<RX_SITE>/<RECEIVER>/<BAND>/<filename>.jsonl
+                   (mode = `ft8`, `ft4`, future `msk144`, …)
 
-    The wire-format text per line is byte-identical to v1's
-    wd-extend-spots / wd-decode output for the same row data, modulo
-    the noise/overload fields which stay 0 until Phase 2 ships the
-    in-process noise measurement path.
+    Spot records without a `table` attribute default to wspr.spots for
+    back-compat with the file-source path that still emits naked
+    spot records. Records carrying a `psk.spots` table also produce
+    a ``routing.json`` at the tar root with the per-receiver forwarding
+    flags collected from each row's ``forward_to_pskreporter`` field.
     """
-    # Group records by category + bucket key:
-    #   spot records  → (band, mode, ts_filename) → spot rows
-    #   noise records → (band, ts_filename) → noise rows
-    # The row's `r.table` (set by SqliteSource from target_table) tells
-    # us which bucket — "wspr.spots" vs "wspr.noise".  Records without
-    # a `table` attribute are assumed to be spots for back-compat.
     spot_groups: dict = {}
     noise_groups: dict = {}
+    # psk records → grouped by (mode, band, cycle); each entry is a
+    # list of dicts (one JSONL row each).
+    psk_groups: dict = {}
+    # Per-receiver forwarding intent collected from psk rows.
+    receivers_forward: dict = {}
+
     for r in records:
         cols = getattr(r, "columns", None)
         if not cols:
             continue
         table = getattr(r, "table", "wspr.spots") or "wspr.spots"
+        if table == "psk.spots":
+            mode = (cols.get("mode") or "").lower()
+            if mode not in ("ft8", "ft4", "msk144"):
+                continue
+            band = cols.get("band") or 0
+            cycle = _psk_cycle_key(cols.get("time", ""))
+            psk_groups.setdefault((mode, band, cycle), []).append(cols)
+            psk_receiver = cols.get("receiver") or receiver
+            key = f"{rx_site}/{psk_receiver}"
+            # If any single row in this receiver's batch wants
+            # forwarding=False, the receiver-level flag flips False.
+            # Conservative: prefer NOT-forwarding when the producer
+            # explicitly opted out for any row.
+            existing = receivers_forward.get(key, True)
+            receivers_forward[key] = existing and bool(
+                cols.get("forward_to_pskreporter", True)
+            )
+            continue
         try:
             band = cols["band"]
             _, _, ts_filename = _ts_from_iso(cols["time"])
@@ -448,15 +569,19 @@ def build_wsprdaemon_tar_from_records(
                 continue
             spot_groups.setdefault((band, mode, ts_filename), []).append(cols)
 
-    buf = io.BytesIO()
-    with tarfile.open(fileobj=buf, mode="w:bz2") as tf:
-        _tar_add_bytes(tf, "wsprdaemon/uploads_config.txt",
-                       _config_bytes(version))
+    raw_buf = io.BytesIO()
+    with tarfile.open(fileobj=raw_buf, mode="w:") as tf:
+        _tar_add_bytes(tf, "uploads_config.txt", _config_bytes(version))
         if client_info is not None:
             reporter_id, pubkey = client_info
             _tar_add_bytes(
-                tf, "wsprdaemon/client_upload_info.txt",
+                tf, "client_upload_info.txt",
                 _client_info_bytes(reporter_id, pubkey),
+            )
+        if psk_groups:
+            _tar_add_bytes(
+                tf, "routing.json",
+                _render_routing_json(receivers_forward),
             )
         for (band, mode, ts_filename), rows in spot_groups.items():
             is_w = mode.startswith("W")
@@ -469,19 +594,31 @@ def build_wsprdaemon_tar_from_records(
                 suffix = "_spots.txt"
             content = ("\n".join(lines) + "\n").encode()
             filename = f"{receiver}_{band}_{mode}_{ts_filename}{suffix}"
-            arcname = (
-                f"wsprdaemon/spots/{rx_site}/{receiver}/{band}/{filename}"
-            )
+            arcname = f"wspr/spots/{rx_site}/{receiver}/{band}/{filename}"
             _tar_add_bytes(tf, arcname, content)
         for (band, ts_filename), row in noise_groups.items():
             content = (_format_noise_line(row) + "\n").encode()
             # Filename: <RECEIVER>_<BAND>_<YYYYMMDD>_<HHMMSS>_noise.txt
             filename = f"{receiver}_{band}_{ts_filename}_noise.txt"
-            arcname = (
-                f"wsprdaemon/noise/{rx_site}/{receiver}/{band}/{filename}"
-            )
+            arcname = f"wspr/noise/{rx_site}/{receiver}/{band}/{filename}"
             _tar_add_bytes(tf, arcname, content)
-    return buf.getvalue()
+        for (mode, band, cycle), rows in psk_groups.items():
+            psk_receiver = (rows[0].get("receiver") or receiver)
+            # One JSONL row per spot, ordered by time then frequency
+            # for byte-stable retries.
+            rows_sorted = sorted(
+                rows,
+                key=lambda c: (c.get("time", ""), c.get("frequency", 0)),
+            )
+            lines = [json.dumps(c, default=str, sort_keys=True) for c in rows_sorted]
+            content = ("\n".join(lines) + "\n").encode()
+            filename = f"{cycle}_{mode}.jsonl"
+            arcname = f"{mode}/{rx_site}/{psk_receiver}/{band}/{filename}"
+            _tar_add_bytes(tf, arcname, content)
+    return _compress_tar_bytes(
+        raw_buf.getvalue(),
+        compression=compression, level=compression_level,
+    )
 
 
 # ---------- SFTP transport ----------
@@ -496,7 +633,9 @@ class WsprdaemonTarSftp:
     ``StationIdentity.call`` (``AC0G/B1`` → ``AC0G_B1``) unless overridden.
     """
 
-    ACCEPTS = {"wspr.spots": [3], "wspr.noise": [3]}
+    # Phase 2 PR 5: psk.spots schema_version 2 (the version
+    # psk-recorder's ch_tailer writes via sigmond.hamsci_ch.Writer).
+    ACCEPTS = {"wspr.spots": [3], "wspr.noise": [3], "psk.spots": [2]}
 
     def __init__(
         self,
@@ -513,6 +652,8 @@ class WsprdaemonTarSftp:
         receiver: Optional[str] = None,
         fallback_ftp: Optional["WsprdaemonTarFtp"] = None,
         primary_table_name: str = "wspr.spots",
+        compression: str = COMPRESSION_ZSTD,
+        compression_level: int = 9,
     ):
         self.servers = list(servers)
         self.spool_root = Path(spool_root) if spool_root else None
@@ -523,6 +664,11 @@ class WsprdaemonTarSftp:
         self.version = version
         self.upload_id = upload_id
         self.name = name or f"wsprdaemon-tar-sftp:{','.join(servers)}"
+        # Compression knobs. zstd-9 is the post-PR-5 default after the
+        # B4-100 benchmark; bz2 stays selectable for hosts shipping to
+        # an older wsprdaemon-server build.
+        self.compression = compression
+        self.compression_level = int(compression_level)
         # `receiver` is only needed for the SqliteSource path, where it
         # forms the per-band tar-arcname segment.  The legacy file path
         # derives it from the spool_root directory layout instead.
@@ -591,6 +737,8 @@ class WsprdaemonTarSftp:
                 root=self.spool_root,
                 rx_site=rx_site,
                 version=self.version,
+                compression=self.compression,
+                compression_level=self.compression_level,
             )
         if col_records:
             if not self.receiver:
@@ -607,6 +755,8 @@ class WsprdaemonTarSftp:
                 receiver=self.receiver,
                 rx_site=rx_site,
                 version=self.version,
+                compression=self.compression,
+                compression_level=self.compression_level,
             )
         return None
 
@@ -750,7 +900,7 @@ class WsprdaemonTarFtp:
     Auth is anonymous-style user/password from a file.
     """
 
-    ACCEPTS = {"wspr.spots": [3], "wspr.noise": [3]}
+    ACCEPTS = {"wspr.spots": [3], "wspr.noise": [3], "psk.spots": [2]}
 
     def __init__(
         self,
@@ -766,6 +916,8 @@ class WsprdaemonTarFtp:
         upload_id: Optional[str] = None,
         name: Optional[str] = None,
         receiver: Optional[str] = None,
+        compression: str = COMPRESSION_ZSTD,
+        compression_level: int = 9,
     ):
         self.servers = list(servers)
         self.spool_root = Path(spool_root) if spool_root else None
@@ -783,6 +935,11 @@ class WsprdaemonTarFtp:
         # Optional; only required when records carry `columns` rather
         # than `payload_path`.
         self.receiver = receiver
+        # Compression carried through to build_wsprdaemon_tar*; the FTP
+        # path stays in sync with SFTP so a fallback shipment is the
+        # same wire format the server would have received via SFTP.
+        self.compression = compression
+        self.compression_level = int(compression_level)
 
     def primary_table(self) -> str:
         return "wspr.spots"
@@ -828,6 +985,8 @@ class WsprdaemonTarFtp:
                 rx_site=rx_site,
                 version=self.version,
                 client_info=client_info,
+                compression=self.compression,
+                compression_level=self.compression_level,
             )
         if col_records:
             if not self.receiver:
@@ -843,6 +1002,8 @@ class WsprdaemonTarFtp:
                 rx_site=rx_site,
                 version=self.version,
                 client_info=client_info,
+                compression=self.compression,
+                compression_level=self.compression_level,
             )
         return None
 

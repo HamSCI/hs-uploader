@@ -22,7 +22,27 @@ from hs_uploader.transports.wsprdaemon import (
     _arcname_for,
     _build_rx_site,
     build_wsprdaemon_tar,
+    COMPRESSION_BZ2,
+    COMPRESSION_ZSTD,
 )
+
+
+# Phase 2 PR 5: the transport now defaults to zstd compression. Tests
+# that read tar bytes back must sniff the format rather than assume bz2.
+_BZ2_MAGIC  = b"BZh"
+_ZSTD_MAGIC = b"\x28\xb5\x2f\xfd"
+
+
+def _open_tar_blob(blob: bytes) -> tarfile.TarFile:
+    """Return a TarFile open on `blob` regardless of whether it's bz2
+    or zstd compressed. Mirrors wsprdaemon-server's sniff logic."""
+    if blob.startswith(_ZSTD_MAGIC):
+        import zstandard
+        raw = zstandard.ZstdDecompressor().decompress(blob)
+        return tarfile.open(fileobj=io.BytesIO(raw), mode="r:")
+    if blob.startswith(_BZ2_MAGIC):
+        return tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2")
+    raise ValueError(f"unknown tar magic: {blob[:8]!r}")
 
 
 def _ident(call="AC0G/B1", grid="EM38ww", key="/etc/hs-uploader/keys/id_ed25519"):
@@ -70,7 +90,7 @@ def test_arcname_spot(tmp_path):
     p.parent.mkdir(parents=True, exist_ok=True)
     p.touch()
     assert _arcname_for(p, root=root, rx_site="AC0G=B1_EM38ww") == (
-        "wsprdaemon/spots/AC0G=B1_EM38ww/HF1/14M/210508_1200_wd_spots.txt"
+        "wspr/spots/AC0G=B1_EM38ww/HF1/14M/210508_1200_wd_spots.txt"
     )
 
 
@@ -81,7 +101,7 @@ def test_arcname_noise_renamed(tmp_path):
     p.touch()
     # Server expects YYMMDD_HHMM (no seconds).
     assert _arcname_for(p, root=root, rx_site="X_Y") == (
-        "wsprdaemon/noise/X_Y/HF1/14M/210508_1200_noise.txt"
+        "wspr/noise/X_Y/HF1/14M/210508_1200_noise.txt"
     )
 
 
@@ -94,12 +114,12 @@ def test_tar_layout_includes_config_and_files(tmp_path):
     blob = build_wsprdaemon_tar(
         paths, root=root, rx_site="AC0G=B1_EM38ww",
     )
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
+    with _open_tar_blob(blob) as tf:
         names = sorted(tf.getnames())
     # Mandatory config first.
-    assert "wsprdaemon/uploads_config.txt" in names
+    assert "uploads_config.txt" in names
     # client_upload_info.txt absent on the SFTP path.
-    assert "wsprdaemon/client_upload_info.txt" not in names
+    assert "client_upload_info.txt" not in names
     # All three spool files mapped to canonical arcnames.
     assert any(
         n.endswith("HF1/14M/210508_1200_wd_spots.txt") for n in names
@@ -114,8 +134,8 @@ def test_tar_with_client_info(tmp_path):
         paths, root=root, rx_site="X_Y",
         client_info=("AC0G/B1", "ssh-ed25519 AAAAC3... fake"),
     )
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
-        info = tf.extractfile("wsprdaemon/client_upload_info.txt").read()
+    with _open_tar_blob(blob) as tf:
+        info = tf.extractfile("client_upload_info.txt").read()
     assert b"reporter_id=AC0G/B1" in info
     assert b"ssh_public_key=ssh-ed25519 AAAAC3..." in info
 
@@ -236,9 +256,9 @@ def test_sftp_serialize_for_retry_is_deterministic(tmp_path):
     # We only assert both are valid bzip2 tars containing the same set
     # of arcnames + the same uploads_config.txt body.
     def _names_and_config(blob):
-        with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
+        with _open_tar_blob(blob) as tf:
             names = sorted(tf.getnames())
-            cfg = tf.extractfile("wsprdaemon/uploads_config.txt").read()
+            cfg = tf.extractfile("uploads_config.txt").read()
         return names, cfg
     assert _names_and_config(a) == _names_and_config(b)
 
@@ -279,9 +299,9 @@ def test_ftp_ship_invokes_storbinary(tmp_path):
     assert captured["cmd"].startswith("STOR upload/AC0G_B1_")
     assert captured["cmd"].endswith(".tbz")
     # Tar should contain client_upload_info.txt (FTP path adds it).
-    with tarfile.open(fileobj=io.BytesIO(captured["bytes"]), mode="r:bz2") as tf:
+    with _open_tar_blob(captured["bytes"]) as tf:
         names = tf.getnames()
-    assert "wsprdaemon/client_upload_info.txt" in names
+    assert "client_upload_info.txt" in names
 
 
 def test_ftp_falls_through_servers_on_error(tmp_path):
@@ -421,18 +441,18 @@ def test_tar_from_records_layout(tmp_path):
         receiver="KA9Q_T3FD",
         rx_site="AC0G=B1_EM38ww",
     )
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
+    with _open_tar_blob(blob) as tf:
         names = set(tf.getnames())
-    assert "wsprdaemon/uploads_config.txt" in names
+    assert "uploads_config.txt" in names
     # W-mode rows are grouped into one _wd_spots.txt file
     assert any(
-        n.startswith("wsprdaemon/spots/AC0G=B1_EM38ww/KA9Q_T3FD/30/")
+        n.startswith("wspr/spots/AC0G=B1_EM38ww/KA9Q_T3FD/30/")
         and n.endswith("_W2_20260514_115800_wd_spots.txt")
         for n in names
     )
     # F-mode rows produce a short _spots.txt file
     assert any(
-        n.startswith("wsprdaemon/spots/AC0G=B1_EM38ww/KA9Q_T3FD/40/")
+        n.startswith("wspr/spots/AC0G=B1_EM38ww/KA9Q_T3FD/40/")
         and n.endswith("_F2_20260514_115800_spots.txt")
         for n in names
     )
@@ -451,10 +471,10 @@ def test_tar_from_records_per_band_grouping(tmp_path):
         receiver="KA9Q_T3FD",
         rx_site="AC0G=B1_EM38ww",
     )
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
+    with _open_tar_blob(blob) as tf:
         bands = sorted(
             n.split("/")[4] for n in tf.getnames()
-            if n.startswith("wsprdaemon/spots/")
+            if n.startswith("wspr/spots/")
         )
     assert bands == ["30", "40"]
 
@@ -547,7 +567,7 @@ def test_noise_line_has_15_whitespace_fields():
 
 def test_tar_from_records_includes_noise_files(tmp_path):
     """Mixed batch (spots + noise) lands them in their respective
-    arcnames: wsprdaemon/spots/... and wsprdaemon/noise/..."""
+    arcnames: wspr/spots/... and wspr/noise/..."""
     records = [
         _record_from_row(_row_v2(band="30", mode="W2", callsign="VE7SAR")),
         _noise_record(_noise_row(band="30")),
@@ -559,15 +579,15 @@ def test_tar_from_records_includes_noise_files(tmp_path):
         receiver="KA9Q_T3FD",
         rx_site="AC0G=B1_EM38ww",
     )
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
+    with _open_tar_blob(blob) as tf:
         names = sorted(tf.getnames())
-    # Two noise arcnames under wsprdaemon/noise/.../<band>/
-    noise_arcs = [n for n in names if n.startswith("wsprdaemon/noise/")]
+    # Two noise arcnames under wspr/noise/.../<band>/
+    noise_arcs = [n for n in names if n.startswith("wspr/noise/")]
     assert len(noise_arcs) == 2
     assert any("/30/" in n and n.endswith("_noise.txt") for n in noise_arcs)
     assert any("/40/" in n and n.endswith("_noise.txt") for n in noise_arcs)
     # Spot arcname still present.
-    assert any(n.startswith("wsprdaemon/spots/") for n in names)
+    assert any(n.startswith("wspr/spots/") for n in names)
 
 
 def test_noise_only_batch_produces_only_noise_tar(tmp_path):
@@ -580,10 +600,10 @@ def test_noise_only_batch_produces_only_noise_tar(tmp_path):
         receiver="KA9Q_T3FD",
         rx_site="AC0G=B1_EM38ww",
     )
-    with tarfile.open(fileobj=io.BytesIO(blob), mode="r:bz2") as tf:
+    with _open_tar_blob(blob) as tf:
         names = tf.getnames()
-    assert any(n.startswith("wsprdaemon/noise/") for n in names)
-    assert not any(n.startswith("wsprdaemon/spots/") for n in names)
+    assert any(n.startswith("wspr/noise/") for n in names)
+    assert not any(n.startswith("wspr/spots/") for n in names)
 
 
 def test_sqlite_path_requires_receiver_set():
@@ -598,3 +618,204 @@ def test_sqlite_path_requires_receiver_set():
     # lives in .reason (not .message).
     assert outcome.kind == "permanent"
     assert "receiver=" in outcome.reason
+
+
+# ---- Phase 2 PR 5: psk.spots records → ft8/ft4 JSONL trees + routing.json ----
+
+
+def _psk_row(
+    *,
+    mode: str = "ft8",
+    band: int = 20,
+    time: str = "2026-05-18T14:30:15+00:00",
+    frequency: int = 14_074_580,
+    receiver: str = "KA9Q_RX888",
+    tx_call: str = "K1ABC",
+    grid: str = "FN42",
+    score: int = 50,
+    snr_db: int = -12,
+    dt: float = 0.27,
+    message: str = "AC0G/B1 K1ABC FN42",
+    forward_to_pskreporter: bool = True,
+    schema_version: int = 2,
+) -> dict:
+    return {
+        "time": time, "mode": mode, "decoder_kind": "jt9",
+        "frequency": frequency, "band": band, "receiver": receiver,
+        "rx_sign": "AC0G/B1", "rx_loc": "EM38ww",
+        "tx_call": tx_call, "grid": grid, "score": score,
+        "snr_db": snr_db, "dt": dt, "message": message,
+        "host_call": "AC0G/B1", "host_grid": "EM38ww",
+        "radiod_id": "my-rx888",
+        "processing_version": "psk-recorder/0.6.1+test",
+        "forward_to_pskreporter": forward_to_pskreporter,
+        "schema_version": schema_version,
+    }
+
+
+def _psk_record(row: dict):
+    from datetime import datetime
+    return Record(
+        table="psk.spots",
+        time=datetime.fromisoformat(row["time"].replace("Z", "+00:00")),
+        columns=row,
+        payload_path=None,
+    )
+
+
+def test_psk_records_emit_jsonl_under_mode_peer_dir():
+    """An ft8 row should land at ft8/<RX_SITE>/<RECEIVER>/<BAND>/...jsonl,
+    NOT under wspr/. Each mode is a peer of wspr at the tar root."""
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
+    import json as _j
+    records = [_psk_record(_psk_row(mode="ft8", band=20))]
+    blob = build_wsprdaemon_tar_from_records(
+        records, rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_RX888", rx_site="AC0G=B1_EM38ww",
+    )
+    with _open_tar_blob(blob) as tf:
+        names = tf.getnames()
+        ft8_files = [n for n in names if n.startswith("ft8/")]
+        assert len(ft8_files) == 1, names
+        n = ft8_files[0]
+        assert n.startswith("ft8/AC0G=B1_EM38ww/KA9Q_RX888/20/"), n
+        assert n.endswith("_ft8.jsonl"), n
+        content = tf.extractfile(n).read().decode().splitlines()
+    assert len(content) == 1
+    parsed = _j.loads(content[0])
+    assert parsed["mode"] == "ft8"
+    assert parsed["frequency"] == 14_074_580
+    assert parsed["forward_to_pskreporter"] is True
+
+
+def test_psk_records_emit_routing_json_at_root():
+    """Routing.json appears at root only when psk records are present."""
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
+    import json as _j
+    records = [_psk_record(_psk_row(forward_to_pskreporter=True))]
+    blob = build_wsprdaemon_tar_from_records(
+        records, rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_RX888", rx_site="AC0G=B1_EM38ww",
+    )
+    with _open_tar_blob(blob) as tf:
+        names = tf.getnames()
+        assert "routing.json" in names
+        routing = _j.loads(tf.extractfile("routing.json").read())
+    # All flags True → collapse to a single default entry.
+    assert routing == {"default": {"forward_to_pskreporter": True}}
+
+
+def test_no_routing_json_when_no_psk_records():
+    """A pure-WSPR tar must not carry routing.json."""
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
+    records = [_record_from_row(_row_v2())]
+    blob = build_wsprdaemon_tar_from_records(
+        records, rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_T3FD", rx_site="AC0G=B1_EM38ww",
+    )
+    with _open_tar_blob(blob) as tf:
+        names = tf.getnames()
+    assert "routing.json" not in names
+
+
+def test_psk_records_routing_collapses_when_all_forward_false():
+    """Operator on PSK_DELIVERY_MODE=both: every row carries
+    forward=False. routing.json must collapse to one default entry,
+    not a verbose per-receiver list, so the wire payload stays small."""
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
+    import json as _j
+    records = [_psk_record(_psk_row(forward_to_pskreporter=False))
+               for _ in range(3)]
+    blob = build_wsprdaemon_tar_from_records(
+        records, rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_RX888", rx_site="AC0G=B1_EM38ww",
+    )
+    with _open_tar_blob(blob) as tf:
+        routing = _j.loads(tf.extractfile("routing.json").read())
+    assert routing == {"default": {"forward_to_pskreporter": False}}
+
+
+def test_psk_records_routing_emits_per_receiver_overrides_when_mixed():
+    """Two receivers with different forwarding intent → default plus the
+    minority as an explicit override."""
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
+    import json as _j
+    records = [
+        _psk_record(_psk_row(receiver="KA9Q_A", forward_to_pskreporter=True)),
+        _psk_record(_psk_row(receiver="KA9Q_A", forward_to_pskreporter=True)),
+        _psk_record(_psk_row(receiver="KA9Q_B", forward_to_pskreporter=False)),
+    ]
+    blob = build_wsprdaemon_tar_from_records(
+        records, rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_A", rx_site="AC0G=B1_EM38ww",
+    )
+    with _open_tar_blob(blob) as tf:
+        routing = _j.loads(tf.extractfile("routing.json").read())
+    assert routing["default"]["forward_to_pskreporter"] is True
+    assert routing["AC0G=B1_EM38ww/KA9Q_B"]["forward_to_pskreporter"] is False
+    # KA9Q_A matches default → omitted from override map.
+    assert "AC0G=B1_EM38ww/KA9Q_A" not in routing
+
+
+def test_mixed_batch_packs_wspr_and_ft8_into_one_tar():
+    """A batch with both wspr.spots and psk.spots records must produce
+    one tar carrying both mode subtrees + routing.json."""
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
+    records = [
+        _record_from_row(_row_v2()),
+        _psk_record(_psk_row(mode="ft8")),
+        _psk_record(_psk_row(mode="ft4", time="2026-05-18T14:30:22+00:00")),
+    ]
+    blob = build_wsprdaemon_tar_from_records(
+        records, rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_T3FD", rx_site="AC0G=B1_EM38ww",
+    )
+    with _open_tar_blob(blob) as tf:
+        names = tf.getnames()
+    assert any(n.startswith("wspr/spots/") for n in names)
+    assert any(n.startswith("ft8/") for n in names)
+    assert any(n.startswith("ft4/") for n in names)
+    assert "routing.json" in names
+
+
+# ---- compression knob ----
+
+
+def test_default_compression_is_zstd():
+    """Phase 2 PR 5: zstd-9 is the default for new producers."""
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar
+    blob = build_wsprdaemon_tar(
+        [], root=Path("/tmp"), rx_site="X_Y",
+    )
+    # First 4 bytes are the zstd frame magic.
+    assert blob[:4] == _ZSTD_MAGIC
+
+
+def test_explicit_bz2_still_works():
+    """Operators on older wsprdaemon-server builds must be able to
+    pin bz2 explicitly until they upgrade."""
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar
+    blob = build_wsprdaemon_tar(
+        [], root=Path("/tmp"), rx_site="X_Y",
+        compression=COMPRESSION_BZ2, compression_level=9,
+    )
+    assert blob[:3] == _BZ2_MAGIC
+
+
+def test_transport_carries_compression_setting():
+    """Constructor-level compression flows into the built tar."""
+    from hs_uploader.transports.wsprdaemon import WsprdaemonTarSftp
+    t = WsprdaemonTarSftp(servers=["gw1"], compression=COMPRESSION_BZ2)
+    assert t.compression == COMPRESSION_BZ2
+    t_default = WsprdaemonTarSftp(servers=["gw1"])
+    assert t_default.compression == COMPRESSION_ZSTD
+
+
+def test_accepts_includes_psk_spots():
+    """ACCEPTS must advertise psk.spots so the orchestrator routes the
+    psk source to this transport."""
+    from hs_uploader.transports.wsprdaemon import WsprdaemonTarSftp, WsprdaemonTarFtp
+    assert "psk.spots" in WsprdaemonTarSftp.ACCEPTS
+    assert "psk.spots" in WsprdaemonTarFtp.ACCEPTS
+    # Schema version 2 = ch_tailer's current write tag.
+    assert WsprdaemonTarSftp.ACCEPTS["psk.spots"] == [2]
