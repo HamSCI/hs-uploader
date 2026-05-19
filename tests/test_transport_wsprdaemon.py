@@ -778,6 +778,67 @@ def test_mixed_batch_packs_wspr_and_ft8_into_one_tar():
     assert "routing.json" in names
 
 
+# ---- band derivation for psk rows missing 'band' ----
+
+
+def test_psk_band_derived_from_frequency_when_missing():
+    """psk-recorder's ChTailer doesn't set 'band' on rows — the tar
+    builder must derive it from `frequency` so the arcname segment is
+    the canonical metre-band (20, 40, ...). Regression for the
+    Phase 2 producer-side wire-up where band=0 paths were silently
+    dropped by the wsprdaemon-server's band_str_to_meters() check.
+    """
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
+    row = _psk_row(mode="ft8", frequency=14_074_580)
+    row.pop("band", None)  # producer doesn't set it
+    blob = build_wsprdaemon_tar_from_records(
+        [_psk_record(row)],
+        rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_RX888", rx_site="AC0G=B1_EM38ww",
+    )
+    with _open_tar_blob(blob) as tf:
+        names = tf.getnames()
+    ft8_files = [n for n in names if n.startswith("ft8/")]
+    assert len(ft8_files) == 1, names
+    # 14.074 MHz → 20m. Arcname segment must be "20", not "0".
+    assert "/20/" in ft8_files[0], ft8_files[0]
+
+
+def test_psk_band_zero_when_frequency_outside_ham_bands():
+    """Edge case: frequency outside known ham bands → band=0, server
+    will warn + skip. We don't want to error in the tar builder.
+    """
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
+    row = _psk_row(mode="ft8", frequency=0)
+    row.pop("band", None)
+    blob = build_wsprdaemon_tar_from_records(
+        [_psk_record(row)],
+        rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_RX888", rx_site="AC0G=B1_EM38ww",
+    )
+    with _open_tar_blob(blob) as tf:
+        names = tf.getnames()
+    ft8_files = [n for n in names if n.startswith("ft8/")]
+    assert len(ft8_files) == 1, names
+    assert "/0/" in ft8_files[0], ft8_files[0]
+
+
+def test_psk_explicit_band_wins_over_derived():
+    """If the producer DOES set band explicitly, that value wins."""
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
+    # 14 MHz would derive to 20m, but producer says 17m.
+    row = _psk_row(mode="ft8", frequency=14_074_580, band=17)
+    blob = build_wsprdaemon_tar_from_records(
+        [_psk_record(row)],
+        rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_RX888", rx_site="AC0G=B1_EM38ww",
+    )
+    with _open_tar_blob(blob) as tf:
+        names = tf.getnames()
+    ft8_files = [n for n in names if n.startswith("ft8/")]
+    assert "/17/" in ft8_files[0], ft8_files[0]
+
+
 # ---- compression knob ----
 
 

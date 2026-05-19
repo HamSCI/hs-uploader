@@ -553,7 +553,17 @@ def build_wsprdaemon_tar_from_records(
             mode = (cols.get("mode") or "").lower()
             if mode not in ("ft8", "ft4", "msk144"):
                 continue
-            band = cols.get("band") or 0
+            # psk-recorder's ChTailer doesn't set ``band`` on the row
+            # (the schema field is server-side-only).  Derive it here
+            # from frequency_hz so the tar arcname segment is the
+            # canonical metre-band (20, 40, ...) — what
+            # band_str_to_meters() on the wsprdaemon-server side
+            # expects.  Falls back to 0 when frequency is missing or
+            # outside the ham bands; server logs a warning + skips.
+            band = cols.get("band")
+            if not band:
+                freq_hz = int(cols.get("frequency") or 0)
+                band = _freq_to_band(freq_hz / 1_000_000.0) if freq_hz else 0
             cycle = _psk_cycle_key(cols.get("time", ""))
             psk_groups.setdefault((mode, band, cycle), []).append(cols)
             psk_receiver = cols.get("receiver") or receiver
