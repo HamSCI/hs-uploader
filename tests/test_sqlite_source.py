@@ -4,7 +4,7 @@ Tests use a real in-process sqlite3 connection against either a tmp
 file or an in-memory database — no mocking needed, the writer's
 schema is small and well-defined.  Producer side is simulated by
 direct INSERTs into `pending_uploads` matching what
-`sigmond.hamsci_ch.SqliteWriter` would emit (target_db, target_table,
+`sigmond.hamsci_sink.Writer` would emit (target_db, target_table,
 schema_version, payload_json, queued_at).
 """
 
