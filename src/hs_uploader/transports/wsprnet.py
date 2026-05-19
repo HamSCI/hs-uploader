@@ -124,6 +124,17 @@ class WsprNet:
     # -- internals --
 
     def _build_mept_body(self, records) -> bytes:
+        # Collapse duplicate spots first — multi-RX888 plan, phase 5.
+        # When wspr-recorder runs against more than one radiod, the
+        # same WSPR transmission lands in pending_uploads N times
+        # (once per receiver) with the same (time, callsign, freq_hz)
+        # key but typically different snr_db.  wsprnet has no
+        # diversity tier; sending N copies wastes its budget and
+        # produces "0/N added" rejections.  Keep the max-SNR record
+        # per spot-key; the others are dropped silently here.  The
+        # wsprdaemon-tar transport runs its own untouched _build path
+        # and still ships all receivers' rows.
+        records = dedup_records_for_wsprnet(records)
         lines: List[str] = []
         for rec in records:
             line = _record_to_mept(rec)
@@ -212,6 +223,82 @@ class WsprNet:
 
 
 _HASH_UNRESOLVED = "<...>"
+
+
+def dedup_records_for_wsprnet(records):
+    """Collapse multi-receiver duplicates of the same WSPR transmission.
+
+    Returns a list where each ``(date, time, callsign, freq_mhz_q)``
+    tuple appears at most once, keeping the record with the largest
+    ``snr_db`` (or ``snr``).  ``freq_mhz_q`` is the frequency rounded
+    to 0.0001 MHz (≈ 100 Hz) — finer than WSPR's natural bandwidth so
+    spots that genuinely differ in carrier frequency remain distinct,
+    coarser than wsprd's float precision so identical spots seen by
+    two receivers with negligible drift collapse.
+
+    Ordering is stable: the first record encountered for each key
+    sets that key's position in the output, and ties on snr_db keep
+    the earlier record (matches the wsprnet_audit table's INSERT OR
+    IGNORE first-write-wins semantics, so transport and audit converge
+    on the same identity).
+
+    Records that don't match the wsprnet record shape (missing call /
+    freq / time) are passed through unchanged — ``_record_to_mept``
+    will drop them at format time.
+
+    Exported for use by the producer-side audit / verifier — both
+    paths must dedup on the same key so their counts line up.
+
+    Multi-RX888 plan, phase 5.
+    """
+    best: dict = {}                 # key -> (position, record, snr)
+    pass_through: list = []         # records that don't dedup cleanly
+    for pos, rec in enumerate(records):
+        cols = rec.columns or {}
+        call = (
+            cols.get("tx_sign") or cols.get("tx_call")
+            or cols.get("callsign") or ""
+        ).strip()
+        if not call:
+            pass_through.append((pos, rec))
+            continue
+        # Quantize frequency the same way for every record-shape
+        # variant the transport accepts.
+        freq_mhz = cols.get("frequency_mhz")
+        if freq_mhz is None:
+            freq_hz = cols.get("frequency") or cols.get("frequency_hz")
+            if not freq_hz:
+                pass_through.append((pos, rec))
+                continue
+            try:
+                freq_mhz = float(freq_hz) / 1_000_000.0
+            except (TypeError, ValueError):
+                pass_through.append((pos, rec))
+                continue
+        try:
+            freq_q = round(float(freq_mhz), 4)
+        except (TypeError, ValueError):
+            pass_through.append((pos, rec))
+            continue
+        t = rec.time
+        if t is None:
+            pass_through.append((pos, rec))
+            continue
+        key = (t.strftime("%y%m%d"), t.strftime("%H%M"), call, freq_q)
+        raw_snr = cols.get("snr") if cols.get("snr") is not None else cols.get("snr_db")
+        snr = _float_or_zero(raw_snr)
+        prev = best.get(key)
+        if prev is None or snr > prev[2]:
+            best[key] = (pos, rec, snr)
+    # Re-interleave deduped winners with pass-throughs by original
+    # position so the output keeps caller-supplied ordering wherever
+    # possible.  (Stable order makes the MEPT body diff cleanly
+    # under tests + makes byte-stable replay deterministic.)
+    ordered = sorted(
+        list(best.values()) + [(pos, rec, 0.0) for pos, rec in pass_through],
+        key=lambda t: t[0],
+    )
+    return [t[1] for t in ordered]
 
 
 def _record_to_mept(record) -> Optional[str]:

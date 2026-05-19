@@ -405,3 +405,122 @@ def test_accepts_wspr_spots_v1():
 
 def test_primary_table_is_wspr_spots():
     assert WsprNet().primary_table() == "wspr.spots"
+
+
+# ---- multi-source dedup (multi-RX888 plan, phase 5) ----
+
+
+def test_dedup_collapses_duplicate_spots_keeping_max_snr():
+    from hs_uploader.transports.wsprnet import dedup_records_for_wsprnet
+    when = datetime(2026, 5, 19, 21, 22, tzinfo=timezone.utc)
+    weak = _spot(when=when, tx_sign="K9XX", tx_loc="EN52",
+                 freq_mhz=14.097100, snr=-22)
+    strong = _spot(when=when, tx_sign="K9XX", tx_loc="EN52",
+                   freq_mhz=14.097100, snr=-5)
+    different_call = _spot(when=when, tx_sign="W1AW", tx_loc="FN31",
+                           freq_mhz=14.097200, snr=-15)
+    out = dedup_records_for_wsprnet([weak, strong, different_call])
+    # K9XX collapses to one record — the -5 dB one (max SNR).  W1AW
+    # passes through untouched as a different spot.
+    snrs = sorted(r.columns["snr"] for r in out)
+    calls = sorted(r.columns["tx_sign"] for r in out)
+    assert calls == ["K9XX", "W1AW"]
+    assert -5 in snrs and -15 in snrs
+    assert -22 not in snrs
+
+
+def test_dedup_quantizes_frequency_to_100hz():
+    """Two receivers report the same spot at frequencies differing by
+    < 100 Hz — should collapse to one.  Differing by > 100 Hz is treated
+    as two distinct spots."""
+    from hs_uploader.transports.wsprnet import dedup_records_for_wsprnet
+    when = datetime(2026, 5, 19, 21, 22, tzinfo=timezone.utc)
+    # 14.0971000 vs 14.0971002 — within the 0.0001 MHz quantum
+    a = _spot(when=when, tx_sign="K9XX", freq_mhz=14.0971000, snr=-10)
+    b = _spot(when=when, tx_sign="K9XX", freq_mhz=14.0971002, snr=-8)
+    # 14.0971000 vs 14.0975000 — 400 Hz apart, distinct spots
+    c = _spot(when=when, tx_sign="K9XX", freq_mhz=14.0975000, snr=-12)
+    out = dedup_records_for_wsprnet([a, b, c])
+    snrs = sorted(r.columns["snr"] for r in out)
+    # a+b collapse (kept -8), c distinct
+    assert -8 in snrs and -12 in snrs
+    assert -10 not in snrs
+    assert len(out) == 2
+
+
+def test_dedup_uses_snr_db_when_snr_absent():
+    """v2 sink.db rows carry ``snr_db`` not ``snr``.  Dedup must read
+    either name to pick the max-SNR winner."""
+    from hs_uploader.transports.wsprnet import dedup_records_for_wsprnet
+    from hs_uploader.core import Record
+    when = datetime(2026, 5, 19, 21, 22, tzinfo=timezone.utc)
+    weak = Record(table="wspr.spots", time=when, columns={
+        "callsign": "K9XX", "frequency_hz": 14097100, "snr_db": -22,
+        "pwr_dbm": 23, "drift_hz_per_s": 0.0, "pkt_mode": 2,
+    })
+    strong = Record(table="wspr.spots", time=when, columns={
+        "callsign": "K9XX", "frequency_hz": 14097100, "snr_db": -5,
+        "pwr_dbm": 23, "drift_hz_per_s": 0.0, "pkt_mode": 2,
+    })
+    out = dedup_records_for_wsprnet([weak, strong])
+    assert len(out) == 1
+    assert out[0].columns["snr_db"] == -5
+
+
+def test_dedup_preserves_input_order_for_ties():
+    """When two records have identical SNR, keep the first (matches
+    wsprnet_audit's INSERT OR IGNORE first-write-wins semantics)."""
+    from hs_uploader.transports.wsprnet import dedup_records_for_wsprnet
+    when = datetime(2026, 5, 19, 21, 22, tzinfo=timezone.utc)
+    first = _spot(when=when, tx_sign="K9XX", freq_mhz=14.097100, snr=-10,
+                  tx_loc="EN52")
+    second = _spot(when=when, tx_sign="K9XX", freq_mhz=14.097100, snr=-10,
+                   tx_loc="FN31")   # different grid — only kept if "first"
+    out = dedup_records_for_wsprnet([first, second])
+    assert len(out) == 1
+    assert out[0].columns["tx_loc"] == "EN52"
+
+
+def test_dedup_passes_through_malformed_records_unchanged():
+    """Records that fail the dedup-shape check (missing time, missing
+    call, etc.) must still appear in the output so ``_record_to_mept``
+    can drop them at format time with its own filter logic.  This
+    keeps dedup orthogonal to the existing filter rules."""
+    from hs_uploader.transports.wsprnet import dedup_records_for_wsprnet
+    from hs_uploader.core import Record
+    when = datetime(2026, 5, 19, 21, 22, tzinfo=timezone.utc)
+    good = _spot(when=when, tx_sign="K9XX", snr=-10)
+    no_call = Record(table="wspr.spots", time=when, columns={
+        "frequency_mhz": 14.097, "snr": -8,
+    })
+    no_time = Record(table="wspr.spots", time=None, columns={
+        "tx_sign": "K9XX", "frequency_mhz": 14.097, "snr": -8,
+    })
+    out = dedup_records_for_wsprnet([good, no_call, no_time])
+    # All three pass through (good as the deduped winner, the others
+    # because they didn't match the dedup shape).
+    assert len(out) == 3
+
+
+def test_ship_collapses_duplicates_in_posted_body():
+    """End-to-end through ``ship()``: a batch containing two copies of
+    the same spot only emits ONE MEPT line in the posted body."""
+    captured: dict = {}
+
+    def fake_urlopen(req, timeout):
+        captured["body"] = req.data
+        return _FakeResp(status=200)
+
+    when = datetime(2026, 5, 19, 21, 22, tzinfo=timezone.utc)
+    weak = _spot(when=when, tx_sign="K9XX", freq_mhz=14.097100, snr=-22)
+    strong = _spot(when=when, tx_sign="K9XX", freq_mhz=14.097100, snr=-5)
+    batch = RecordBatch(records=(weak, strong), cursor_after=b"")
+    WsprNet(urlopen=fake_urlopen).ship(batch, _ident())
+
+    # Count MEPT lines in the body (each line starts with the 6-digit
+    # YYMMDD prefix).
+    n_lines = captured["body"].count(b"260519 2122 ")
+    assert n_lines == 1
+    # And the winning SNR is -5 (the strong record).
+    assert b" -5 " in captured["body"]
+    assert b" -22 " not in captured["body"]
