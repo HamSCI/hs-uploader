@@ -175,6 +175,8 @@ class SqliteSource:
         extra_where: Optional[Sequence[tuple[str, str, Any]]] = None,
         start_at: Optional[Union[str, datetime]] = None,
         delete_on_commit: bool = True,
+        dedup_partition_by: Optional[Sequence[str]] = None,
+        dedup_order_by_desc: Optional[str] = None,
         config: Optional[_ConnectionConfig] = None,
         connect_factory: Optional[Callable[[_ConnectionConfig], sqlite3.Connection]] = None,
     ):
@@ -183,6 +185,47 @@ class SqliteSource:
         self.accepted_schema_versions = list(accepted_schema_versions)
         self.select_columns = list(select_columns) if select_columns else None
         self.start_at = start_at
+        # Optional max-key-wins dedup at the SQL layer.  When BOTH
+        # ``dedup_partition_by`` and ``dedup_order_by_desc`` are set,
+        # the query is wrapped in a window-function CTE that selects
+        # the row with the largest ``dedup_order_by_desc`` JSON field
+        # per ``dedup_partition_by`` tuple.  Other rows in the
+        # partition are NEVER yielded (regardless of cursor position),
+        # so a follower transport on the same queue that DOESN'T set
+        # these params still sees every row — used for the wsprnet
+        # vs wsprdaemon-tar split where wsprnet wants max-SNR-only
+        # and wsprdaemon-tar wants every receiver's row for diversity.
+        #
+        # Both fields must be present in the payload_json or the
+        # row is skipped (the ORDER BY treats NULL as smallest, so
+        # rows missing the order field never win their partition).
+        #
+        # See ``wsprnet`` pipeline in wspr-recorder/hs_uploader_shim.py
+        # for the canonical multi-RX888 dedup use:
+        #   dedup_partition_by=('time', 'callsign', 'frequency_hz'),
+        #   dedup_order_by_desc='snr_db',
+        self.dedup_partition_by = (
+            tuple(dedup_partition_by) if dedup_partition_by else None
+        )
+        self.dedup_order_by_desc = dedup_order_by_desc or None
+        if (self.dedup_partition_by is not None) != bool(self.dedup_order_by_desc):
+            raise ValueError(
+                "dedup_partition_by and dedup_order_by_desc must be set "
+                "together (one without the other is meaningless)"
+            )
+        # Sanity-check the JSON field names — they go into the SQL
+        # directly so reject anything that isn't alphanumeric/underscore.
+        for f in (self.dedup_partition_by or ()):
+            if not f.replace("_", "").isalnum():
+                raise ValueError(
+                    f"dedup_partition_by field {f!r} must be alphanumeric/underscore"
+                )
+        if self.dedup_order_by_desc:
+            if not self.dedup_order_by_desc.replace("_", "").isalnum():
+                raise ValueError(
+                    f"dedup_order_by_desc {self.dedup_order_by_desc!r} "
+                    "must be alphanumeric/underscore"
+                )
         # When False, commit() advances the watermark cursor but does NOT
         # DELETE rows from pending_uploads.  Required when multiple
         # pipelines consume the same logical (database, table) queue —
@@ -224,6 +267,8 @@ class SqliteSource:
         extra_where: Optional[Sequence[tuple[str, str, Any]]] = None,
         start_at: Optional[Union[str, datetime]] = None,
         delete_on_commit: bool = True,
+        dedup_partition_by: Optional[Sequence[str]] = None,
+        dedup_order_by_desc: Optional[str] = None,
         env: Optional[dict] = None,
         connect_factory: Optional[Callable[[_ConnectionConfig], sqlite3.Connection]] = None,
     ) -> "SqliteSource":
@@ -236,6 +281,8 @@ class SqliteSource:
             extra_where=extra_where,
             start_at=start_at,
             delete_on_commit=delete_on_commit,
+            dedup_partition_by=dedup_partition_by,
+            dedup_order_by_desc=dedup_order_by_desc,
             config=cfg,
             connect_factory=connect_factory,
         )
@@ -423,15 +470,83 @@ class SqliteSource:
                 )
                 params.append(value)
 
+        if self.dedup_partition_by and self.dedup_order_by_desc:
+            sql, params = self._build_dedup_query(clauses, params, cur, limit)
+        else:
+            sql = (
+                "SELECT id, schema_version, payload_json, queued_at "
+                "FROM pending_uploads "
+                f"WHERE {' AND '.join(clauses)} "
+                "ORDER BY id ASC "
+                "LIMIT ?"
+            )
+            params.append(int(limit))
+        return sql, params
+
+    def _build_dedup_query(
+        self, clauses: list, params: list, cur: _Cursor, limit: int,
+    ) -> tuple[str, list]:
+        """Build a max-key-wins dedup query using a window function.
+
+        The inner CTE ranks every row in pending_uploads (filtered by
+        the same target_db/target_table/schema_versions/extra_where
+        clauses as the simple query, but NOT by ``id > cursor``) into
+        partitions defined by ``dedup_partition_by`` JSON fields,
+        ordered by ``dedup_order_by_desc`` JSON field descending with
+        ``id ASC`` as the tiebreak.  The outer SELECT pulls only the
+        rank-1 winners with ``id > cursor``, so the cursor still
+        advances normally and the loser rows stay in the queue for
+        any sibling pipeline (e.g. wsprdaemon-tar's all-receiver
+        diversity feed).
+
+        Important consequence: loser rows whose partition winner was
+        already shipped are silently SKIPPED on subsequent polls
+        (rn != 1).  This is the desired behaviour — wsprnet only
+        wants the best version of each spot, exactly once.
+
+        Late-arriving HIGHER-snr rows DO get yielded, even though
+        their partition's earlier (lower-snr) row was already shipped.
+        Trade-off: we accept the late duplicate to wsprnet so the
+        better SNR reaches the central database.  Empirically rare
+        given normal cycle ordering (both sources decode in lockstep).
+        """
+        # The CTE filter clauses re-use everything from the simple
+        # query EXCEPT the cursor — the window function needs to see
+        # ALL rows in the partition to rank them correctly.  We split
+        # the params list accordingly.
+        cursor_param = params[0]  # id > ?  (the cur.last_id we set first)
+        cte_clauses = clauses[1:]  # everything except "id > ?"
+        cte_params = params[1:]    # everything except cursor
+
+        partition_exprs = ", ".join(
+            f"json_extract(payload_json, '$.{f}')"
+            for f in self.dedup_partition_by
+        )
+        # CAST so SQLite treats stored numbers as numeric for ORDER BY.
+        # json_extract returns the JSON type as-is (text vs real); the
+        # CAST normalises and NULLs sort last.
+        order_expr = (
+            f"CAST(json_extract(payload_json, "
+            f"'$.{self.dedup_order_by_desc}') AS REAL) DESC, id ASC"
+        )
         sql = (
-            "SELECT id, schema_version, payload_json, queued_at "
+            "WITH ranked AS ("
+            "SELECT id, schema_version, payload_json, queued_at, "
+            f"ROW_NUMBER() OVER ("
+            f"PARTITION BY {partition_exprs} "
+            f"ORDER BY {order_expr}"
+            f") AS rn "
             "FROM pending_uploads "
-            f"WHERE {' AND '.join(clauses)} "
+            f"WHERE {' AND '.join(cte_clauses)}"
+            ") "
+            "SELECT id, schema_version, payload_json, queued_at "
+            "FROM ranked "
+            "WHERE rn = 1 AND id > ? "
             "ORDER BY id ASC "
             "LIMIT ?"
         )
-        params.append(int(limit))
-        return sql, params
+        new_params = list(cte_params) + [cursor_param, int(limit)]
+        return sql, new_params
 
     def _check_stale_schema(self, conn: sqlite3.Connection) -> None:
         """Probe for rows with schema_versions outside `accepted`.

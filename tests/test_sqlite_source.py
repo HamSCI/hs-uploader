@@ -397,3 +397,155 @@ def test_cursor_roundtrip() -> None:
 def test_cursor_rejects_malformed_bytes() -> None:
     with pytest.raises(ValueError):
         _Cursor.from_bytes(b"not a number")
+
+
+# ---------------------------------------------------------------------------
+# Max-key-wins dedup (multi-RX888 plan, phase 5 follow-up — task #43)
+# ---------------------------------------------------------------------------
+
+def test_dedup_collapses_partition_to_max_order_value(
+    seeded: sqlite3.Connection, db_path: Path,
+) -> None:
+    """Two records with the same (time, callsign, frequency_hz) should
+    yield only the one with the highest snr_db."""
+    _insert(seeded, target_db="wspr", target_table="spots", payload={
+        "time": "2026-05-19T22:00:00Z",
+        "callsign": "W1AW", "frequency_hz": 14097100,
+        "snr_db": -15, "rx_source": "radiod:host-a",
+    })
+    _insert(seeded, target_db="wspr", target_table="spots", payload={
+        "time": "2026-05-19T22:00:00Z",
+        "callsign": "W1AW", "frequency_hz": 14097100,
+        "snr_db": -3,  "rx_source": "radiod:host-b",
+    })
+    # And a non-duplicate
+    _insert(seeded, target_db="wspr", target_table="spots", payload={
+        "time": "2026-05-19T22:00:00Z",
+        "callsign": "K9XX", "frequency_hz": 14097200,
+        "snr_db": -8, "rx_source": "radiod:host-a",
+    })
+    src = SqliteSource(
+        database="wspr", table="spots", accepted_schema_versions=[2],
+        config=_ConnectionConfig(path=str(db_path)),
+        dedup_partition_by=("time", "callsign", "frequency_hz"),
+        dedup_order_by_desc="snr_db",
+    )
+    batches = list(src.iter_batches(b"", 10))
+    assert len(batches) == 1
+    cols = [r.columns for r in batches[0].records]
+    # W1AW collapses to one (the -3 winner); K9XX passes through
+    snrs = sorted(c["snr_db"] for c in cols)
+    calls = sorted(c["callsign"] for c in cols)
+    assert calls == ["K9XX", "W1AW"]
+    assert -3 in snrs and -8 in snrs
+    assert -15 not in snrs
+
+
+def test_dedup_does_not_yield_loser_rows_after_winner_committed(
+    seeded: sqlite3.Connection, db_path: Path,
+) -> None:
+    """Once a partition's winner has been shipped, the loser rows
+    stay behind in pending_uploads (we don't delete them — sibling
+    pipelines may need them) but the dedup query must NEVER yield
+    them on subsequent polls."""
+    _insert(seeded, target_db="wspr", target_table="spots", payload={
+        "time": "2026-05-19T22:00:00Z", "callsign": "W1AW",
+        "frequency_hz": 14097100, "snr_db": -3,
+    })
+    _insert(seeded, target_db="wspr", target_table="spots", payload={
+        "time": "2026-05-19T22:00:00Z", "callsign": "W1AW",
+        "frequency_hz": 14097100, "snr_db": -15,
+    })
+    src = SqliteSource(
+        database="wspr", table="spots", accepted_schema_versions=[2],
+        config=_ConnectionConfig(path=str(db_path)),
+        delete_on_commit=False,    # shared with sibling pipeline
+        dedup_partition_by=("time", "callsign", "frequency_hz"),
+        dedup_order_by_desc="snr_db",
+    )
+    batches = list(src.iter_batches(b"", 10))
+    assert len(batches[0].records) == 1
+    # Commit the winner
+    src.commit(batches[0].commit_token)
+    # Next poll: nothing new (loser is rn=2 in its partition)
+    batches2 = list(src.iter_batches(batches[0].cursor_after, 10))
+    assert all(len(b.records) == 0 for b in batches2)
+
+
+def test_dedup_off_yields_every_row(
+    seeded: sqlite3.Connection, db_path: Path,
+) -> None:
+    """Sanity: with dedup params unset, the source yields every row
+    (matches the wsprdaemon-tar diversity feed's behaviour on the
+    same shared queue)."""
+    _insert(seeded, target_db="wspr", target_table="spots", payload={
+        "time": "2026-05-19T22:00:00Z", "callsign": "W1AW",
+        "frequency_hz": 14097100, "snr_db": -3,
+    })
+    _insert(seeded, target_db="wspr", target_table="spots", payload={
+        "time": "2026-05-19T22:00:00Z", "callsign": "W1AW",
+        "frequency_hz": 14097100, "snr_db": -15,
+    })
+    src = SqliteSource(
+        database="wspr", table="spots", accepted_schema_versions=[2],
+        config=_ConnectionConfig(path=str(db_path)),
+    )
+    batches = list(src.iter_batches(b"", 10))
+    assert len(batches[0].records) == 2
+
+
+def test_dedup_tiebreak_keeps_earliest_id_on_equal_snr(
+    seeded: sqlite3.Connection, db_path: Path,
+) -> None:
+    """Two records with identical SNR — the earlier id wins (first
+    write wins, deterministic).  Matches the wsprnet_audit table's
+    INSERT OR IGNORE first-write-wins semantics so the audit and
+    transport agree on which receiver 'owned' the spot."""
+    id_a = _insert(seeded, target_db="wspr", target_table="spots", payload={
+        "time": "2026-05-19T22:00:00Z", "callsign": "W1AW",
+        "frequency_hz": 14097100, "snr_db": -7,
+        "rx_source": "first",
+    })
+    _insert(seeded, target_db="wspr", target_table="spots", payload={
+        "time": "2026-05-19T22:00:00Z", "callsign": "W1AW",
+        "frequency_hz": 14097100, "snr_db": -7,
+        "rx_source": "second",
+    })
+    src = SqliteSource(
+        database="wspr", table="spots", accepted_schema_versions=[2],
+        config=_ConnectionConfig(path=str(db_path)),
+        dedup_partition_by=("time", "callsign", "frequency_hz"),
+        dedup_order_by_desc="snr_db",
+    )
+    batches = list(src.iter_batches(b"", 10))
+    assert len(batches[0].records) == 1
+    # Winner is the first-inserted row
+    assert batches[0].records[0].columns["rx_source"] == "first"
+
+
+def test_dedup_partition_and_order_must_both_be_set() -> None:
+    """Programmer-error guard: setting one without the other is
+    meaningless; reject at construction time."""
+    with pytest.raises(ValueError, match="set together"):
+        SqliteSource(
+            database="wspr", table="spots", accepted_schema_versions=[2],
+            dedup_partition_by=("time",),
+            # dedup_order_by_desc missing
+        )
+
+
+def test_dedup_field_names_rejected_when_unsafe() -> None:
+    """The dedup fields go into SQL directly — reject anything that
+    isn't [A-Za-z0-9_] to defend against trivial typos / injection."""
+    with pytest.raises(ValueError, match="alphanumeric"):
+        SqliteSource(
+            database="wspr", table="spots", accepted_schema_versions=[2],
+            dedup_partition_by=("time", "call sign"),
+            dedup_order_by_desc="snr_db",
+        )
+    with pytest.raises(ValueError, match="alphanumeric"):
+        SqliteSource(
+            database="wspr", table="spots", accepted_schema_versions=[2],
+            dedup_partition_by=("time",),
+            dedup_order_by_desc="snr; drop table--",
+        )
