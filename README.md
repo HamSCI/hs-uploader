@@ -2,8 +2,8 @@
 
 Library for shipping HamSCI sigmond observations to HF reporting destinations.
 
-`hs-uploader` is the read-side counterpart to `sigmond.hamsci_ch`'s
-`SqliteWriter`: clients import it to forward records they have staged in
+`hs-uploader` is the read-side counterpart to `sigmond.hamsci_sink`'s
+`Writer`: clients import it to forward records they have staged in
 sigmond's local SQLite sink (preferred) or in spool files (fallback) up to a
 HamSCI / community ingest destination — wsprdaemon.org, wsprnet.org,
 PSKReporter, PSWS, etc.
@@ -13,7 +13,7 @@ PSKReporter, PSWS, etc.
 Active. Sources, transports, and watermark store are all working:
 
 - **Sources:** `SqliteSource` (preferred — reads
-  `sigmond.hamsci_ch.SqliteWriter`'s `pending_uploads` queue, with
+  `sigmond.hamsci_sink.Writer`'s `pending_uploads` queue, with
   `extra_where` and `start_at` knobs and a strict `schema_version`
   check), `WsprCycleSource` (cycle-aligned variant over the same
   queue — yields one `RecordBatch` per 2-minute WSPR cycle, bundling

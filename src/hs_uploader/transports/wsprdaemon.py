@@ -662,7 +662,7 @@ class WsprdaemonTarSftp:
     """
 
     # Phase 2 PR 5: psk.spots schema_version 2 (the version
-    # psk-recorder's ch_tailer writes via sigmond.hamsci_ch.Writer).
+    # psk-recorder's ch_tailer writes via sigmond.hamsci_sink.Writer).
     ACCEPTS = {"wspr.spots": [3], "wspr.noise": [3], "psk.spots": [2]}
 
     def __init__(

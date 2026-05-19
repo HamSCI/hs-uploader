@@ -1,14 +1,14 @@
-"""SQLite source — reads from `sigmond.hamsci_ch.SqliteWriter`'s
+"""SQLite source — reads from `sigmond.hamsci_sink.Writer`'s
 `pending_uploads` queue.
 
 This is hs-uploader's database source: it yields `RecordBatch`es
 starting strictly after the supplied opaque cursor, with strict
-schema-version checking.  `sigmond.hamsci_ch.Writer.from_env()` stages
+schema-version checking.  `sigmond.hamsci_sink.Writer.from_env()` stages
 rows into this queue by default (`/var/lib/sigmond/sink.db`).
 
 Pipeline shape::
 
-    Producer.hamsci_ch.Writer.from_env()  → SqliteWriter.flush()
+    Producer.hamsci_sink.Writer.from_env()  → Writer.flush()
         → pending_uploads (target_db, target_table, schema_version,
                            payload_json, queued_at)
     SqliteSource.iter_batches(cursor, limit)
@@ -122,7 +122,7 @@ class _ConnectionConfig:
 
         Returns ``None`` (→ no-op source) when neither `SIGMOND_SQLITE_PATH`
         is set nor the default sink db exists — the standalone-safe no-op
-        that mirrors `sigmond.hamsci_ch.Writer.from_env()`.
+        that mirrors `sigmond.hamsci_sink.Writer.from_env()`.
         """
         e = env if env is not None else os.environ
         path = (e.get("SIGMOND_SQLITE_PATH") or "").strip()
@@ -152,7 +152,7 @@ def _default_connect_factory(cfg: _ConnectionConfig) -> sqlite3.Connection:
 
 
 class SqliteSource:
-    """Read-side of sigmond.hamsci_ch.SqliteWriter's `pending_uploads`
+    """Read-side of sigmond.hamsci_sink.Writer's `pending_uploads`
     queue.
 
     The (database, table) pair filters which rows belong to this
