@@ -504,11 +504,19 @@ class SqliteSource:
         (rn != 1).  This is the desired behaviour — wsprnet only
         wants the best version of each spot, exactly once.
 
-        Late-arriving HIGHER-snr rows DO get yielded, even though
-        their partition's earlier (lower-snr) row was already shipped.
-        Trade-off: we accept the late duplicate to wsprnet so the
-        better SNR reaches the central database.  Empirically rare
-        given normal cycle ordering (both sources decode in lockstep).
+        Late-arriving rows in a partition that was ALREADY visited by
+        an earlier pump (i.e. ``MIN(id) OVER partition <= cursor``)
+        are excluded too — otherwise the second rx's copy of a spot
+        that arrived in pending_uploads after the first rx's spot was
+        already shipped would be uploaded again, wsprnet would reject
+        it as a duplicate, and our wsprnet_audit table would skip the
+        row via INSERT OR IGNORE PK collision (leaving an audit_batch
+        row with no spot — the bug that hid ~93% of rejection causes
+        from ``smd watch wspr --rejected``).  Trade-off: we lose a
+        chance to upgrade to a higher-SNR version, but the spot is
+        already on wsprnet's books and a few dB of SNR isn't worth
+        the rejection rate.  Cross-server diversity still works via
+        the wsprdaemon-tar pipeline which doesn't enable dedup.
         """
         # The CTE filter clauses re-use everything from the simple
         # query EXCEPT the cursor — the window function needs to see
@@ -535,17 +543,22 @@ class SqliteSource:
             f"ROW_NUMBER() OVER ("
             f"PARTITION BY {partition_exprs} "
             f"ORDER BY {order_expr}"
-            f") AS rn "
+            f") AS rn, "
+            f"MIN(id) OVER ("
+            f"PARTITION BY {partition_exprs}"
+            f") AS partition_min_id "
             "FROM pending_uploads "
             f"WHERE {' AND '.join(cte_clauses)}"
             ") "
             "SELECT id, schema_version, payload_json, queued_at "
             "FROM ranked "
-            "WHERE rn = 1 AND id > ? "
+            "WHERE rn = 1 AND id > ? AND partition_min_id > ? "
             "ORDER BY id ASC "
             "LIMIT ?"
         )
-        new_params = list(cte_params) + [cursor_param, int(limit)]
+        new_params = (
+            list(cte_params) + [cursor_param, cursor_param, int(limit)]
+        )
         return sql, new_params
 
     def _check_stale_schema(self, conn: sqlite3.Connection) -> None:
