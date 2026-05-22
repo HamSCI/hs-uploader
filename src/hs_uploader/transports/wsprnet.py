@@ -28,6 +28,7 @@ from __future__ import annotations
 
 import logging
 import re
+import time
 import urllib.error
 import urllib.request
 from typing import Any, List, Optional
@@ -100,10 +101,28 @@ class WsprNet:
         return BatchPolicy(max_records=self._max_spots_per_upload)
 
     def ship(self, batch: RecordBatch, identity) -> Outcome:
+        # Dedup once here so we can compute cycle attribution from
+        # the EXACT records that go into the body (downstream
+        # ``_build_mept_body`` redoes dedup on the same input, idempotent).
+        deduped = dedup_records_for_wsprnet(batch.records)
         body = self._build_mept_body(batch.records)
         if not body:
             return Outcome.acked()
-        return self._post(body, identity)
+        # Per-cycle attribution: count records per cycle UTC so the
+        # log line shows operators which cycles' spots are in THIS
+        # POST.  Example: "cycle 01:08=68, 01:10=2" — multi-cycle
+        # POSTs happen during backlog drain.
+        cycle_counts: dict = {}
+        for rec in deduped:
+            try:
+                key = rec.time.strftime('%H:%M')
+            except Exception:
+                continue
+            cycle_counts[key] = cycle_counts.get(key, 0) + 1
+        cycle_summary = ", ".join(
+            f"{k}={v}" for k, v in sorted(cycle_counts.items())
+        ) or "(none)"
+        return self._post(body, identity, cycle_summary)
 
     def serialize_for_retry(self, batch: RecordBatch, identity) -> bytes:
         """Snapshot the rendered MEPT body for byte-stable replay.
@@ -119,7 +138,10 @@ class WsprNet:
     def replay(self, payload_blob: bytes, identity) -> Outcome:
         if not payload_blob:
             return Outcome.acked()
-        return self._post(payload_blob, identity)
+        # Replay path doesn't have the original record objects, so
+        # we can't compute cycle attribution.  Use a placeholder
+        # the operator can still match against.
+        return self._post(payload_blob, identity, "(replay)")
 
     # -- internals --
 
@@ -145,7 +167,12 @@ class WsprNet:
         lines.sort(key=_mept_sort_key)
         return ("\n".join(lines) + "\n").encode("utf-8")
 
-    def _post(self, body: bytes, identity) -> Outcome:
+    def _post(
+        self,
+        body: bytes,
+        identity,
+        cycle_summary: str = "(unknown)",
+    ) -> Outcome:
         call = (getattr(identity, "call", "") or "").strip()
         grid = (getattr(identity, "grid", "") or "").strip()
         if not call:
@@ -168,6 +195,17 @@ class WsprNet:
             },
             method="POST",
         )
+        # Count the MEPT lines we're about to send.  Each line in
+        # ``body`` is one spot; trailing newlines don't count.  This
+        # lets the log show both client-side count (we sent N) and
+        # server-side count (it accepted M of N).
+        client_spots = body.count(b"\n")
+        body_kb = round(len(body) / 1024.0, 1)
+        logger.info(
+            "wsprnet POST start: %d spots (cycles: %s, %.1f KB)",
+            client_spots, cycle_summary, body_kb,
+        )
+        post_t0 = time.monotonic()
         try:
             with self._urlopen(req, timeout=self.upload_timeout_sec) as resp:
                 status = getattr(resp, "status", 200)
@@ -181,17 +219,26 @@ class WsprNet:
             # ack the batch (advance watermark, no retry).  Retrying
             # would just resend identical payload to the same server
             # for the same rejection; better to move on to fresh spots.
+            elapsed = time.monotonic() - post_t0
             response_body = ""
             try:
                 response_body = exc.read().decode(errors="replace")
             except Exception:  # noqa: BLE001
                 pass
+            logger.warning(
+                "wsprnet POST failed in %.2fs: HTTP %d — %s",
+                elapsed, exc.code, response_body[:160],
+            )
             return Outcome(
                 kind="acked",
                 reason=f"HTTP {exc.code} (no retry): {response_body[:200]}",
             )
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             # Network-level failure (no HTTP response received) — retry.
+            elapsed = time.monotonic() - post_t0
+            logger.warning(
+                "wsprnet POST network error in %.2fs: %s", elapsed, exc,
+            )
             return Outcome.retry_later(f"wsprnet: network error — {exc}")
 
         if not (200 <= status < 300):
@@ -216,6 +263,14 @@ class WsprNet:
         import re
         m = re.search(r"(\d+)\s+out\s+of\s+(\d+)\s+spot", response_body)
         reason = f"{m.group(1)}/{m.group(2)} added" if m else ""
+        elapsed = time.monotonic() - post_t0
+        rate = (client_spots / elapsed) if elapsed > 0 else 0
+        logger.info(
+            "wsprnet POST done: %d spots (cycles: %s) in %.2fs "
+            "(%.1f spots/s); server: %s",
+            client_spots, cycle_summary, elapsed, rate,
+            reason or "no count",
+        )
         return Outcome(kind="acked", reason=reason)
 
 
