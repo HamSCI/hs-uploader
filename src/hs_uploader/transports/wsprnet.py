@@ -234,12 +234,30 @@ class WsprNet:
                 reason=f"HTTP {exc.code} (no retry): {response_body[:200]}",
             )
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            # Network-level failure (no HTTP response received) — retry.
+            # Network-level failure or timeout (no HTTP response
+            # received within upload_timeout_sec).  Per policy
+            # (operator @rrobinett 2026-05-23): even when we never
+            # see a response, treat the batch as ack'd and move on.
+            # Rationale: wsprnet.org has been observed responding
+            # 3-10 minutes after the POST body was sent, well after
+            # our client timeout fires.  Retrying just resends the
+            # same body, which the server processes a SECOND time
+            # and reports as "0/100 added" because the first
+            # delivery already populated its tables.  Net effect was
+            # a 15-minute retry loop per batch + 100s of CPU + a
+            # multi-cycle backlog buildup, all to land 0 new spots.
+            # Losing the occasional batch to a truly down network
+            # is a much cheaper failure mode than spinning forever.
             elapsed = time.monotonic() - post_t0
             logger.warning(
-                "wsprnet POST network error in %.2fs: %s", elapsed, exc,
+                "wsprnet POST timeout/network error in %.2fs "
+                "(no retry — treating as acked): %s", elapsed, exc,
             )
-            return Outcome.retry_later(f"wsprnet: network error — {exc}")
+            return Outcome(
+                kind="acked",
+                reason=f"timeout/network error after {elapsed:.0f}s "
+                       f"(no retry): {exc}",
+            )
 
         if not (200 <= status < 300):
             # Defensive — _urlopen normally raises HTTPError for non-2xx,

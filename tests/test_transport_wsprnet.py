@@ -308,7 +308,11 @@ def test_ship_returns_acked_on_2xx():
     assert "multipart/form-data; boundary=" in ct
 
 
-def test_ship_returns_retry_later_on_5xx():
+def test_ship_acks_on_5xx_no_retry():
+    """Per policy (operator @rrobinett 2026-05-14): ANY HTTP response —
+    2xx success or 4xx/5xx error — is ack'd, never retried.  Retrying
+    a 5xx just resends identical payload to the same server for the
+    same rejection."""
     import urllib.error
 
     def fake_urlopen(req, timeout):
@@ -320,11 +324,20 @@ def test_ship_returns_retry_later_on_5xx():
     t = WsprNet(urlopen=fake_urlopen)
     batch = RecordBatch(records=(_spot(),), cursor_after=b"")
     outcome = t.ship(batch, _ident())
-    assert outcome.kind == "retry_later"
+    assert outcome.kind == "acked"
     assert "502" in outcome.reason
 
 
-def test_ship_returns_retry_later_on_network_error():
+def test_ship_acks_on_network_error_no_retry():
+    """Per policy (operator @rrobinett 2026-05-23): even network-level
+    failures and timeouts are ack'd, not retried.  wsprnet.org has been
+    observed responding 3-10 min after the POST body was sent — long
+    after our upload_timeout_sec fires.  Retrying on timeout just
+    re-uploads the same body, which the server processes a second time
+    and reports as ``0/N added`` (the first delivery already populated
+    its tables).  Net effect was multi-minute retry loops landing zero
+    new spots.  Lose-the-occasional-true-outage is cheaper than spin-
+    forever."""
     import urllib.error
 
     def fake_urlopen(req, timeout):
@@ -333,7 +346,7 @@ def test_ship_returns_retry_later_on_network_error():
     t = WsprNet(urlopen=fake_urlopen)
     batch = RecordBatch(records=(_spot(),), cursor_after=b"")
     outcome = t.ship(batch, _ident())
-    assert outcome.kind == "retry_later"
+    assert outcome.kind == "acked"
     assert "connection refused" in outcome.reason
 
 
