@@ -64,7 +64,12 @@ class WsprNet:
     real listener.
     """
 
-    ACCEPTS = {"wspr.spots": [1]}
+    # wspr-recorder's spot_sink writes SCHEMA_VERSION=2; psk-recorder's
+    # ch_tailer writes 2.  Pre-2026-05-23 this declared only [1] but
+    # ACCEPTS is advisory (no orchestrator gate), so wsprnet shipped
+    # v2 rows fine — listing both versions keeps the declaration
+    # truthful and future-proof.
+    ACCEPTS = {"wspr.spots": [1, 2, 3]}
 
     def __init__(
         self,

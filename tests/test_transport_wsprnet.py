@@ -412,8 +412,11 @@ def test_replay_posts_the_stored_blob_verbatim():
 # ---- ACCEPTS / primary_table ----
 
 
-def test_accepts_wspr_spots_v1():
-    assert WsprNet().ACCEPTS == {"wspr.spots": [1]}
+def test_accepts_wspr_spots_versions():
+    """Updated 2026-05-23: producers write schema_version=2 (and
+    we declare room for 3) — ACCEPTS lists the actually-supported
+    versions rather than a single legacy value."""
+    assert WsprNet().ACCEPTS == {"wspr.spots": [1, 2, 3]}
 
 
 def test_primary_table_is_wspr_spots():

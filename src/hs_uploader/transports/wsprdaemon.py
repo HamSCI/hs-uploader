@@ -661,9 +661,22 @@ class WsprdaemonTarSftp:
     ``StationIdentity.call`` (``AC0G/B1`` → ``AC0G_B1``) unless overridden.
     """
 
-    # Phase 2 PR 5: psk.spots schema_version 2 (the version
-    # psk-recorder's ch_tailer writes via sigmond.hamsci_sink.Writer).
-    ACCEPTS = {"wspr.spots": [3], "wspr.noise": [3], "psk.spots": [2]}
+    # Schema versions actually written by producers (as of 2026-05-23):
+    #   wspr.spots: SCHEMA_VERSION=2 (wspr-recorder spot_sink)
+    #   wspr.noise: NOISE_SCHEMA_VERSION=1 (wspr-recorder spot_sink)
+    #   psk.spots:  schema_version=2 (psk-recorder ch_tailer)
+    # Pre-2026-05-23 this declared [3] for wspr.spots/noise, which
+    # was aspirational — no producer ever wrote v3.  ACCEPTS is
+    # currently advisory (no orchestrator gate enforces it), so the
+    # mismatch wasn't causing the upload failure on its own — but the
+    # inconsistency made future strict-mode enforcement a footgun.
+    # Listing the actually-written versions plus [3] keeps room for
+    # producers to bump without breaking deliveries.
+    ACCEPTS = {
+        "wspr.spots": [1, 2, 3],
+        "wspr.noise": [1, 2, 3],
+        "psk.spots": [2],
+    }
 
     def __init__(
         self,
@@ -932,7 +945,12 @@ class WsprdaemonTarFtp:
     Auth is anonymous-style user/password from a file.
     """
 
-    ACCEPTS = {"wspr.spots": [3], "wspr.noise": [3], "psk.spots": [2]}
+    # Mirrors WsprdaemonTarSftp.ACCEPTS — same producer / same payload.
+    ACCEPTS = {
+        "wspr.spots": [1, 2, 3],
+        "wspr.noise": [1, 2, 3],
+        "psk.spots": [2],
+    }
 
     def __init__(
         self,
