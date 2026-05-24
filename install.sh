@@ -54,31 +54,36 @@ check_root() {
     [[ $EUID -eq 0 ]] || error "Run as root (sudo)."
 }
 
-# Ensures `uv` is on PATH.  If missing, installs from astral.sh into
-# /usr/local/bin so root + every interactive user sees it (service
-# users don't need uv at runtime -- once the venv exists, Python
-# imports are self-contained).
-_ensure_uv() {
-    if command -v uv >/dev/null 2>&1; then
-        info "  uv $(uv --version 2>/dev/null | awk '{print $2}') at $(command -v uv)"
-        return
-    fi
-    info "  uv not found -- installing system-wide to /usr/local/bin"
-    command -v curl >/dev/null || error "curl not found (apt install curl)"
-    # Astral installer honors XDG_BIN_HOME for target dir; UV_NO_MODIFY_PATH=1
-    # because /usr/local/bin is already on every shell's PATH (the older
-    # --no-modify-path flag is deprecated as of uv 0.11.x).
-    if ! curl -LsSf https://astral.sh/uv/install.sh | env XDG_BIN_HOME=/usr/local/bin UV_NO_MODIFY_PATH=1 sh; then
-        error "uv installer failed"
-    fi
-    command -v uv >/dev/null || error "uv installer ran but uv is still not on PATH"
-    info "  uv $(uv --version 2>/dev/null | awk '{print $2}') installed"
-}
+# Ensures `uv` is on PATH.  Delegates to sigmond's shared helper if
+# present; falls back to an inline copy otherwise (covers the bootstrap
+# case where sigmond hasn't been cloned -- hs-uploader doesn't
+# otherwise require sigmond, so we don't force-clone it).  Keep the
+# inline body in sync with sigmond/scripts/install/ensure_uv.sh.
+_ENSURE_UV_SH="/opt/git/sigmond/sigmond/scripts/install/ensure_uv.sh"
+if [[ -r "$_ENSURE_UV_SH" ]]; then
+    # shellcheck source=/dev/null
+    source "$_ENSURE_UV_SH"
+else
+    _ensure_uv() {
+        if command -v uv >/dev/null 2>&1; then
+            printf '[INFO]  uv %s at %s\n' "$(uv --version 2>/dev/null | awk '{print $2}')" "$(command -v uv)"
+            return 0
+        fi
+        printf '[INFO]  uv not found -- installing system-wide to /usr/local/bin\n'
+        command -v curl >/dev/null || { printf '[ERROR] curl not found (apt install curl)\n' >&2; return 1; }
+        if ! curl -LsSf https://astral.sh/uv/install.sh | env XDG_BIN_HOME=/usr/local/bin UV_NO_MODIFY_PATH=1 sh; then
+            printf '[ERROR] uv installer failed\n' >&2
+            return 1
+        fi
+        command -v uv >/dev/null || { printf '[ERROR] uv installer ran but uv is still not on PATH\n' >&2; return 1; }
+        printf '[INFO]  uv %s installed\n' "$(uv --version 2>/dev/null | awk '{print $2}')"
+    }
+fi
 
 check_dependencies() {
     info "Checking dependencies..."
     command -v python3 >/dev/null || error "python3 not found"
-    _ensure_uv
+    _ensure_uv || error "_ensure_uv failed"
 }
 
 install_application() {
