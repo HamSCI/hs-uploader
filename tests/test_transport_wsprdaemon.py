@@ -843,7 +843,14 @@ def test_psk_explicit_band_wins_over_derived():
 
 
 def test_default_compression_is_zstd():
-    """Phase 2 PR 5: zstd-9 is the default for new producers."""
+    """Phase 2 PR 5: zstd-9 is the default for new producers.
+
+    Skipped when ``zstandard`` is not installed — by design, the
+    transport falls back to bz2 if the optional package is missing
+    (see wsprdaemon.py: "without a producer ever blocking on a missing
+    package is more important than the marginal wire-size win").
+    """
+    pytest.importorskip("zstandard")
     from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar
     blob = build_wsprdaemon_tar(
         [], root=Path("/tmp"), rx_site="X_Y",
