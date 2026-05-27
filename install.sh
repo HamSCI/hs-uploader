@@ -119,6 +119,38 @@ uninstall() {
     info "Per-client venv installs (mag/psk/wspr-recorder, wsprdaemon-client) are untouched."
 }
 
+ensure_runtime_state() {
+    # The watermark store at /var/lib/hs-uploader is shared across HamSCI
+    # client users (pskrec, wsprrec, ...) that all belong to the sigmond
+    # supplementary group.  Without setgid root:sigmond perms on the dir,
+    # the first user to construct a SqliteWatermarkStore creates it with
+    # their own group and a second user from a different account hits
+    # "attempt to write a readonly database" on its first ack — observed
+    # on bee1 2026-05-12 and B4-100 2026-05-14.  Fix in three parts:
+    #
+    #   1. ensure the `sigmond` group exists (normally created by
+    #      sigmond/install.sh's `useradd --user-group sigmond`, but
+    #      hs-uploader can be installed standalone without sigmond);
+    #   2. install tmpfiles.d/hs-uploader.conf so systemd-tmpfiles can
+    #      enforce the perms on every boot (recovery from ownership drift);
+    #   3. trigger systemd-tmpfiles --create now so /var/lib/hs-uploader
+    #      exists with the right perms before the first watermark write.
+
+    if ! getent group sigmond >/dev/null 2>&1; then
+        info "Creating sigmond system group"
+        groupadd --system sigmond
+    fi
+
+    if [[ -f "$REPO_ROOT/tmpfiles.d/hs-uploader.conf" ]]; then
+        info "Installing tmpfiles.d/hs-uploader.conf → /etc/tmpfiles.d/"
+        install -m 0644 "$REPO_ROOT/tmpfiles.d/hs-uploader.conf" \
+                /etc/tmpfiles.d/hs-uploader.conf
+        systemd-tmpfiles --create /etc/tmpfiles.d/hs-uploader.conf
+    else
+        warn "tmpfiles.d/hs-uploader.conf not found in repo — skipping"
+    fi
+}
+
 main() {
     check_root
     if [[ "${1:-}" == "--uninstall" ]]; then
@@ -126,6 +158,7 @@ main() {
         return
     fi
     check_dependencies
+    ensure_runtime_state
     install_application
     info "Install complete."
     info "Try:  hs-uploader status"
