@@ -177,6 +177,8 @@ class SqliteSource:
         delete_on_commit: bool = True,
         dedup_partition_by: Optional[Sequence[str]] = None,
         dedup_order_by_desc: Optional[str] = None,
+        ceiling_column: Optional[str] = None,
+        ceiling_provider: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None,
         config: Optional[_ConnectionConfig] = None,
         connect_factory: Optional[Callable[[_ConnectionConfig], sqlite3.Connection]] = None,
     ):
@@ -185,6 +187,28 @@ class SqliteSource:
         self.accepted_schema_versions = list(accepted_schema_versions)
         self.select_columns = list(select_columns) if select_columns else None
         self.start_at = start_at
+        # Optional ship ceiling.  When BOTH ``ceiling_column`` and
+        # ``ceiling_provider`` are set, every query (simple AND dedup
+        # CTE) gains a ``json_extract(payload_json,'$.<ceiling_column>')
+        # <= ceiling_provider(conn)`` clause.  Used by the wsprnet merge
+        # pipeline to hold back rows from WSPR cycles that aren't yet
+        # complete across all receivers (the provider returns the newest
+        # contiguous-complete cycle from wspr_completion.shippable_
+        # ceiling).  Holding incomplete cycles out of the dedup CTE is
+        # what makes the cross-RX best-SNR pick correct — otherwise the
+        # first receiver's copy ships and a later better-SNR copy is
+        # dropped as an already-visited partition.  Provider returning
+        # None means "nothing shippable yet" → empty batch.
+        self.ceiling_column = ceiling_column
+        self.ceiling_provider = ceiling_provider
+        if (self.ceiling_column is not None) != (self.ceiling_provider is not None):
+            raise ValueError(
+                "ceiling_column and ceiling_provider must both be set or both None"
+            )
+        if self.ceiling_column and not self.ceiling_column.replace("_", "").isalnum():
+            raise ValueError(
+                f"ceiling_column {self.ceiling_column!r} must be alphanumeric/underscore"
+            )
         # Optional max-key-wins dedup at the SQL layer.  When BOTH
         # ``dedup_partition_by`` and ``dedup_order_by_desc`` are set,
         # the query is wrapped in a window-function CTE that selects
@@ -269,6 +293,8 @@ class SqliteSource:
         delete_on_commit: bool = True,
         dedup_partition_by: Optional[Sequence[str]] = None,
         dedup_order_by_desc: Optional[str] = None,
+        ceiling_column: Optional[str] = None,
+        ceiling_provider: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None,
         env: Optional[dict] = None,
         connect_factory: Optional[Callable[[_ConnectionConfig], sqlite3.Connection]] = None,
     ) -> "SqliteSource":
@@ -283,6 +309,8 @@ class SqliteSource:
             delete_on_commit=delete_on_commit,
             dedup_partition_by=dedup_partition_by,
             dedup_order_by_desc=dedup_order_by_desc,
+            ceiling_column=ceiling_column,
+            ceiling_provider=ceiling_provider,
             config=cfg,
             connect_factory=connect_factory,
         )
@@ -402,7 +430,15 @@ class SqliteSource:
 
     def _iter_one_batch(self, cur: _Cursor, limit: int) -> Iterator[RecordBatch]:
         conn = self._connect()
-        sql, params = self._build_query(cur, limit)
+        ceiling = None
+        if self.ceiling_provider is not None:
+            ceiling = self.ceiling_provider(conn)
+            if ceiling is None:
+                # Nothing is complete enough to ship yet (every recent
+                # cycle is still waiting on a receiver, none past the
+                # backstop).  Empty batch — try again next pump.
+                return
+        sql, params = self._build_query(cur, limit, ceiling=ceiling)
         rows = conn.execute(sql, params).fetchall()
         if not rows:
             # Probe for stale-schema rows — only when no in-band data
@@ -440,7 +476,9 @@ class SqliteSource:
             commit_token=new_cursor,
         )
 
-    def _build_query(self, cur: _Cursor, limit: int) -> tuple[str, list]:
+    def _build_query(
+        self, cur: _Cursor, limit: int, *, ceiling: Optional[str] = None,
+    ) -> tuple[str, list]:
         clauses = [
             "id > ?",
             "target_db = ?",
@@ -452,6 +490,18 @@ class SqliteSource:
             placeholders = ",".join("?" for _ in self.accepted_schema_versions)
             clauses.append(f"schema_version IN ({placeholders})")
             params.extend(self.accepted_schema_versions)
+
+        # Ship ceiling: exclude rows whose ceiling_column value is newer
+        # than the provided ceiling.  Appended AFTER the cursor/target/
+        # schema clauses but BEFORE extra_where, so it lands in both the
+        # simple query and the dedup CTE filter (cte_clauses = clauses
+        # minus the leading "id > ?").  That keeps incomplete-cycle rows
+        # out of the dedup partition ranking — see __init__.
+        if self.ceiling_column is not None and ceiling is not None:
+            clauses.append(
+                f"json_extract(payload_json, '$.{self.ceiling_column}') <= ?"
+            )
+            params.append(ceiling)
 
         for col, op, value in self.extra_where:
             if op in ("IN", "NOT IN"):

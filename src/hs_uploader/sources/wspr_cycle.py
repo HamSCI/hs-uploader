@@ -75,6 +75,8 @@ class WsprCycleSource:
         db_path: Path | str = "/var/lib/sigmond/sink.db",
         ship_buffer_sec: int = 0,
         start_at: str = "now",
+        expected_reporters: Optional[set] = None,
+        backstop_sec: float = 90.0,
     ):
         """``db_path`` is the sink.db path (must be readable by the
         uploader's runtime user).  ``ship_buffer_sec`` is a defensive
@@ -82,6 +84,14 @@ class WsprCycleSource:
         producer and uploader.  Default 0 because we already rely on
         the producer's SIGUSR1 to wake us only after a cycle is
         committed.
+
+        ``expected_reporters`` enables event-driven cross-receiver
+        gating for the multi-RX merge: a cycle is only shipped once
+        every listed reporter (rx_call, e.g. ``AC0G/B5``) has written
+        its per-cycle ``wspr.noise`` completion rows, OR the cycle is
+        older than ``backstop_sec`` past its end (so a dead receiver
+        can't stall uploads).  Empty/None → no gating (single-receiver
+        behaviour: ship every past cycle).  See wspr_completion.py.
 
         ``start_at`` controls behaviour the first time the source is
         polled with an empty watermark cursor:
@@ -96,6 +106,8 @@ class WsprCycleSource:
         self.db_path = Path(db_path)
         self.ship_buffer_sec = int(ship_buffer_sec)
         self.start_at = start_at
+        self.expected_reporters = set(expected_reporters or ())
+        self.backstop_sec = float(backstop_sec)
         self._conn: Optional[sqlite3.Connection] = None
         # Cached at-first-pump anchor so the "now" mode is stable across
         # multiple iter_batches calls before the first cycle ships.
@@ -115,21 +127,46 @@ class WsprCycleSource:
         """Yield one RecordBatch per shippable cycle, oldest first."""
         conn = self._connect()
         cursor_iso = self._effective_cursor(cursor)
-        floor_iso = self._cycle_floor_iso(datetime.now(timezone.utc))
 
-        # Find distinct cycles past the cursor and before the floor.
+        if self.expected_reporters:
+            # Event-driven cross-RX gate: only ship cycles up to the
+            # newest contiguous-complete one (all expected receivers'
+            # noise rows present, or past the backstop).  Replaces the
+            # plain cycle-floor cutoff with completion awareness.
+            from .wspr_completion import shippable_ceiling
+            ceiling_iso = shippable_ceiling(
+                conn,
+                cursor_iso=cursor_iso,
+                expected=self.expected_reporters,
+                backstop_sec=self.backstop_sec,
+            )
+            if ceiling_iso is None:
+                return
+        else:
+            # Single-receiver: ship everything before the in-progress
+            # cycle (original behaviour).
+            ceiling_iso = self._cycle_floor_iso(datetime.now(timezone.utc))
+
+        # Find distinct cycles past the cursor and at/before the ceiling.
         # `json_extract` lets us pull the cycle timestamp without parsing
-        # every payload in Python.
+        # every payload in Python.  The comparison is `<=` for the
+        # completion ceiling (an exact shippable cycle) but the floor
+        # path passes the in-progress cycle start, which is exclusive —
+        # use `<` there.  Unify by always treating ceiling as inclusive
+        # of complete cycles: when gated, ceiling_iso is a real cycle we
+        # WANT to include, so `<=`.  When ungated, ceiling_iso is the
+        # in-progress floor, exclusive, so `<`.
+        op = "<=" if self.expected_reporters else "<"
         sql = (
             "SELECT DISTINCT json_extract(payload_json, '$.time') AS cycle "
             "FROM pending_uploads "
             "WHERE target_db = 'wspr' "
             "  AND target_table IN ('spots', 'noise') "
             "  AND json_extract(payload_json, '$.time') > ? "
-            "  AND json_extract(payload_json, '$.time') < ? "
+            f"  AND json_extract(payload_json, '$.time') {op} ? "
             "ORDER BY cycle ASC"
         )
-        cycles = [row[0] for row in conn.execute(sql, (cursor_iso, floor_iso))]
+        cycles = [row[0] for row in conn.execute(sql, (cursor_iso, ceiling_iso))]
         if not cycles:
             return
 
