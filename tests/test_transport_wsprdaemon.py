@@ -882,41 +882,36 @@ def test_psk_explicit_band_wins_over_derived():
 # ---- compression knob ----
 
 
-def test_default_compression_is_zstd():
-    """Phase 2 PR 5: zstd-9 is the default for new producers.
+def test_default_compression_is_bz2():
+    """bz2 -9 is the default: smaller tars than zstd (B4-100 benchmark)
+    and dependency-free, the operator's chosen trade (size over CPU)."""
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar
+    blob = build_wsprdaemon_tar(
+        [], root=Path("/tmp"), rx_site="X_Y",
+    )
+    # First 3 bytes are the bz2 magic (BZh).
+    assert blob[:3] == _BZ2_MAGIC
 
-    Skipped when ``zstandard`` is not installed — by design, the
-    transport falls back to bz2 if the optional package is missing
-    (see wsprdaemon.py: "without a producer ever blocking on a missing
-    package is more important than the marginal wire-size win").
-    """
+
+def test_explicit_zstd_still_works():
+    """zstd stays selectable for hosts that install the package and
+    prefer speed over size."""
     pytest.importorskip("zstandard")
     from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar
     blob = build_wsprdaemon_tar(
         [], root=Path("/tmp"), rx_site="X_Y",
+        compression="zstd", compression_level=9,
     )
-    # First 4 bytes are the zstd frame magic.
     assert blob[:4] == _ZSTD_MAGIC
-
-
-def test_explicit_bz2_still_works():
-    """Operators on older wsprdaemon-server builds must be able to
-    pin bz2 explicitly until they upgrade."""
-    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar
-    blob = build_wsprdaemon_tar(
-        [], root=Path("/tmp"), rx_site="X_Y",
-        compression=COMPRESSION_BZ2, compression_level=9,
-    )
-    assert blob[:3] == _BZ2_MAGIC
 
 
 def test_transport_carries_compression_setting():
     """Constructor-level compression flows into the built tar."""
     from hs_uploader.transports.wsprdaemon import WsprdaemonTarSftp
-    t = WsprdaemonTarSftp(servers=["gw1"], compression=COMPRESSION_BZ2)
-    assert t.compression == COMPRESSION_BZ2
+    t = WsprdaemonTarSftp(servers=["gw1"], compression=COMPRESSION_ZSTD)
+    assert t.compression == COMPRESSION_ZSTD
     t_default = WsprdaemonTarSftp(servers=["gw1"])
-    assert t_default.compression == COMPRESSION_ZSTD
+    assert t_default.compression == COMPRESSION_BZ2
 
 
 def test_accepts_includes_psk_spots():

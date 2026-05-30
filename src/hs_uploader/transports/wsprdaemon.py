@@ -48,14 +48,34 @@ from ..core import BatchPolicy, Outcome, RecordBatch
 logger = logging.getLogger(__name__)
 
 
-# Phase 2 PR 5: per-tar compression. zstd-9 is the default after the
-# B4-100 benchmark; bz2 stays selectable for hosts running on
-# wsprdaemon-server builds pre-zstd-sniff. The server sniffs leading
-# magic bytes (not the filename suffix), so a producer flipping
+# Per-tar compression.  bz2 -9 is the default: the B4-100 benchmark
+# showed it produces meaningfully smaller tars than zstd, and the
+# operator prefers minimum wire size over CPU (WSPR upload volume is
+# tiny and the extra compress time is irrelevant against the cycle
+# cadence).  bz2 is also dependency-free (stdlib), so there's no
+# `zstandard` wheel to install on every host.  zstd stays selectable
+# via WSPRDAEMON_TAR_COMPRESSION=zstd for hosts that install the
+# package and would rather trade size for speed.  The wsprdaemon-server
+# sniffs leading magic bytes (not the filename suffix), so flipping
 # `compression` mid-stream is safe as long as every active wd{10,20,30}
 # is running >= Phase 2 PR 1.
 COMPRESSION_ZSTD = "zstd"
 COMPRESSION_BZ2  = "bz2"
+
+
+def _default_known_hosts() -> str:
+    """Writable known_hosts path for the SFTP transport.
+
+    The recorder unit runs with ProtectHome=read-only, so the service
+    user's ``~/.ssh/known_hosts`` can't be written — sftp's first
+    connection to a gateway logs "Failed to add the host to the list of
+    known hosts (/home/<user>/.ssh/known_hosts)".  Put known_hosts in
+    the uploader's state dir instead (default /var/lib/hs-uploader,
+    already a ReadWritePaths in the recorder unit; overridable via
+    HS_UPLOADER_STATE_DIR to match the watermark store location).
+    """
+    base = os.environ.get("HS_UPLOADER_STATE_DIR", "/var/lib/hs-uploader")
+    return str(Path(base) / "known_hosts")
 
 
 # Phase 2 PR 5 also flipped the tar root from `wsprdaemon/` to `wspr/`
@@ -186,7 +206,7 @@ def build_wsprdaemon_tar(
     rx_site: str,
     version: str = "4.0",
     client_info: Optional[tuple[str, str]] = None,
-    compression: str = COMPRESSION_ZSTD,
+    compression: str = COMPRESSION_BZ2,
     compression_level: int = 9,
     tar_root: str = TAR_ROOT_NEW,
 ) -> bytes:
@@ -514,7 +534,7 @@ def build_wsprdaemon_tar_from_records(
     rx_site: str,
     version: str = "4.0",
     client_info: Optional[tuple[str, str]] = None,
-    compression: str = COMPRESSION_ZSTD,
+    compression: str = COMPRESSION_BZ2,
     compression_level: int = 9,
     tar_root: str = TAR_ROOT_NEW,
 ) -> bytes:
@@ -737,13 +757,17 @@ class WsprdaemonTarSftp:
         receiver: Optional[str] = None,
         fallback_ftp: Optional["WsprdaemonTarFtp"] = None,
         primary_table_name: str = "wspr.spots",
-        compression: str = COMPRESSION_ZSTD,
+        compression: str = COMPRESSION_BZ2,
         compression_level: int = 9,
         tar_root: str = TAR_ROOT_NEW,
+        known_hosts_file: Optional[str] = None,
     ):
         self.servers = list(servers)
         self.spool_root = Path(spool_root) if spool_root else None
         self.sftp_user_override = sftp_user
+        # Writable known_hosts (see _default_known_hosts) — avoids the
+        # ProtectHome=read-only "can't write ~/.ssh/known_hosts" warning.
+        self.known_hosts_file = known_hosts_file or _default_known_hosts()
         self.remote_path = remote_path
         self.connect_timeout_sec = connect_timeout_sec
         self.xfer_timeout_sec = xfer_timeout_sec
@@ -949,6 +973,15 @@ class WsprdaemonTarSftp:
             "sftp", "-b", "-",
             "-o", "BatchMode=yes",
             "-o", f"ConnectTimeout={self.connect_timeout_sec}",
+            # Use a writable known_hosts so sftp can persist gateway host
+            # keys under ProtectHome=read-only (and ignore the immutable
+            # system file).  StrictHostKeyChecking=accept-new records a
+            # new gateway's key on first contact but still rejects a
+            # CHANGED key (the _remove_host_key retry path handles a
+            # legitimate gateway rekey).
+            "-o", f"UserKnownHostsFile={self.known_hosts_file}",
+            "-o", "GlobalKnownHostsFile=/dev/null",
+            "-o", "StrictHostKeyChecking=accept-new",
         ]
         if identity.ssh_key_file:
             cmd += ["-i", identity.ssh_key_file]
@@ -968,11 +1001,12 @@ class WsprdaemonTarSftp:
         except subprocess.TimeoutExpired:
             return 1, "sftp timed out"
 
-    @staticmethod
-    def _remove_host_key(server: str) -> None:
-        known_hosts = Path.home() / ".ssh" / "known_hosts"
+    def _remove_host_key(self, server: str) -> None:
+        # Operate on the same writable known_hosts the sftp commands use
+        # (NOT ~/.ssh, which is read-only under ProtectHome).  ssh-keygen
+        # -R is a no-op if the file or entry is absent.
         subprocess.run(
-            ["ssh-keygen", "-f", str(known_hosts), "-R", server],
+            ["ssh-keygen", "-f", self.known_hosts_file, "-R", server],
             capture_output=True,
         )
 
@@ -1010,7 +1044,7 @@ class WsprdaemonTarFtp:
         upload_id: Optional[str] = None,
         name: Optional[str] = None,
         receiver: Optional[str] = None,
-        compression: str = COMPRESSION_ZSTD,
+        compression: str = COMPRESSION_BZ2,
         compression_level: int = 9,
         tar_root: str = TAR_ROOT_NEW,
     ):
