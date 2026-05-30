@@ -479,6 +479,46 @@ def test_tar_from_records_per_band_grouping(tmp_path):
     assert bands == ["30", "40"]
 
 
+def test_tar_from_records_per_receiver_rx_site(tmp_path):
+    """Multi-RX merge: rows from different receivers (distinct rx_call /
+    radiod_id) on the same band+cycle land under per-receiver RX_SITE
+    subtrees, even though the uploader's own identity is the bare base
+    call.  This is what lets ONE merge-uploader post the union to
+    wsprnet as `AC0G` while wsprdaemon.org still sees per-receiver
+    diversity attribution (AC0G/B4, /B5, /B6)."""
+    def _rx_row(rx_call, radiod_id, snr):
+        r = _row_v2(band="20", mode="W2", callsign="K7GXB", snr=snr)
+        r["rx_call"] = rx_call
+        r["radiod_id"] = radiod_id
+        return r
+
+    records = [
+        _record_from_row(_rx_row("AC0G/B4", "B4-100-rx888mk2-status.local", -13)),
+        _record_from_row(_rx_row("AC0G/B5", "bee1-status.local", -9)),
+        _record_from_row(_rx_row("AC0G/B6", "bee2-status.local", -11)),
+    ]
+    # Uploader identity is the BARE merge call — must NOT leak into the
+    # per-row RX_SITE attribution.
+    blob = build_wsprdaemon_tar_from_records(
+        records,
+        rx_call="AC0G", rx_grid="EM38ww",
+        receiver="merge", rx_site="AC0G_EM38ww",
+    )
+    with _open_tar_blob(blob) as tf:
+        spot_names = sorted(
+            n for n in tf.getnames() if n.startswith("wspr/spots/")
+        )
+    # Three distinct RX_SITE subtrees, one per receiver, none under the
+    # bare uploader identity.
+    rx_sites = sorted(n.split("/")[2] for n in spot_names)
+    assert rx_sites == ["AC0G=B4_EM38ww", "AC0G=B5_EM38ww", "AC0G=B6_EM38ww"]
+    # RECEIVER segment derives from radiod_id (mDNS suffix stripped).
+    receivers = sorted(n.split("/")[3] for n in spot_names)
+    assert receivers == ["B4-100-rx888mk2", "bee1", "bee2"]
+    # The bare uploader identity never appears as an RX_SITE.
+    assert not any("/AC0G_EM38ww/" in n for n in spot_names)
+
+
 def test_sftp_ship_via_sqlite_source(tmp_path):
     """End-to-end: WsprdaemonTarSftp with no spool_root, records carry
     columns; receiver= is passed; SFTP fakery confirms upload happens."""

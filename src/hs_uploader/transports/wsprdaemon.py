@@ -544,6 +544,40 @@ def build_wsprdaemon_tar_from_records(
     # Per-receiver forwarding intent collected from psk rows.
     receivers_forward: dict = {}
 
+    def _row_rx_identity(cols: dict) -> tuple:
+        """Per-row receiver identity for diversity attribution.
+
+        When several RX-888s feed one shared sink and a single
+        merge-uploader ships the union, each spot/noise row must be
+        filed under ITS OWN receiver's RX_SITE on wsprdaemon.org —
+        NOT the uploader's identity — so per-receiver diversity stats
+        stay correct.  The producer (wspr-recorder spot_sink) tags
+        every row with `rx_call` / `rx_grid` / `radiod_id`; we derive
+        the RX_SITE and RECEIVER arcname segments from those.
+
+        Falls back to the uploader-level `rx_call` / `rx_grid` /
+        `receiver` / `rx_site` args for rows that don't carry the
+        per-row fields (the FileTreeSource path, and single-receiver
+        deployments predating multi-RX tagging).  Returns
+        (row_rx_call, row_rx_grid, row_receiver, row_rx_site).
+        """
+        row_call = (cols.get("rx_call") or rx_call or "").strip()
+        row_grid = (cols.get("rx_grid") or rx_grid or "").strip()
+        # RECEIVER path segment: the physical receiver, distinct from
+        # the recorder host (all instances share one host).  radiod_id
+        # is per-receiver (`bee1-status.local`); strip the mDNS suffix
+        # and `radiod:` prefix for a clean path component.
+        raw_recv = (
+            cols.get("radiod_id") or cols.get("rx_source")
+            or receiver or "rx"
+        )
+        row_recv = (
+            raw_recv.replace("radiod:", "").replace("-status.local", "")
+            or receiver or "rx"
+        )
+        row_site = _build_rx_site(row_call, row_grid) if row_call else rx_site
+        return (row_call, row_grid, row_recv, row_site)
+
     for r in records:
         cols = getattr(r, "columns", None)
         if not cols:
@@ -584,10 +618,14 @@ def build_wsprdaemon_tar_from_records(
             logger.warning("wsprdaemon-tar: skipping malformed row: %r",
                            list(cols.keys()) if cols else cols)
             continue
+        # Per-row receiver identity → keys the group so two receivers'
+        # same-band-same-cycle rows land in distinct RX_SITE subtrees.
+        rx_id = _row_rx_identity(cols)
         if table == "wspr.noise":
-            # One noise row per (band, cycle); last write wins inside
-            # a single batch (shouldn't happen but be defensive).
-            noise_groups[(band, ts_filename)] = cols
+            # One noise row per (receiver, band, cycle); last write
+            # wins inside a single batch (shouldn't happen but be
+            # defensive).
+            noise_groups[(rx_id, band, ts_filename)] = cols
         else:
             try:
                 mode = cols["mode"]
@@ -595,7 +633,9 @@ def build_wsprdaemon_tar_from_records(
                 logger.warning("wsprdaemon-tar: spot row missing `mode`: %r",
                                list(cols.keys()))
                 continue
-            spot_groups.setdefault((band, mode, ts_filename), []).append(cols)
+            spot_groups.setdefault(
+                (rx_id, band, mode, ts_filename), []
+            ).append(cols)
 
     raw_buf = io.BytesIO()
     with tarfile.open(fileobj=raw_buf, mode="w:") as tf:
@@ -611,24 +651,28 @@ def build_wsprdaemon_tar_from_records(
                 tf, "routing.json",
                 _render_routing_json(receivers_forward),
             )
-        for (band, mode, ts_filename), rows in spot_groups.items():
+        for (rx_id, band, mode, ts_filename), rows in spot_groups.items():
+            row_call, row_grid, row_recv, row_site = rx_id
             is_w = mode.startswith("W")
             if is_w:
-                lines = [_format_extended_line(r, rx_call, rx_grid)
+                # Per-row identity: the spot line carries this
+                # receiver's call+grid, not the uploader's.
+                lines = [_format_extended_line(r, row_call, row_grid)
                          for r in rows]
                 suffix = "_wd_spots.txt"
             else:
                 lines = [_format_short_line(r, w_mode=False) for r in rows]
                 suffix = "_spots.txt"
             content = ("\n".join(lines) + "\n").encode()
-            filename = f"{receiver}_{band}_{mode}_{ts_filename}{suffix}"
-            arcname = f"{tar_root}/spots/{rx_site}/{receiver}/{band}/{filename}"
+            filename = f"{row_recv}_{band}_{mode}_{ts_filename}{suffix}"
+            arcname = f"{tar_root}/spots/{row_site}/{row_recv}/{band}/{filename}"
             _tar_add_bytes(tf, arcname, content)
-        for (band, ts_filename), row in noise_groups.items():
+        for (rx_id, band, ts_filename), row in noise_groups.items():
+            row_call, row_grid, row_recv, row_site = rx_id
             content = (_format_noise_line(row) + "\n").encode()
             # Filename: <RECEIVER>_<BAND>_<YYYYMMDD>_<HHMMSS>_noise.txt
-            filename = f"{receiver}_{band}_{ts_filename}_noise.txt"
-            arcname = f"{tar_root}/noise/{rx_site}/{receiver}/{band}/{filename}"
+            filename = f"{row_recv}_{band}_{ts_filename}_noise.txt"
+            arcname = f"{tar_root}/noise/{row_site}/{row_recv}/{band}/{filename}"
             _tar_add_bytes(tf, arcname, content)
         for (mode, band, cycle), rows in psk_groups.items():
             psk_receiver = (rows[0].get("receiver") or receiver)
