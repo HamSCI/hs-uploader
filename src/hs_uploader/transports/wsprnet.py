@@ -408,10 +408,16 @@ class WsprNet:
             reason = f"{accepted}/{submitted} added"
         else:
             reason = st
+        # Keep the legacy ``wsprnet POST done: … in Ts (R spots/s);
+        # server: …`` shape so `smd watch wspr`'s parser renders the line
+        # exactly as it did on the synchronous path; the async-specific
+        # detail (status / processing_ms / nonce) rides in the server
+        # tail (its capture group is greedy).
+        rate = (client_spots / elapsed) if elapsed > 0 else 0.0
         logger.info(
-            "wsprnet async POST done: %d spots (cycles: %s) in %.2fs; "
-            "server: %s (status=%s, %sms, nonce %s)",
-            client_spots, cycle_summary, elapsed, reason, st,
+            "wsprnet POST done: %d spots (cycles: %s) in %.2fs "
+            "(%.1f spots/s); server: %s [async status=%s, %sms, nonce %s]",
+            client_spots, cycle_summary, elapsed, rate, reason, st,
             result.get("processing_ms"), nonce,
         )
         return Outcome(kind="acked", reason=reason)
