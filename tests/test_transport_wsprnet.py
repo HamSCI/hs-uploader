@@ -540,3 +540,102 @@ def test_ship_collapses_duplicates_in_posted_body():
     # And the winning SNR is -5 (the strong record).
     assert b" -5 " in captured["body"]
     assert b" -22 " not in captured["body"]
+
+
+# ----- async upload API (W1GJM) -----
+
+class _JsonResp:
+    def __init__(self, payload, status=200):
+        import json as _json
+        self.status = status
+        self._body = _json.dumps(payload).encode()
+
+    def read(self):
+        return self._body
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *args):
+        return False
+
+
+def test_async_submit_and_poll_done():
+    """Submit returns a nonce; status poll returns done with counts."""
+    calls = []
+
+    def fake_urlopen(req, timeout):
+        calls.append((req.method, req.full_url))
+        if req.full_url.endswith("/upload"):
+            return _JsonResp({"nonce": "abc123", "queued": True})
+        # status poll
+        return _JsonResp({
+            "nonce": "abc123", "status": "done",
+            "accepted": 48, "submitted": 50, "processing_ms": 1820,
+        })
+
+    t = WsprNet(
+        urlopen=fake_urlopen,
+        api_base_url="https://wsprnet.org/api/upload/v1",
+        poll_interval_sec=0.01,
+    )
+    outcome = t.ship(RecordBatch(records=(_spot(),), cursor_after=b""), _ident())
+    assert outcome.kind == "acked"
+    assert outcome.reason == "48/50 added"
+    # Submit went to <base>/upload, then a status GET to <base>/status/<nonce>.
+    assert calls[0] == ("POST", "https://wsprnet.org/api/upload/v1/upload")
+    assert ("GET", "https://wsprnet.org/api/upload/v1/status/abc123") in calls
+
+
+def test_async_status_failed_is_acked():
+    def fake_urlopen(req, timeout):
+        if req.full_url.endswith("/upload"):
+            return _JsonResp({"nonce": "n1", "queued": True})
+        return _JsonResp({"nonce": "n1", "status": "failed",
+                          "accepted": 0, "submitted": 5})
+
+    t = WsprNet(urlopen=fake_urlopen,
+                api_base_url="https://wsprnet.org/api/upload/v1",
+                poll_interval_sec=0.01)
+    outcome = t.ship(RecordBatch(records=(_spot(),), cursor_after=b""), _ident())
+    assert outcome.kind == "acked"
+    assert outcome.reason == "0/5 added"
+
+
+def test_async_no_nonce_is_acked():
+    def fake_urlopen(req, timeout):
+        return _JsonResp({"queued": False, "error": "bad"})
+
+    t = WsprNet(urlopen=fake_urlopen,
+                api_base_url="https://wsprnet.org/api/upload/v1",
+                poll_interval_sec=0.01)
+    outcome = t.ship(RecordBatch(records=(_spot(),), cursor_after=b""), _ident())
+    assert outcome.kind == "acked"
+    assert "no nonce" in outcome.reason
+
+
+def test_async_poll_timeout_is_acked():
+    """Status never reaches done within poll_max_sec → acked, not retried."""
+    def fake_urlopen(req, timeout):
+        if req.full_url.endswith("/upload"):
+            return _JsonResp({"nonce": "n2", "queued": True})
+        return _JsonResp({"nonce": "n2", "status": "processing"})
+
+    t = WsprNet(urlopen=fake_urlopen,
+                api_base_url="https://wsprnet.org/api/upload/v1",
+                poll_interval_sec=0.01, poll_max_sec=0.05)
+    outcome = t.ship(RecordBatch(records=(_spot(),), cursor_after=b""), _ident())
+    assert outcome.kind == "acked"
+    assert "pending" in outcome.reason or "processing" in outcome.reason
+
+
+def test_async_disabled_uses_legacy_url():
+    captured = {}
+
+    def fake_urlopen(req, timeout):
+        captured["url"] = req.full_url
+        return _FakeResp(status=200)
+
+    t = WsprNet(urlopen=fake_urlopen)  # no api_base_url
+    t.ship(RecordBatch(records=(_spot(),), cursor_after=b""), _ident())
+    assert captured["url"] == "http://wsprnet.org/meptspots.php"

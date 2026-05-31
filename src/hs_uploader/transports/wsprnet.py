@@ -80,12 +80,27 @@ class WsprNet:
         urlopen=None,
         name: Optional[str] = None,
         max_spots_per_upload: int = MAX_SPOTS_PER_UPLOAD,
+        api_base_url: Optional[str] = None,
+        poll_interval_sec: float = 1.0,
+        poll_max_sec: float = 60.0,
     ):
         self.url = url
         self.version = version
         self.upload_timeout_sec = upload_timeout_sec
         self._urlopen = urlopen or urllib.request.urlopen
         self.name = name or f"wsprnet:{url}"
+        # Optional async upload API (W1GJM, 2026-05).  When set (e.g.
+        # ``https://wsprnet.org/api/upload/v1``) the same multipart body
+        # is POSTed to ``<base>/upload``, which returns immediately with
+        # ``{"nonce": ..., "queued": true}``; we then poll
+        # ``<base>/status/<nonce>`` until ``done``/``failed`` for the
+        # accepted/submitted counts.  Unset → the legacy blocking
+        # ``meptspots.php`` POST (default).
+        self._api_base_url = (api_base_url or "").strip().rstrip("/") or None
+        self._poll_interval_sec = max(0.05, float(poll_interval_sec))
+        self._poll_max_sec = max(1.0, float(poll_max_sec))
+        if self._api_base_url:
+            self.name = name or f"wsprnet-async:{self._api_base_url}"
         # Caller-controlled batch ceiling so an operator can opt into
         # per-spot POSTs (``max_spots_per_upload=1``) for diagnostic
         # tracking — wsprnet's "M out of N added" response then
@@ -207,9 +222,12 @@ class WsprNet:
         client_spots = body.count(b"\n")
         body_kb = round(len(body) / 1024.0, 1)
         logger.info(
-            "wsprnet POST start: %d spots (cycles: %s, %.1f KB)",
+            "wsprnet POST start: %d spots (cycles: %s, %.1f KB)%s",
             client_spots, cycle_summary, body_kb,
+            " [async API]" if self._api_base_url else "",
         )
+        if self._api_base_url:
+            return self._post_async(multipart, client_spots, cycle_summary)
         post_t0 = time.monotonic()
         try:
             with self._urlopen(req, timeout=self.upload_timeout_sec) as resp:
@@ -293,6 +311,108 @@ class WsprNet:
             "(%.1f spots/s); server: %s",
             client_spots, cycle_summary, elapsed, rate,
             reason or "no count",
+        )
+        return Outcome(kind="acked", reason=reason)
+
+    def _post_async(
+        self,
+        multipart: bytes,
+        client_spots: int,
+        cycle_summary: str,
+    ) -> Outcome:
+        """Async upload API: submit → nonce → poll status.
+
+        Same no-retry policy as the legacy path — any server response (or
+        a poll timeout) acks the batch so the watermark advances.  The
+        server keeps results 24 h, so a poll timeout just means we don't
+        log the final count, not that the spots were lost.
+        """
+        import json
+        upload_url = f"{self._api_base_url}/upload"
+        post_t0 = time.monotonic()
+        # 1. Submit — returns {"nonce": ..., "queued": true} immediately.
+        req = urllib.request.Request(
+            upload_url,
+            data=multipart,
+            headers={
+                "Content-Type":
+                    "multipart/form-data; boundary=" + _BOUNDARY.decode(),
+            },
+            method="POST",
+        )
+        try:
+            with self._urlopen(req, timeout=self.upload_timeout_sec) as resp:
+                submit = json.loads(resp.read().decode(errors="replace") or "{}")
+        except urllib.error.HTTPError as exc:
+            body = ""
+            try:
+                body = exc.read().decode(errors="replace")
+            except Exception:  # noqa: BLE001
+                pass
+            logger.warning(
+                "wsprnet async submit failed: HTTP %d — %s",
+                exc.code, body[:160],
+            )
+            return Outcome(kind="acked",
+                           reason=f"HTTP {exc.code} (no retry): {body[:200]}")
+        except (urllib.error.URLError, TimeoutError, OSError) as exc:
+            elapsed = time.monotonic() - post_t0
+            logger.warning(
+                "wsprnet async submit timeout/network error in %.2fs "
+                "(no retry — acked): %s", elapsed, exc,
+            )
+            return Outcome(kind="acked",
+                           reason=f"timeout/network error (no retry): {exc}")
+        except ValueError as exc:
+            logger.warning("wsprnet async: submit response not JSON: %s", exc)
+            return Outcome(kind="acked", reason="bad submit response")
+
+        nonce = (submit or {}).get("nonce")
+        if not nonce:
+            logger.warning("wsprnet async: no nonce in submit response: %r",
+                           submit)
+            return Outcome(kind="acked", reason="no nonce returned")
+
+        # 2. Poll <base>/status/<nonce> until done/failed or timeout.
+        status_url = f"{self._api_base_url}/status/{nonce}"
+        deadline = time.monotonic() + self._poll_max_sec
+        result = None
+        while time.monotonic() < deadline:
+            time.sleep(self._poll_interval_sec)
+            try:
+                sreq = urllib.request.Request(status_url, method="GET")
+                with self._urlopen(sreq, timeout=self.upload_timeout_sec) as r:
+                    result = json.loads(r.read().decode(errors="replace") or "{}")
+            except (urllib.error.HTTPError, urllib.error.URLError,
+                    TimeoutError, OSError, ValueError) as exc:
+                logger.debug("wsprnet async: status poll error (retrying): %s",
+                             exc)
+                continue
+            if (result or {}).get("status") in ("done", "failed"):
+                break
+
+        elapsed = time.monotonic() - post_t0
+        st = (result or {}).get("status")
+        if st not in ("done", "failed"):
+            logger.warning(
+                "wsprnet async: status still %r after %.1fs polling "
+                "(nonce %s) — acked, results kept 24h server-side",
+                st or "unknown", elapsed, nonce,
+            )
+            return Outcome(kind="acked",
+                           reason=f"async {st or 'pending'} (nonce {nonce})")
+
+        accepted = result.get("accepted")
+        submitted = result.get("submitted")
+        if accepted is not None and submitted is not None:
+            reason = f"{accepted}/{submitted} added"
+        else:
+            reason = st
+        logger.info(
+            "wsprnet async POST done: %d spots (cycles: %s) in %.2fs; "
+            "server: %s (status=%s, %sms, nonce %s)",
+            client_spots, cycle_summary, elapsed, reason, st,
+            result.get("processing_ms"), nonce,
         )
         return Outcome(kind="acked", reason=reason)
 
