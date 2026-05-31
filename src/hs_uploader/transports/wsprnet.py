@@ -404,8 +404,12 @@ class WsprNet:
 
         accepted = result.get("accepted")
         submitted = result.get("submitted")
+        rejected = result.get("rejected")
+        rejections = result.get("rejections") or []
         if accepted is not None and submitted is not None:
             reason = f"{accepted}/{submitted} added"
+            if rejected:
+                reason += f", {rejected} rejected"
         else:
             reason = st
         # Keep the legacy ``wsprnet POST done: … in Ts (R spots/s);
@@ -420,6 +424,15 @@ class WsprNet:
             client_spots, cycle_summary, elapsed, rate, reason, st,
             result.get("processing_ms"), nonce,
         )
+        # Itemise what the server bounced (e.g. no_grid for type-2 spots)
+        # so operators can see it in the journal / `smd watch wspr`.
+        # rejections[] shape is server-defined — render whatever it sends.
+        if rejections:
+            logger.info(
+                "wsprnet POST rejections (%d, nonce %s): %s",
+                len(rejections), nonce,
+                "; ".join(str(r) for r in rejections[:25]),
+            )
         return Outcome(kind="acked", reason=reason)
 
 

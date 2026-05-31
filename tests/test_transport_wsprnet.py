@@ -639,3 +639,21 @@ def test_async_disabled_uses_legacy_url():
     t = WsprNet(urlopen=fake_urlopen)  # no api_base_url
     t.ship(RecordBatch(records=(_spot(),), cursor_after=b""), _ident())
     assert captured["url"] == "http://wsprnet.org/meptspots.php"
+
+
+def test_async_surfaces_rejections_in_reason():
+    def fake_urlopen(req, timeout):
+        if req.full_url.endswith("/upload"):
+            return _JsonResp({"nonce": "n3", "queued": True})
+        return _JsonResp({
+            "nonce": "n3", "status": "done", "accepted": 48,
+            "submitted": 50, "rejected": 2,
+            "rejections": [{"call": "W4UK/P", "reason": "no_grid"},
+                           {"call": "AB1CD", "reason": "no_grid"}],
+        })
+    t = WsprNet(urlopen=fake_urlopen,
+                api_base_url="https://wsprnet.org/api/upload/v1",
+                poll_interval_sec=0.01)
+    oc = t.ship(RecordBatch(records=(_spot(),), cursor_after=b""), _ident())
+    assert oc.kind == "acked"
+    assert oc.reason == "48/50 added, 2 rejected"
