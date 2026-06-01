@@ -81,7 +81,10 @@ class WsprNet:
         name: Optional[str] = None,
         max_spots_per_upload: int = MAX_SPOTS_PER_UPLOAD,
         api_base_url: Optional[str] = None,
-        poll_interval_sec: float = 1.0,
+        # 5s (not 1s) to ease status-poll load on wsprnet.org: server
+        # processing is ~3-6s, so the 1st-2nd poll still catches "done"
+        # with no practical latency cost, well within poll_max_sec.
+        poll_interval_sec: float = 5.0,
         poll_max_sec: float = 60.0,
     ):
         self.url = url
