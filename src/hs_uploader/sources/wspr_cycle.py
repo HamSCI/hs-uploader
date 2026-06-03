@@ -66,8 +66,10 @@ class WsprCycleSource:
     """
 
     # Transports use this to decide whether to accept records from
-    # this source.  Both subtables travel together.
-    ACCEPTS = {"wspr.spots": [1, 2], "wspr.noise": [1, 2]}
+    # this source.  Both subtables travel together.  psk.spots is
+    # listed too (safe — the transport only routes records it's given;
+    # see include_psk below for the gating).
+    ACCEPTS = {"wspr.spots": [1, 2], "wspr.noise": [1, 2], "psk.spots": [1, 2]}
 
     def __init__(
         self,
@@ -77,6 +79,7 @@ class WsprCycleSource:
         start_at: str = "now",
         expected_reporters: Optional[set] = None,
         backstop_sec: float = 90.0,
+        include_psk: bool = False,
     ):
         """``db_path`` is the sink.db path (must be readable by the
         uploader's runtime user).  ``ship_buffer_sec`` is a defensive
@@ -108,6 +111,11 @@ class WsprCycleSource:
         self.start_at = start_at
         self.expected_reporters = set(expected_reporters or ())
         self.backstop_sec = float(backstop_sec)
+        # When True, also pull this cycle's psk.spots (FT8/FT4/...) rows
+        # into the same RecordBatch so they ride in the per-cycle
+        # wsprdaemon tar.  Default False so existing callers are
+        # unaffected (no separate psk pipeline needed when True).
+        self.include_psk = bool(include_psk)
         self._conn: Optional[sqlite3.Connection] = None
         # Cached at-first-pump anchor so the "now" mode is stable across
         # multiple iter_batches calls before the first cycle ships.
@@ -289,25 +297,69 @@ class WsprCycleSource:
             else:
                 n_noise += 1
 
+        # PSK rides along: pull this cycle's psk.spots rows (FT8/FT4/...)
+        # for the same 2-minute window and append them as psk.spots
+        # records so they ship inside the per-cycle wsprdaemon tar.
+        # Gated by include_psk; no separate psk pipeline needed.
+        n_psk = 0
+        if self.include_psk:
+            try:
+                next_cycle_dt = datetime.fromisoformat(
+                    cycle_iso.replace("Z", "+00:00")
+                ) + timedelta(minutes=2)
+                next_cycle_iso = next_cycle_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            except (ValueError, AttributeError):
+                next_cycle_iso = cycle_iso
+            for (payload_json,) in conn.execute(
+                "SELECT payload_json FROM pending_uploads "
+                "WHERE target_db = 'psk' AND target_table = 'spots' "
+                "  AND json_extract(payload_json, '$.time') >= ? "
+                "  AND json_extract(payload_json, '$.time') < ? "
+                "ORDER BY id ASC",
+                (cycle_iso, next_cycle_iso),
+            ):
+                try:
+                    payload = json.loads(payload_json)
+                except json.JSONDecodeError as exc:
+                    logger.warning(
+                        "WsprCycleSource: corrupt psk payload in cycle %s: %s",
+                        cycle_iso, exc,
+                    )
+                    continue
+                try:
+                    rec_time = datetime.fromisoformat(
+                        payload["time"].replace("Z", "+00:00")
+                    )
+                except (KeyError, ValueError, AttributeError):
+                    rec_time = datetime.fromisoformat(
+                        cycle_iso.replace("Z", "+00:00")
+                    )
+                records.append(Record(
+                    table="psk.spots",
+                    time=rec_time,
+                    columns=payload,
+                ))
+                n_psk += 1
+
         if not records:
             return None
 
-        if n_noise == 0:
+        if n_noise == 0 and n_spots > 0:
             logger.warning(
                 "WsprCycleSource: cycle %s shipping spots-only "
-                "(%d spots, 0 noise rows) — noise unexpectedly missing",
-                cycle_iso, n_spots,
+                "(%d spots, 0 noise rows, %d psk) — noise unexpectedly missing",
+                cycle_iso, n_spots, n_psk,
             )
-        elif n_spots == 0:
+        elif n_spots == 0 and n_noise > 0:
             logger.warning(
                 "WsprCycleSource: cycle %s shipping noise-only "
-                "(%d noise, 0 spot rows) — spots unexpectedly missing",
-                cycle_iso, n_noise,
+                "(%d noise, 0 spot rows, %d psk) — spots unexpectedly missing",
+                cycle_iso, n_noise, n_psk,
             )
         else:
             logger.info(
-                "WsprCycleSource: cycle %s ready (%d spots, %d noise)",
-                cycle_iso, n_spots, n_noise,
+                "WsprCycleSource: cycle %s ready (%d spots, %d noise, %d psk)",
+                cycle_iso, n_spots, n_noise, n_psk,
             )
 
         return RecordBatch(

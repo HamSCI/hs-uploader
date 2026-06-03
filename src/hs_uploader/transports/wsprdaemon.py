@@ -851,6 +851,11 @@ class WsprdaemonTarSftp:
                 "so the gateway can auto-provision SFTP for the next cycle)"
             )
             return self.fallback_ftp.ship(batch, identity)
+        # On a successful ship, carry the wire size so the shim can
+        # report the per-cycle tar byte count in its journal line.
+        if outcome.succeeded and tar_bytes is not None:
+            from dataclasses import replace as _dc_replace
+            return _dc_replace(outcome, n_bytes=len(tar_bytes))
         return outcome
 
     def serialize_for_retry(self, batch: RecordBatch, identity) -> bytes:

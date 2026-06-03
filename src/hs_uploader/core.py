@@ -102,6 +102,7 @@ class Outcome:
     reason: str = ""
     accepted_cursor: Optional[bytes] = None
     rejected: Sequence[Record] = ()
+    n_bytes: int = 0  # transport payload size in bytes (e.g. tar bytes); 0 when N/A
 
     @classmethod
     def acked(cls) -> "Outcome":
