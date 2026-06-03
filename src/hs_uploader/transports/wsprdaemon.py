@@ -546,9 +546,11 @@ def build_wsprdaemon_tar_from_records(
                    wspr/spots/<RX_SITE>/<RECEIVER>/<BAND>/<filename>
       wspr.noise → grouped by (band, cycle) →
                    wspr/noise/<RX_SITE>/<RECEIVER>/<BAND>/<filename>
-      psk.spots  → grouped by (mode, band, cycle) →
+      psk.spots  → grouped by (rx_site, receiver, mode, band, cycle) →
                    <mode>/<RX_SITE>/<RECEIVER>/<BAND>/<filename>.jsonl
-                   (mode = `ft8`, `ft4`, future `msk144`, …)
+                   (mode = `ft8`, `ft4`, future `msk144`, …; RX_SITE and
+                   RECEIVER derived per-row so multi-receiver sinks stay
+                   filed under each receiver's own identity)
 
     Spot records without a `table` attribute default to wspr.spots for
     back-compat with the file-source path that still emits naked
@@ -619,9 +621,35 @@ def build_wsprdaemon_tar_from_records(
                 freq_hz = int(cols.get("frequency") or 0)
                 band = _freq_to_band(freq_hz / 1_000_000.0) if freq_hz else 0
             cycle = _psk_cycle_key(cols.get("time", ""))
-            psk_groups.setdefault((mode, band, cycle), []).append(cols)
-            psk_receiver = cols.get("receiver") or receiver
-            key = f"{rx_site}/{psk_receiver}"
+            # Per-row receiver identity — file each spot under ITS OWN
+            # receiver's RX_SITE/RECEIVER, mirroring the WSPR path
+            # (spot_groups keyed by rx_id).  Without the receiver in the
+            # group key, every receiver sharing this merge-uploader's
+            # sink collapses into one RX_SITE/RECEIVER subtree (the bare
+            # base call), losing per-receiver identity at wsprdaemon-
+            # server ingest.  reporter_id/host_call → callsign (may hold
+            # a '/', which _build_rx_site encodes to '='); host_grid →
+            # grid; radiod_id/rx_source → the physical receiver segment.
+            psk_call = (
+                cols.get("reporter_id") or cols.get("host_call")
+                or rx_call or ""
+            ).strip()
+            psk_grid = (cols.get("host_grid") or rx_grid or "").strip()
+            raw_recv = (
+                cols.get("radiod_id") or cols.get("rx_source")
+                or receiver or "rx"
+            )
+            psk_recv = (
+                raw_recv.replace("radiod:", "").replace("-status.local", "")
+                or receiver or "rx"
+            )
+            psk_site = (
+                _build_rx_site(psk_call, psk_grid) if psk_call else rx_site
+            )
+            psk_groups.setdefault(
+                (psk_site, psk_recv, mode, band, cycle), []
+            ).append(cols)
+            key = f"{psk_site}/{psk_recv}"
             # If any single row in this receiver's batch wants
             # forwarding=False, the receiver-level flag flips False.
             # Conservative: prefer NOT-forwarding when the producer
@@ -694,8 +722,7 @@ def build_wsprdaemon_tar_from_records(
             filename = f"{row_recv}_{band}_{ts_filename}_noise.txt"
             arcname = f"{tar_root}/noise/{row_site}/{row_recv}/{band}/{filename}"
             _tar_add_bytes(tf, arcname, content)
-        for (mode, band, cycle), rows in psk_groups.items():
-            psk_receiver = (rows[0].get("receiver") or receiver)
+        for (psk_site, psk_recv, mode, band, cycle), rows in psk_groups.items():
             # One JSONL row per spot, ordered by time then frequency
             # for byte-stable retries.
             rows_sorted = sorted(
@@ -705,7 +732,7 @@ def build_wsprdaemon_tar_from_records(
             lines = [json.dumps(c, default=str, sort_keys=True) for c in rows_sorted]
             content = ("\n".join(lines) + "\n").encode()
             filename = f"{cycle}_{mode}.jsonl"
-            arcname = f"{mode}/{rx_site}/{psk_receiver}/{band}/{filename}"
+            arcname = f"{mode}/{psk_site}/{psk_recv}/{band}/{filename}"
             _tar_add_bytes(tf, arcname, content)
     return _compress_tar_bytes(
         raw_buf.getvalue(),
