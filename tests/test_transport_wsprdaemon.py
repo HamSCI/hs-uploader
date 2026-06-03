@@ -718,7 +718,12 @@ def test_psk_records_emit_jsonl_under_mode_peer_dir():
         ft8_files = [n for n in names if n.startswith("ft8/")]
         assert len(ft8_files) == 1, names
         n = ft8_files[0]
-        assert n.startswith("ft8/AC0G=B1_EM38ww/KA9Q_RX888/20/"), n
+        # RECEIVER segment is the cleaned radiod_id (the per-receiver
+        # identity; the uploader-level `receiver` arg is only a fallback
+        # when a row has no radiod_id/rx_source — see 80bccdb). _psk_row
+        # sets radiod_id="my-rx888"; the production `receiver` column is
+        # empty, so radiod_id is what distinguishes bee1/bee2/B4 on wd30.
+        assert n.startswith("ft8/AC0G=B1_EM38ww/my-rx888/20/"), n
         assert n.endswith("_ft8.jsonl"), n
         content = tf.extractfile(n).read().decode().splitlines()
     assert len(content) == 1
@@ -776,25 +781,36 @@ def test_psk_records_routing_collapses_when_all_forward_false():
 
 
 def test_psk_records_routing_emits_per_receiver_overrides_when_mixed():
-    """Two receivers with different forwarding intent → default plus the
-    minority as an explicit override."""
+    """Two receivers (distinct radiod_id) with different forwarding intent
+    → default plus the minority as an explicit override.
+
+    The per-receiver key is ``<RX_SITE>/<radiod_id>``: in production the
+    psk row's ``receiver`` column is empty and radiod_id carries the
+    per-receiver identity (bee1/bee2/B4), so routing.json and the tar
+    paths both discriminate on radiod_id (see 80bccdb)."""
     from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
     import json as _j
+
+    def _row(radiod_id, fwd):
+        r = _psk_row(forward_to_pskreporter=fwd)
+        r["radiod_id"] = radiod_id
+        return r
+
     records = [
-        _psk_record(_psk_row(receiver="KA9Q_A", forward_to_pskreporter=True)),
-        _psk_record(_psk_row(receiver="KA9Q_A", forward_to_pskreporter=True)),
-        _psk_record(_psk_row(receiver="KA9Q_B", forward_to_pskreporter=False)),
+        _psk_record(_row("rxA", True)),
+        _psk_record(_row("rxA", True)),
+        _psk_record(_row("rxB", False)),
     ]
     blob = build_wsprdaemon_tar_from_records(
         records, rx_call="AC0G/B1", rx_grid="EM38ww",
-        receiver="KA9Q_A", rx_site="AC0G=B1_EM38ww",
+        receiver="rxA", rx_site="AC0G=B1_EM38ww",
     )
     with _open_tar_blob(blob) as tf:
         routing = _j.loads(tf.extractfile("routing.json").read())
     assert routing["default"]["forward_to_pskreporter"] is True
-    assert routing["AC0G=B1_EM38ww/KA9Q_B"]["forward_to_pskreporter"] is False
-    # KA9Q_A matches default → omitted from override map.
-    assert "AC0G=B1_EM38ww/KA9Q_A" not in routing
+    assert routing["AC0G=B1_EM38ww/rxB"]["forward_to_pskreporter"] is False
+    # rxA matches default → omitted from override map.
+    assert "AC0G=B1_EM38ww/rxA" not in routing
 
 
 def test_mixed_batch_packs_wspr_and_ft8_into_one_tar():
