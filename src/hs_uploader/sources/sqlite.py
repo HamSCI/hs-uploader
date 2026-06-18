@@ -144,8 +144,19 @@ def _default_connect_factory(cfg: _ConnectionConfig) -> sqlite3.Connection:
     Read-write is required (commit deletes rows).  WAL mode (set by the
     writer when it initialises the schema) lets us read concurrently
     while the producer is mid-insert.
+
+    ``temp_store=MEMORY`` keeps SQLite's transient sort/materialise
+    B-trees in RAM instead of spilling them to the temp directory.
+    Consumer units run under systemd ``ProtectSystem=strict``, which
+    mounts ``/tmp`` and ``/var/tmp`` read-only; a query that spills
+    (e.g. the cycle-ceiling scan over a large ``pending_uploads``
+    backlog) would otherwise fail with ``sqlite3.OperationalError:
+    disk I/O error``.  Our batches are ``LIMIT``-bounded, so the
+    in-memory temp store cannot grow unboundedly.
     """
-    return sqlite3.connect(cfg.path, timeout=30.0)
+    conn = sqlite3.connect(cfg.path, timeout=30.0)
+    conn.execute("PRAGMA temp_store=MEMORY")
+    return conn
 
 
 # ---- source ----------------------------------------------------------------
