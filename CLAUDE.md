@@ -18,7 +18,7 @@ Its consumers run a per-pipeline pump worker in-process.
 ## Authors
 
 - Michael Hauan (AC0G, GitHub: mijahauan)
-- Repo: https://github.com/mijahauan/hs-uploader
+- Repo: https://github.com/HamSCI/hs-uploader
 
 ## Commands
 
