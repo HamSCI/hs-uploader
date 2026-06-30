@@ -23,10 +23,17 @@ Manifest shape::
                          host = "pswsnetwork.eng.ua.edu" table = "grape.dataset"
     [pipeline.identity]  station_id = "S000418"   # optional per-pipeline override
 
-Source types: ``sqlite``, ``filetree``.  Transport types: ``psws_dataset``,
-``pskreporter``, ``wsprnet``.  (The cycle-aligned wsprdaemon tar — which needs a
-runtime ``ceiling_provider`` callable + receiver/FTP-fallback objects — is built
-by a code ``builder`` entrypoint instead; see ``hs_uploader.daemon``.)
+Source types: ``sqlite``, ``filetree``, ``wspr_cycle``.  Transport types:
+``psws_dataset``, ``pskreporter``, ``wsprnet``, ``wsprdaemon_tar``.
+
+The cycle-aligned wsprdaemon tar is expressed generically here
+(``wspr_cycle`` source + ``wsprdaemon_tar`` transport): every piece is an
+hs-uploader class, so the daemon builds it from the manifest with NO import
+of any client package.  A ``builder = "module:func"`` entrypoint
+(see ``hs_uploader.daemon``) remains available for pipelines whose
+construction genuinely needs runtime objects a client owns — but wspr is
+not one of them.  For the multi-receiver merge, set
+``expected_reporters`` on the ``wspr_cycle`` source.
 """
 
 from __future__ import annotations
@@ -40,8 +47,10 @@ from .config import StationIdentity
 from .core import Pipeline, RetryPolicy
 from .sources import FileSpec, FileTreeSource
 from .sources.sqlite import SqliteSource
+from .sources.wspr_cycle import WsprCycleSource
 from .transports.pskreporter import PskReporterTcp
 from .transports.psws_magnetometer import PswsDatasetSftp
+from .transports.wsprdaemon import WsprdaemonTarFtp, WsprdaemonTarSftp
 from .transports.wsprnet import WsprNet
 from .watermark.sqlite import SqliteWatermarkStore, default_path
 
@@ -95,6 +104,21 @@ def _build_source(spec: Mapping[str, Any]):
             dedup_partition_by=spec.get("dedup_partition_by"),
             dedup_order_by_desc=spec.get("dedup_order_by_desc"),
         )
+    if stype == "wspr_cycle":
+        # Cycle-aligned source over sink.db: one RecordBatch per WSPR
+        # 2-min cycle bundling wspr.spots + wspr.noise (+ psk.spots when
+        # ``include_psk``), shipped as one tar by ``wsprdaemon_tar``.
+        # ``expected_reporters`` (a list of rx_call strings) turns on the
+        # event-driven cross-receiver merge gate; absent/empty = single-rx.
+        reporters = spec.get("expected_reporters")
+        return WsprCycleSource(
+            db_path=str(spec.get("db_path", "/var/lib/sigmond/sink.db")),
+            start_at=str(spec.get("start_at", "now")),
+            expected_reporters=set(reporters) if reporters else None,
+            backstop_sec=float(spec.get("backstop_sec", 90.0)),
+            include_psk=bool(spec.get("include_psk", False)),
+            ship_buffer_sec=int(spec.get("ship_buffer_sec", 0)),
+        )
     raise ValueError(f"unknown source type: {stype!r}")
 
 
@@ -140,6 +164,45 @@ def _build_transport(spec: Mapping[str, Any]):
         if spec.get("name") is not None:
             kw["name"] = str(spec["name"])
         return WsprNet(**kw)
+    if ttype == "wsprdaemon_tar":
+        # Cycle-aligned tar to wsprdaemon.org via SFTP, with an optional
+        # FTP-fallback leg (``[pipeline.transport.ftp_fallback]``) used
+        # only when every SFTP server rejects auth — typically first-time
+        # bootstrap, where the FTP tar carries ``client_upload_info.txt``
+        # so the gateway auto-provisions SFTP for this station's pubkey.
+        fb = None
+        fbspec = spec.get("ftp_fallback")
+        if fbspec and (fbspec.get("servers")):
+            fb_kw: dict[str, Any] = dict(
+                servers=list(fbspec["servers"]),
+                ftp_user=str(fbspec.get("ftp_user", "noisegraphs")),
+                remote_path=str(fbspec.get("remote_path", "upload")),
+            )
+            if fbspec.get("ftp_password") is not None:
+                fb_kw["ftp_password"] = str(fbspec["ftp_password"])
+            if fbspec.get("ftp_password_file"):
+                fb_kw["ftp_password_file"] = str(fbspec["ftp_password_file"])
+            # Keep the fallback tar's wire format in sync with the SFTP leg.
+            for k in ("version", "compression", "tar_root", "receiver"):
+                if spec.get(k) is not None:
+                    fb_kw[k] = str(spec[k])
+            if spec.get("upload_id"):
+                fb_kw["upload_id"] = str(spec["upload_id"])
+            fb = WsprdaemonTarFtp(**fb_kw)
+        kw = dict(servers=list(spec.get("servers") or []))
+        for k in ("remote_path", "version", "compression", "tar_root", "name"):
+            if spec.get(k) is not None:
+                kw[k] = str(spec[k])
+        if spec.get("sftp_user"):
+            kw["sftp_user"] = str(spec["sftp_user"])
+        if spec.get("upload_id"):
+            kw["upload_id"] = str(spec["upload_id"])
+        if spec.get("receiver"):
+            kw["receiver"] = str(spec["receiver"])
+        # WsprCycleSource parks its watermark on "wspr.cycle" so it doesn't
+        # collide with the raw-table (wspr.spots) wsprnet pipeline.
+        kw["primary_table_name"] = str(spec.get("primary_table_name", "wspr.cycle"))
+        return WsprdaemonTarSftp(fallback_ftp=fb, **kw)
     raise ValueError(f"unknown transport type: {ttype!r}")
 
 
