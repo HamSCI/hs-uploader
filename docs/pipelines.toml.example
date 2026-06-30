@@ -1,0 +1,122 @@
+# hs-uploader single-host daemon manifest — REFERENCE EXAMPLE
+# =============================================================
+# Installed at /etc/hs-uploader/pipelines.toml and read by
+# `hs-uploader serve` (hs-uploader.service, user `hsupload`).  One daemon,
+# one OS user, one SSH key drains every producer to every destination; the
+# recorders are decode/sink-only.
+#
+# This is sigma's (AC0G / EM38ww) working 4-pipeline manifest as of the
+# Stage 4/5 single-host cutover (2026-06-30).  Substitute identity +
+# station_id + receiver for another site.  Until Stage 6 auto-generates
+# this from each client's deploy.toml, it is hand-written.
+#
+# Daemon env (EnvironmentFile=-/etc/hs-uploader/uploader.env): the only var
+# the generic sqlite sources need is
+#   SIGMOND_SQLITE_PATH=/var/lib/sigmond/sink.db
+# (coordination.env does not set it).  Everything else is in this manifest.
+
+[identity]
+call = "AC0G/S"
+grid = "EM38ww"
+station_id = "S000418"
+# The ONE host key.  Register its .pub at each SFTP destination (PSWS portal
+# for the station_id; wsprdaemon auto-bootstraps via the FTP fallback below).
+ssh_key_file = "/etc/hs-uploader/keys/id_ed25519_host"
+
+[daemon]
+pump_interval_sec = 30
+# The daemon binds the shared wake socket (/var/lib/sigmond/upload-wake.sock)
+# automatically when any pipeline reads the sink (sqlite/wspr_cycle), so a
+# recorder's per-cycle commit wakes it within ms; polling is the backstop.
+
+# --- GRAPE Digital RF datasets -> PSWS (daily) ---
+[[pipeline]]
+name = "grape-psws"
+max_records_per_pump = 64
+[pipeline.source]
+type = "filetree"
+root = "/var/lib/timestd/upload"
+patterns = ["OBS*"]
+retention = "keep"
+match_dirs = true
+table = "grape.dataset"
+source_id = "grape-datasets:/var/lib/timestd/upload"
+[pipeline.transport]
+type = "psws_dataset"
+instrument_id = "367"
+host = "pswsnetwork.eng.ua.edu"
+table = "grape.dataset"
+sftp_user = "S000418"
+[pipeline.identity]
+station_id = "S000418"
+
+# --- WSPR: cycle-aligned spots+noise tar -> wsprdaemon.org ---
+# The host key isn't authorised at the gateway on day one: the first cycle's
+# SFTP fails and the FTP fallback ships client_upload_info.txt (host pubkey)
+# so the gateway auto-provisions SFTP for subsequent cycles.  No outreach.
+[[pipeline]]
+name = "wspr-wsprdaemon"
+batch_limit = 10000
+[pipeline.source]
+type = "wspr_cycle"
+db_path = "/var/lib/sigmond/sink.db"
+start_at = "now"
+include_psk = true
+# Multi-receiver merge gate (omit for single-rx):
+#   expected_reporters = ["AC0G/B5", "AC0G/B6"]
+#   backstop_sec = 90
+[pipeline.transport]
+type = "wsprdaemon_tar"
+servers = ["gw1.wsprdaemon.org", "gw2.wsprdaemon.org"]
+version = "4.0"
+receiver = "AC0G_S"
+compression = "bz2"
+tar_root = "wsprdaemon"
+primary_table_name = "wspr.cycle"
+[pipeline.transport.ftp_fallback]
+servers = ["gw2.wsprdaemon.org"]
+ftp_user = "noisegraphs"
+remote_path = "upload"
+# ftp_password defaults to the wsprdaemon anonymous-style value in code;
+# set it here only to override.
+[pipeline.retry]
+base = 2.0
+cap_sec = 900.0
+
+# --- WSPR: individual spot rows -> wsprnet.org (HTTP MEPT) ---
+[[pipeline]]
+name = "wspr-wsprnet"
+batch_limit = 900
+[pipeline.source]
+type = "sqlite"
+database = "wspr"
+table = "spots"
+accepted_schema_versions = [1, 2]
+start_at = "now"
+delete_on_commit = false           # the wsprdaemon pipeline shares this queue
+dedup_partition_by = ["time", "callsign", "band"]   # best-SNR per band (multi-rx)
+dedup_order_by_desc = "snr_db"
+[pipeline.transport]
+type = "wsprnet"
+api_base_url = "https://wsprnet.org/api/upload/v1"
+version = "4.0"
+
+# --- PSK (FT8/FT4) spot rows -> pskreporter.info (TCP) ---
+[[pipeline]]
+name = "psk-pskreporter"
+batch_limit = 500
+[pipeline.source]
+type = "sqlite"
+database = "psk"
+table = "spots"
+accepted_schema_versions = [2]
+start_at = "now"
+delete_on_commit = false
+select_columns = ["time", "frequency", "mode", "snr_db", "tx_call", "grid", "score", "message", "rx_source", "frequency_bucket_hz"]
+extra_where = [["tx_call", "!=", ""], ["mode", "IN", ["ft8", "ft4"]]]
+[pipeline.transport]
+type = "pskreporter"
+decoding_software = "psk-recorder/0.1 (radiod=sigma-rx888mk2-status.local)"
+[pipeline.retry]
+base = 2.0
+cap_sec = 300.0

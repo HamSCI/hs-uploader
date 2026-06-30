@@ -23,6 +23,16 @@ site by substituting identity + credentials.
 The two HTTP/TCP paths (pskreporter, wsprnet) need **only identity** — no keys,
 no registration. They "just work" once the recorder runs with a callsign+grid.
 
+> **Deployment model (2026-06-30, Stages 4/5):** on sigma all four paths are now
+> driven by the **single-host daemon** — one `hs-uploader.service` (user
+> `hsupload`, one host key) reads a manifest and drains every producer; the
+> recorders are decode/sink-only. The per-recorder in-process uploaders implied
+> by the table above (`WSPR_USE_HS_UPLOADER`, `PSK_DELIVERY_PIPELINES=direct`,
+> the GRAPE in-process stage) are **retired** in favour of manifest pipelines.
+> See [`pipelines.toml.example`](pipelines.toml.example) for sigma's working
+> 4-pipeline manifest. Stage 6 will auto-generate it from each client's
+> `deploy.toml`; until then it is hand-written.
+
 ---
 
 ## 2. Identity (callsign + grid)
