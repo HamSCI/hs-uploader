@@ -1,0 +1,63 @@
+# HamSCI single-host uploader (sigmond suite).
+#
+# One daemon, one user (hsupload), one SSH key — drains every producer on the
+# host (sink.db pending_uploads + dataset spools) to every destination
+# (wsprnet, wsprdaemon, pskreporter, PSWS).  Replaces the per-recorder
+# in-process uploaders.  Pipelines are declared in /etc/hs-uploader/pipelines.toml.
+#
+# Installed by hs-uploader/install.sh; enabled per host once a manifest exists.
+
+[Unit]
+Description=HamSCI single-host uploader (hs-uploader serve)
+After=network-online.target
+Wants=network-online.target
+# Don't start until a pipeline manifest has been written for this host.
+ConditionPathExists=/etc/hs-uploader/pipelines.toml
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+[Service]
+Type=notify
+User=hsupload
+Group=hsupload
+WatchdogSec=180
+NotifyAccess=main
+
+EnvironmentFile=-/etc/sigmond/coordination.env
+EnvironmentFile=-/etc/hs-uploader/uploader.env
+
+WorkingDirectory=/opt/hs-uploader
+ExecStart=/opt/hs-uploader/venv/bin/hs-uploader serve --manifest /etc/hs-uploader/pipelines.toml
+TimeoutStartSec=30
+
+Restart=always
+RestartSec=5
+
+StandardOutput=journal
+StandardError=inherit
+SyslogIdentifier=hs-uploader
+
+Nice=5
+MemoryMax=512M
+MemorySwapMax=0
+
+# Hardening — the uploader only reads producers and ships via HTTP/SFTP/TCP.
+NoNewPrivileges=true
+# PrivateTmp: hs-uploader stages the wsprdaemon .tbz via tempfile.NamedTemporaryFile
+# and ProtectSystem=strict makes host /tmp read-only — give it a private one.
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+# Writable: the shared sink (cursor commits / janitor) and the watermark store.
+# Producer dataset spools (e.g. /var/lib/timestd/upload) are read-only datasets
+# (KEEP retention) — readable under ProtectSystem=strict via group membership,
+# no write needed.
+ReadWritePaths=/var/lib/sigmond /var/lib/hs-uploader
+ReadOnlyPaths=/etc/sigmond /etc/hs-uploader
+# No privileged ports / raw sockets: pskreporter 4739, wsprnet 443, SFTP 22 are
+# all outbound client connections.
+CapabilityBoundingSet=
+AmbientCapabilities=
+
+[Install]
+WantedBy=multi-user.target

@@ -151,6 +151,46 @@ ensure_runtime_state() {
     fi
 }
 
+install_daemon() {
+    # The single-host uploader daemon (`hs-uploader serve`): a dedicated
+    # `hsupload` system user owns the one host SSH key and runs ALL outbound
+    # pipelines in one process.  The unit only starts once a host has a
+    # /etc/hs-uploader/pipelines.toml manifest (ConditionPathExists), so this
+    # is safe to install everywhere; enabling is a per-host opt-in.
+
+    # 1. Dedicated service user, in the sigmond group (sink.db + watermarks).
+    if ! getent passwd hsupload >/dev/null 2>&1; then
+        info "Creating hsupload system user"
+        useradd --system --no-create-home --shell /usr/sbin/nologin hsupload
+    fi
+    if getent group sigmond >/dev/null 2>&1; then
+        usermod -a -G sigmond hsupload
+    fi
+    # Producer data groups the uploader must read (best-effort; a group that
+    # isn't present on this host is simply skipped):
+    for _g in timestd wsprrec pskrec; do
+        getent group "$_g" >/dev/null 2>&1 && usermod -a -G "$_g" hsupload || true
+    done
+
+    # 2. Shared host-key directory (the ONE key the daemon uses for every SFTP
+    #    destination).  root:sigmond setgid so the key + known_hosts are
+    #    group-managed; the daemon reads its own 600 key as hsupload.
+    install -d -o root -g sigmond -m 2775 /etc/hs-uploader/keys
+
+    # 3. systemd unit (installed, not enabled — per-host opt-in once a manifest
+    #    exists).
+    if [[ -f "$REPO_ROOT/systemd/hs-uploader.service" ]]; then
+        info "Installing systemd/hs-uploader.service → /etc/systemd/system/"
+        install -m 0644 "$REPO_ROOT/systemd/hs-uploader.service" \
+                /etc/systemd/system/hs-uploader.service
+        systemctl daemon-reload || true
+        info "  enable per host with: sudo systemctl enable --now hs-uploader.service"
+        info "  (after writing /etc/hs-uploader/pipelines.toml)"
+    else
+        warn "systemd/hs-uploader.service not found in repo — skipping daemon unit"
+    fi
+}
+
 main() {
     check_root
     if [[ "${1:-}" == "--uninstall" ]]; then
@@ -160,6 +200,7 @@ main() {
     check_dependencies
     ensure_runtime_state
     install_application
+    install_daemon
     info "Install complete."
     info "Try:  hs-uploader status"
     info "      (reads /var/lib/hs-uploader/watermarks.db; needs sigmond group or root)"

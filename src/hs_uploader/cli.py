@@ -62,12 +62,35 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_kick.set_defaults(func=_cmd_kick)
 
+    sp_serve = sub.add_parser(
+        "serve",
+        help="Run the host uploader daemon — every outbound pipeline in the "
+             "manifest, in one process (the single-host uploader).",
+    )
+    sp_serve.add_argument("--manifest", default="/etc/hs-uploader/pipelines.toml")
+    sp_serve.add_argument("--dry-run", action="store_true",
+                          help="build pipelines and exit (no pumping)")
+    sp_serve.add_argument("--once", action="store_true",
+                          help="drain once (pump_until_idle) and exit")
+    sp_serve.add_argument("--log-level", default="INFO")
+    sp_serve.set_defaults(func=None)
+
     return p
 
 
 def main(argv: list[str] | None = None) -> int:
     parser = _build_parser()
     args = parser.parse_args(argv)
+    # `serve` runs the daemon, which manages its own watermark store — it does
+    # not go through the read-only store-command dispatch below.
+    if args.cmd == "serve":
+        import logging
+        logging.basicConfig(
+            level=getattr(logging, str(args.log_level).upper(), logging.INFO),
+            format="%(asctime)s %(levelname)s:%(name)s:%(message)s",
+        )
+        from . import daemon
+        return daemon.run(args.manifest, dry_run=args.dry_run, once=args.once)
     state_path = args.state or default_path()
     if not state_path.exists() and args.cmd in ("reset-cursor", "kick"):
         print(f"hs-uploader: state file not found: {state_path}", file=sys.stderr)
