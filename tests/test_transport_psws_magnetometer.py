@@ -217,3 +217,78 @@ def test_ship_no_station_id_permanent_failure(tmp_path):
 def test_transport_exported_from_transports_package():
     from hs_uploader.transports import PswsMagnetometerSftp as exported
     assert exported is PswsMagnetometerSftp
+
+
+# ---- directory datasets (GRAPE) ---------------------------------------------
+
+
+def _grape_dataset(tmp_path: Path, date: str = "2026-06-28") -> tuple[Path, Record]:
+    """A GRAPE OBS<date>T00-00/ dataset directory (ch0/ + gap_summary.json)."""
+    ds = tmp_path / f"OBS{date}T00-00"
+    (ds / "ch0").mkdir(parents=True)
+    (ds / "ch0" / "data@0.bin").write_bytes(b"\x00\x01\x02\x03")
+    (ds / "ch0" / "drf_properties.h5").write_bytes(b"h5")
+    (ds / "gap_summary.json").write_text("{}")
+    rec = Record(
+        table="grape.dataset",
+        time=datetime.now(tz=timezone.utc),
+        columns={},
+        payload_path=ds,
+    )
+    return ds, rec
+
+
+def test_custom_table_and_alias():
+    from hs_uploader.transports.psws_magnetometer import PswsDatasetSftp
+    assert PswsDatasetSftp is PswsMagnetometerSftp
+    t = PswsDatasetSftp(instrument_id="367", table="grape.dataset")
+    assert t.ACCEPTS == {"grape.dataset": [1]}
+    assert t.primary_table() == "grape.dataset"
+
+
+def test_dir_trigger_keys_off_directory_name(tmp_path):
+    ds, _ = _grape_dataset(tmp_path)
+    t = PswsMagnetometerSftp(instrument_id="367", table="grape.dataset")
+    name = t._trigger_dir_name(ds.name)
+    assert name.startswith("cOBS2026-06-28T00-00_#367_#")
+
+
+def test_dir_upload_batch_has_recursive_mkdir_put_then_trigger(tmp_path):
+    ds, rec = _grape_dataset(tmp_path, date="2026-06-28")
+    batch = RecordBatch(records=[rec], cursor_after=b"")
+    t = PswsMagnetometerSftp(instrument_id="367", table="grape.dataset")
+
+    captured = {}
+    def _capture(*args, **kwargs):
+        captured["input"] = kwargs["input"]
+        res = MagicMock(); res.returncode = 0
+        res.stdout = b""; res.stderr = b""
+        return res
+
+    with patch("subprocess.run", side_effect=_capture):
+        outcome = t.ship(batch, _ident())
+
+    assert outcome.kind == "acked"
+    body = captured["input"].decode()
+    lines = body.splitlines()
+    # Top-level dataset dir is created first, then the ch0 subdir, then puts.
+    assert lines[0] == '-mkdir "OBS2026-06-28T00-00"'  # error-tolerant mkdir
+    assert '-mkdir "OBS2026-06-28T00-00/ch0"' in body
+    assert 'put "' in body and '/ch0/data@0.bin" "OBS2026-06-28T00-00/ch0/data@0.bin"' in body
+    assert 'put "' in body and 'gap_summary.json" "OBS2026-06-28T00-00/gap_summary.json"' in body
+    # Trigger dir comes after the data, and there is NO post-upload ls/verify.
+    assert '-mkdir "cOBS2026-06-28T00-00_#367_#' in body
+    assert "ls " not in body
+    trig_idx = next(i for i, l in enumerate(lines) if l.startswith('-mkdir "cOBS'))
+    put_idx = max(i for i, l in enumerate(lines) if l.startswith('put "'))
+    assert trig_idx > put_idx  # trigger created only after all data is put
+    assert lines[-1] == "quit"
+
+
+def test_dir_upload_failure_retry_later(tmp_path):
+    ds, rec = _grape_dataset(tmp_path)
+    batch = RecordBatch(records=[rec], cursor_after=b"")
+    t = PswsMagnetometerSftp(instrument_id="367", table="grape.dataset")
+    with patch("subprocess.run", side_effect=_run_fail):
+        outcome = t.ship(batch, _ident())
+    assert outcome.kind == "retry_later"

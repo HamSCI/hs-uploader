@@ -76,6 +76,7 @@ class FileTreeSource:
         retention: str = DELETE_ON_ACK,
         source_id: Optional[str] = None,
         prune_empty_dirs: bool = True,
+        match_dirs: bool = False,
     ):
         self.root = Path(root)
         self.specs = list(specs)
@@ -86,6 +87,12 @@ class FileTreeSource:
         self.retention = retention
         self._source_id = source_id or f"files:{self.root}"
         self._prune_empty_dirs = prune_empty_dirs
+        # When True, directory entries matching a spec pattern are yielded
+        # as records (payload_path = the directory).  Used by the PSWS
+        # Digital RF / GRAPE path where the "dataset" is a directory tree
+        # uploaded recursively.  Directory specs must use parser=None
+        # (the transport consumes payload_path, not parsed columns).
+        self.match_dirs = match_dirs
 
     # -- Source protocol --
 
@@ -105,9 +112,12 @@ class FileTreeSource:
             return
         if self.retention == self.KEEP:
             # Skip files whose mtime is at or before the cursor's
-            # checkpoint.  Cursor format: ISO timestamp bytes.
+            # checkpoint.  Cursor is integer nanoseconds (st_mtime_ns) —
+            # float seconds rounded to microseconds loses sub-µs mtime
+            # precision and the strict ``>`` then re-includes the just-
+            # shipped entry forever (infinite re-ship).
             after_mtime = _decode_keep_cursor(cursor)
-            files = [f for f in files if f.stat().st_mtime > after_mtime]
+            files = [f for f in files if f.stat().st_mtime_ns > after_mtime]
             if not files:
                 return
         chunk = files[:limit]
@@ -169,9 +179,9 @@ class FileTreeSource:
             cursor_after = b"<delete-on-ack>"
         else:
             commit_token = b""
-            # Cursor advances to the latest mtime in the batch.
+            # Cursor advances to the latest mtime in the batch (integer ns).
             unique_paths = {r.payload_path for r in records if r.payload_path}
-            latest_mtime = max(p.stat().st_mtime for p in unique_paths)
+            latest_mtime = max(p.stat().st_mtime_ns for p in unique_paths)
             cursor_after = _encode_keep_cursor(latest_mtime)
 
         yield RecordBatch(
@@ -226,9 +236,9 @@ class FileTreeSource:
         seen: set[Path] = set()
         for spec in self.specs:
             for path in self.root.rglob(spec.pattern):
-                if path.is_file():
+                if path.is_file() or (self.match_dirs and path.is_dir()):
                     seen.add(path)
-        return sorted(seen, key=lambda p: p.stat().st_mtime)
+        return sorted(seen, key=lambda p: p.stat().st_mtime_ns)
 
     def _spec_for(self, path: Path) -> Optional[FileSpec]:
         # First-match wins.  Patterns with overlap (e.g. *_spots.txt
@@ -243,14 +253,27 @@ class FileTreeSource:
 # ---- cursor helpers (KEEP mode) ----
 
 
-def _encode_keep_cursor(mtime: float) -> bytes:
-    return f"{mtime:.6f}".encode("ascii")
+def _encode_keep_cursor(mtime_ns: int) -> bytes:
+    # Integer nanoseconds (st_mtime_ns) — exact, no float rounding.  A
+    # legacy float-seconds cursor (e.g. ``1781583014.421470``) decodes
+    # via the fallback below so existing KEEP cursors keep working.
+    return str(int(mtime_ns)).encode("ascii")
 
 
-def _decode_keep_cursor(cursor: bytes) -> float:
+def _decode_keep_cursor(cursor: bytes) -> int:
     if not cursor:
-        return 0.0
+        return 0
     try:
-        return float(cursor.decode("ascii"))
-    except (ValueError, UnicodeDecodeError):
-        return 0.0
+        text = cursor.decode("ascii")
+    except UnicodeDecodeError:
+        return 0
+    try:
+        return int(text)
+    except ValueError:
+        # Legacy float-seconds cursor → convert to ns (floor).  Floor is
+        # safe: it can only re-admit a boundary entry once, after which
+        # the ns cursor takes over.
+        try:
+            return int(float(text) * 1_000_000_000)
+        except ValueError:
+            return 0

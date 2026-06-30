@@ -230,3 +230,105 @@ def test_parser_exception_skips_file(tmp_path):
     batches = list(src.iter_batches(b"", limit=10))
     assert len(batches[0].records) == 1
     assert batches[0].records[0].payload_path == good
+
+
+# ---- directory datasets (match_dirs, KEEP retention — GRAPE/PSWS) ----
+
+
+def test_match_dirs_yields_directory_records_keep_mode(tmp_path):
+    """GRAPE-style spool: OBS<date>T00-00/ dirs nested under date/site dirs."""
+    import os
+    spool = tmp_path
+    ds_dates = ["2026-06-27T00-00", "2026-06-28T00-00"]
+    made = []
+    for i, d in enumerate(ds_dates):
+        ds = spool / "20260627" / "AC0G_EM38ww" / "GRAPE@S000418_367" / f"OBS{d}"
+        (ds / "ch0").mkdir(parents=True)
+        (ds / "ch0" / "data.bin").write_bytes(b"x")
+        (ds / "gap_summary.json").write_text("{}")
+        # increasing mtime so ordering + cursor are deterministic
+        os.utime(ds, (1_700_000_000 + i, 1_700_000_000 + i))
+        made.append(ds)
+
+    src = FileTreeSource(
+        root=spool,
+        specs=[FileSpec(pattern="OBS*", parser=None, table="grape.dataset")],
+        retention=FileTreeSource.KEEP,
+        match_dirs=True,
+    )
+    batches = list(src.iter_batches(cursor=b"", limit=10))
+    assert len(batches) == 1
+    recs = batches[0].records
+    # Two dataset directories, oldest first, each carried as payload_path.
+    assert [r.payload_path for r in recs] == made
+    assert all(r.payload_path.is_dir() for r in recs)
+    assert all(r.table == "grape.dataset" for r in recs)
+
+    # KEEP cursor advances past the newest mtime; a re-poll yields nothing
+    # and (KEEP mode) the directories are NOT deleted.
+    again = list(src.iter_batches(cursor=batches[0].cursor_after, limit=10))
+    assert again == []
+    assert all(ds.exists() for ds in made)
+
+
+def test_match_dirs_false_ignores_directories(tmp_path):
+    (tmp_path / "OBS2026-06-28T00-00" / "ch0").mkdir(parents=True)
+    src = FileTreeSource(
+        root=tmp_path,
+        specs=[FileSpec(pattern="OBS*", parser=None, table="grape.dataset")],
+        retention=FileTreeSource.KEEP,
+        match_dirs=False,
+    )
+    assert list(src.iter_batches(cursor=b"", limit=10)) == []
+
+
+def test_keep_cursor_nanosecond_precision_no_reship(tmp_path):
+    """Regression: KEEP cursor must use ns precision.
+
+    A float-seconds cursor rounded to microseconds is slightly less than
+    the true sub-µs mtime, so a strict ``>`` re-includes the just-shipped
+    entry forever.  Drive the source through every entry and confirm each
+    is yielded exactly once.
+    """
+    import os
+    made = []
+    # mtimes with sub-microsecond (ns) fractions that round badly at 1e-6.
+    base = 1_781_583_014_421_470_789  # ns; .6f would drop the trailing 789
+    for i in range(4):
+        ds = tmp_path / f"d{i}" / f"OBS2026-06-1{i}T00-00"
+        (ds / "ch0").mkdir(parents=True)
+        (ds / "ch0" / "x.bin").write_bytes(b"x")
+        os.utime(ds, ns=(base + i * 86_400_000_000_000, base + i * 86_400_000_000_000))
+        made.append(ds)
+
+    src = FileTreeSource(
+        root=tmp_path,
+        specs=[FileSpec(pattern="OBS*", parser=None, table="grape.dataset")],
+        retention=FileTreeSource.KEEP,
+        match_dirs=True,
+    )
+    seen = []
+    cursor = b""
+    # Walk one record at a time (limit=1, the PSWS transport's batch size)
+    # advancing the cursor — this is exactly the orchestrator drain loop.
+    for _ in range(10):
+        batches = list(src.iter_batches(cursor=cursor, limit=1))
+        if not batches:
+            break
+        b = batches[0]
+        seen.extend(r.payload_path for r in b.records)
+        cursor = b.cursor_after
+    assert seen == made, f"expected each dataset once, got {len(seen)}: {seen}"
+
+
+def test_keep_cursor_legacy_float_seconds_still_decodes(tmp_path):
+    """A legacy float-seconds cursor must still skip already-shipped files."""
+    import os
+    from hs_uploader.sources.files import _decode_keep_cursor, _encode_keep_cursor
+    # ns round-trip is exact
+    assert _decode_keep_cursor(_encode_keep_cursor(1_781_583_014_421_470_789)) == 1_781_583_014_421_470_789
+    # legacy float-seconds string converts to ns (best-effort; float64
+    # precision means ~µs accuracy, which is fine — re-admits at most one
+    # boundary entry once before the ns cursor takes over).
+    legacy = _decode_keep_cursor(b"1781583014.421470")
+    assert abs(legacy - 1_781_583_014_421_470_000) < 1_000  # within 1 µs
