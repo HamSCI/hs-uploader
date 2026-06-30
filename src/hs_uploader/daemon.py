@@ -177,11 +177,31 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     interval = float(dcfg.get("pump_interval_sec", 30.0))
     wake_sock = dcfg.get("wake_socket")  # None → default path
 
+    # Only bind the shared upload-wake socket when at least one pipeline reads
+    # from the sink (SqliteSource/WsprCycleSource) — those are the producers
+    # that fire wakes.  A file-spool-only daemon (e.g. GRAPE during migration)
+    # must NOT bind it, or it steals the socket from a recorder's still-running
+    # in-process uploader.  Overridable via [daemon] wake = true/false.
+    from .sources.sqlite import SqliteSource
+    try:
+        from .sources.wspr_cycle import WsprCycleSource
+        _sink_types: tuple = (SqliteSource, WsprCycleSource)
+    except Exception:
+        _sink_types = (SqliteSource,)
+    needs_wake = any(isinstance(p.source, _sink_types) for p in pipelines)
+    wake_cfg = dcfg.get("wake")
+    use_wake = needs_wake if wake_cfg is None else bool(wake_cfg)
+
     stop = threading.Event()
     wake = threading.Event()
 
-    listener = WakeListener(on_wake=wake.set, path=wake_sock)
-    listener.start()  # best-effort; polling backstop covers a bind failure
+    listener = None
+    if use_wake:
+        listener = WakeListener(on_wake=wake.set, path=wake_sock)
+        listener.start()  # best-effort; polling backstop covers a bind failure
+    else:
+        logger.info("daemon: wake socket not bound (no sink pipeline); "
+                    "polling every %.0fs", interval)
 
     def _handle(sig, _frame):
         logger.info("daemon: signal %s — shutting down", sig)
@@ -197,7 +217,7 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
 
     _sd_notify(b"READY=1")
     logger.info("daemon: active (pump interval %.0fs, wake %s)",
-                interval, listener.path)
+                interval, listener.path if listener else "disabled")
 
     while not stop.is_set():
         wake.wait(interval)
@@ -210,7 +230,8 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
             logger.exception("daemon: error in pump loop")
 
     _sd_notify(b"STOPPING=1")
-    listener.stop()
+    if listener is not None:
+        listener.stop()
     logger.info("daemon: stopped")
     return 0
 
