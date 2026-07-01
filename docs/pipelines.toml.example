@@ -109,7 +109,13 @@ type = "wsprnet"
 api_base_url = "https://wsprnet.org/api/upload/v1"
 version = "4.0"
 
-# --- PSK (FT8/FT4) spot rows -> pskreporter.info (TCP) ---
+# --- PSK/MSK144 spot rows -> pskreporter.info (TCP) ---
+# One shared egress for the whole psk.spots stream: psk-recorder writes ft8/ft4
+# and meteor-scatter writes msk144 into the SAME psk.spots (per-row `mode`), the
+# way the wsprdaemon server unifies all three under one PSKReporter forwarder.
+# So the mode filter includes msk144; PskReporterTcp maps the row mode to the
+# PSKReporter tag (msk144 -> MSK144).  (sigmond generates this once even when
+# both clients declare it — it dedups identical pipelines by name.)
 [[pipeline]]
 name = "psk-pskreporter"
 batch_limit = 500
@@ -121,7 +127,7 @@ accepted_schema_versions = [2]
 start_at = "now"
 delete_on_commit = false
 select_columns = ["time", "frequency", "mode", "snr_db", "tx_call", "grid", "score", "message", "rx_source", "frequency_bucket_hz"]
-extra_where = [["tx_call", "!=", ""], ["mode", "IN", ["ft8", "ft4"]]]
+extra_where = [["tx_call", "!=", ""], ["mode", "IN", ["ft8", "ft4", "msk144"]]]
 [pipeline.transport]
 type = "pskreporter"
 decoding_software = "psk-recorder/0.1 (radiod=sigma-rx888mk2-status.local)"
