@@ -90,6 +90,16 @@ def _default_known_hosts() -> str:
 TAR_ROOT_NEW    = "wspr"
 TAR_ROOT_LEGACY = "wsprdaemon"
 
+# wsprdaemon.org's shared FTP-fallback bootstrap credential — the same
+# `noisegraphs` account every wsprdaemon client uses to ship its first tar
+# (carrying client_upload_info.txt) so the gateway can auto-provision SFTP.
+# It is NOT a per-site secret; it is baked into the wsprdaemon client too.
+# Pairing it with the `ftp_user="noisegraphs"` default means a manifest can
+# omit ftp_password entirely (matching the PER-SITE-SETUP / pipelines.toml
+# docs), and the FTP bootstrap still authenticates.
+FTP_BOOTSTRAP_USER     = "noisegraphs"
+FTP_BOOTSTRAP_PASSWORD = "xahFie6g"
+
 
 def _compress_tar_bytes(raw: bytes, *, compression: str, level: int) -> bytes:
     """Compress an in-memory uncompressed tar.
@@ -1067,7 +1077,7 @@ class WsprdaemonTarFtp:
         *,
         servers: Sequence[str],
         spool_root: Path | str = "",
-        ftp_user: str = "noisegraphs",
+        ftp_user: str = FTP_BOOTSTRAP_USER,
         ftp_password_file: Optional[Path | str] = None,
         ftp_password: Optional[str] = None,
         remote_path: str = "upload",
@@ -1179,7 +1189,9 @@ class WsprdaemonTarFtp:
     def _password(self) -> str:
         if self.ftp_password_file and self.ftp_password_file.exists():
             return self.ftp_password_file.read_text().strip()
-        return self.ftp_password or ""
+        # Fall back to the shared wsprdaemon bootstrap credential so a manifest
+        # that omits ftp_password still authenticates (see FTP_BOOTSTRAP_*).
+        return self.ftp_password or FTP_BOOTSTRAP_PASSWORD
 
     def _tar_name(self, identity, batch: Optional[RecordBatch] = None) -> str:
         # Same cycle-aligned tar name policy as WsprdaemonTarSftp.

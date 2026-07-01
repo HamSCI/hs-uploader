@@ -30,8 +30,18 @@ no registration. They "just work" once the recorder runs with a callsign+grid.
 > by the table above (`WSPR_USE_HS_UPLOADER`, `PSK_DELIVERY_PIPELINES=direct`,
 > the GRAPE in-process stage) are **retired** in favour of manifest pipelines.
 > See [`pipelines.toml.example`](pipelines.toml.example) for sigma's working
-> 4-pipeline manifest. Stage 6 will auto-generate it from each client's
-> `deploy.toml`; until then it is hand-written.
+> 4-pipeline manifest.
+>
+> **Stage 6 (2026-06-30):** the manifest is now **auto-generated** — each
+> client declares its outbound pipeline(s) in its own `deploy.toml` as
+> `[[hs_uploader.pipeline]]` blocks (manifest-native shape with `{placeholder}`
+> tokens), and sigmond renders `/etc/hs-uploader/pipelines.toml` from every
+> *enabled* client, substituting per-site identity read from the current
+> configs. Run it with **`sudo smd admin uploader manifest --write`** (add
+> `--enable` to install/refresh the daemon), or `--check` for a read-only drift
+> diff. Bring-up and `smd apply` regenerate it automatically. See
+> [§7](#7-the-hs_uploaderpipeline-declaration-stage-6) for the declaration
+> schema.
 
 ---
 
@@ -194,6 +204,53 @@ sudo -u timestd sftp -i /home/timestd/.ssh/id_rsa_psws S000NNN@pswsnetwork.eng.u
    `start_at='now'`, so historical `wspr.noise`/spots predating enablement never
    drain through wsprdaemon; and `superdarn.detections` is queued with no
    transport at all. Needs a janitor / per-client egress decision.
+
+---
+
+## 7. The `[[hs_uploader.pipeline]]` declaration (Stage 6)
+
+Each client owns its outbound pipeline(s) in its own `deploy.toml`. The block
+shape **is** the manifest `[[pipeline]]` shape
+(`hs_uploader.pipeline_factory`); sigmond substitutes per-site identity and
+concatenates every enabled client's blocks into
+`/etc/hs-uploader/pipelines.toml`. Example (wsprnet leg):
+
+```toml
+[[hs_uploader.pipeline]]
+name = "wspr-wsprnet"
+batch_limit = 900
+[hs_uploader.pipeline.source]
+type = "sqlite"
+database = "wspr"
+table = "spots"
+[hs_uploader.pipeline.transport]
+type = "wsprnet"
+api_base_url = "https://wsprnet.org/api/upload/v1"
+```
+
+Placeholders sigmond resolves (from the *current* configs — no new store):
+
+| token | source |
+|---|---|
+| `{call}` | wspr reporter id, display form (`AC0G/S`), else coordination `[host].call` |
+| `{call_pathsafe}` | `{call}` with `/`→`_` (`AC0G_S`) — wsprdaemon `receiver` |
+| `{grid}` | coordination `[host].grid` |
+| `{radiod_status}` | first radiod status DNS in coordination |
+| `{sink_path}` | `/var/lib/sigmond/sink.db` |
+| `{ssh_key_file}` | the one host key (`/etc/hs-uploader/keys/id_ed25519_host`) |
+| `{station_id}` / `{instrument_id}` | PSWS ids for the **declaring** client (`smd`'s `psws.RECORDERS` map — grape→hf-timestd config, mag→mag config) |
+
+A pipeline whose required identity is missing/placeholder is **skipped with a
+warning** (so mag is silently absent until its PSWS station id is set).
+
+**Cursor safety:** the generated pipeline reproduces the same derived watermark
+keys (`source_id`/`dest_id`) as a correctly hand-written manifest, so the daemon
+inherits its cursors with no backlog re-ship. For the GRAPE file-tree pipeline,
+whose `dest_id` embeds the station id, pin the transport `name` and source
+`source_id` verbatim in the declaration (see `hf-timestd/deploy.toml`).
+
+Commands: `smd admin uploader manifest --check` (read-only drift diff) /
+`--write` (render, root) / `--enable` (write + install/refresh the daemon).
 
 ---
 
