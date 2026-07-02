@@ -127,7 +127,10 @@ accepted_schema_versions = [2]
 start_at = "now"
 delete_on_commit = false
 select_columns = ["time", "frequency", "mode", "snr_db", "tx_call", "grid", "score", "message", "rx_source", "frequency_bucket_hz"]
-extra_where = [["tx_call", "!=", ""], ["mode", "IN", ["ft8", "ft4", "msk144"]]]
+# forward_to_pskreporter=0: post only rows this host is responsible for —
+# rows flagged true ride the wsprdaemon tar and wd30's server-side
+# forwarder posts them (meteor deposit mode).
+extra_where = [["tx_call", "!=", ""], ["mode", "IN", ["ft8", "ft4", "msk144"]], ["forward_to_pskreporter", "=", 0]]
 [pipeline.transport]
 type = "pskreporter"
 decoding_software = "psk-recorder/0.1 (radiod=sigma-rx888mk2-status.local)"
