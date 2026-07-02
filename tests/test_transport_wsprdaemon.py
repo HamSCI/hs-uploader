@@ -938,3 +938,115 @@ def test_accepts_includes_psk_spots():
     assert "psk.spots" in WsprdaemonTarFtp.ACCEPTS
     # Schema version 2 = ch_tailer's current write tag.
     assert WsprdaemonTarSftp.ACCEPTS["psk.spots"] == [2]
+
+
+# ---- station key auto-generation (gap #1: ensure_ssh_key was never called) ----
+
+
+def test_ftp_bootstrap_autogenerates_key_and_ships_pubkey(tmp_path):
+    """A fresh site (no keypair on disk) must generate one so the FTP
+    bootstrap ships a real pubkey in client_upload_info.txt — an empty
+    ssh_public_key means the gateway can never provision SFTP."""
+    root, records = _spool_with_files(tmp_path)
+    key = tmp_path / "keys" / "id_ed25519"
+    ident = _ident(key=str(key))
+    transport = WsprdaemonTarFtp(
+        servers=["gw2"],
+        spool_root=root,
+        ftp_password="x",
+        upload_id="AC0G_B1",
+    )
+    batch = RecordBatch(records=tuple(records), cursor_after=b"")
+
+    captured = {}
+    fake_ftp = MagicMock()
+    fake_ftp.__enter__ = MagicMock(return_value=fake_ftp)
+    fake_ftp.__exit__ = MagicMock(return_value=None)
+    fake_ftp.storbinary.side_effect = (
+        lambda cmd, fh: captured.__setitem__("bytes", fh.read())
+    )
+
+    with patch("ftplib.FTP", lambda timeout=None: fake_ftp):
+        outcome = transport.ship(batch, ident)
+
+    assert outcome.kind == "acked"
+    # Keypair generated on first use (real ssh-keygen).
+    assert key.exists()
+    assert (tmp_path / "keys" / "id_ed25519.pub").exists()
+    with _open_tar_blob(captured["bytes"]) as tf:
+        info = tf.extractfile("client_upload_info.txt").read().decode()
+    assert "ssh_public_key=ssh-ed25519 " in info
+
+
+def test_sftp_upload_autogenerates_key(tmp_path):
+    """The SFTP path ensures the key exists before invoking sftp -i."""
+    root, records = _spool_with_files(tmp_path)
+    key = tmp_path / "keys" / "id_ed25519"
+    transport = WsprdaemonTarSftp(
+        servers=["gw1"],
+        spool_root=root,
+        upload_id="AC0G_B1",
+    )
+    batch = RecordBatch(records=tuple(records), cursor_after=b"")
+
+    captured = {}
+
+    def fake_run(cmd, **kw):
+        if cmd[0] == "ssh-keygen":
+            # Stand in for real keygen so the global subprocess patch
+            # doesn't hide the generation call.
+            path = Path(cmd[cmd.index("-f") + 1])
+            path.write_text("PRIVATE")
+            Path(str(path) + ".pub").write_text("ssh-ed25519 FAKE k")
+            return MagicMock(returncode=0)
+        captured["cmd"] = cmd
+        out = MagicMock()
+        out.returncode = 0
+        out.stdout = b""
+        out.stderr = b""
+        return out
+
+    with patch("subprocess.run", side_effect=fake_run):
+        outcome = transport.ship(batch, _ident(key=str(key)))
+
+    assert outcome.kind == "acked"
+    assert key.exists()
+    assert any(str(key) in arg for arg in captured["cmd"])
+
+
+def test_key_generation_failure_is_nonfatal(tmp_path):
+    """Keygen failure (unwritable dir, no ssh-keygen) must not kill the
+    pump — the ship proceeds with an empty pubkey as before."""
+    root, records = _spool_with_files(tmp_path)
+
+    class BrokenIdent(StationIdentity):
+        def ensure_ssh_key(self):
+            raise OSError("read-only key dir")
+
+    ident = BrokenIdent(
+        call="AC0G/B1", grid="EM38ww",
+        ssh_key_file=str(tmp_path / "nope" / "id_ed25519"),
+    )
+    transport = WsprdaemonTarFtp(
+        servers=["gw2"],
+        spool_root=root,
+        ftp_password="x",
+        upload_id="AC0G_B1",
+    )
+    batch = RecordBatch(records=tuple(records), cursor_after=b"")
+
+    captured = {}
+    fake_ftp = MagicMock()
+    fake_ftp.__enter__ = MagicMock(return_value=fake_ftp)
+    fake_ftp.__exit__ = MagicMock(return_value=None)
+    fake_ftp.storbinary.side_effect = (
+        lambda cmd, fh: captured.__setitem__("bytes", fh.read())
+    )
+
+    with patch("ftplib.FTP", lambda timeout=None: fake_ftp):
+        outcome = transport.ship(batch, ident)
+
+    assert outcome.kind == "acked"
+    with _open_tar_blob(captured["bytes"]) as tf:
+        info = tf.extractfile("client_upload_info.txt").read().decode()
+    assert "ssh_public_key=\n" in info

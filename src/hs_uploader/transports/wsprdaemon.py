@@ -156,6 +156,29 @@ def _config_bytes(version: str = "4.0") -> bytes:
     return "\n".join(lines).encode() + b"\n"
 
 
+def _ensure_identity_key(identity) -> None:
+    """Auto-generate the station SSH keypair on first use.
+
+    The design intent ("auto-generate + share across clients on a
+    station", StationIdentity.ensure_ssh_key) was never wired in: a
+    fresh site shipped an EMPTY ssh_public_key in
+    client_upload_info.txt and could never self-provision SFTP.
+    Failure is non-fatal — keygen needs a writable key directory, and
+    a host without one degrades to the previous behaviour (empty
+    pubkey / SFTP auth failure → FTP fallback keeps retrying).
+    """
+    ensure = getattr(identity, "ensure_ssh_key", None)
+    if ensure is None:
+        return
+    try:
+        ensure()
+    except Exception as exc:
+        logger.warning(
+            "station ssh key auto-generation failed (%s) — "
+            "continuing without a key", exc,
+        )
+
+
 def _client_info_bytes(reporter_id: str, ssh_pubkey: str) -> bytes:
     lines = [
         f"reporter_id={reporter_id}",
@@ -955,6 +978,7 @@ class WsprdaemonTarSftp:
     def _upload_tar(
         self, tar_bytes: bytes, tar_name: str, identity
     ) -> Outcome:
+        _ensure_identity_key(identity)
         with tempfile.NamedTemporaryFile(
             "wb", suffix=".tbz", delete=False,
         ) as fh:
@@ -1145,6 +1169,7 @@ class WsprdaemonTarFtp:
         reporter_id = (
             identity.call.replace("/", "_") if identity.call else "wsprdaemon"
         )
+        _ensure_identity_key(identity)
         client_info = (reporter_id, identity.public_key())
         paths = [r.payload_path for r in batch.records if getattr(r, "payload_path", None)]
         col_records = [r for r in batch.records
