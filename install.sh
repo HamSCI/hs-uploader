@@ -88,11 +88,23 @@ check_dependencies() {
 
 install_application() {
     info "Installing Python application to ${INSTALL_DIR}..."
+    # A venv whose interpreter lives under /root is unreadable by the
+    # hsupload service user (observed on B4-100 2026-07-15: uv, run as
+    # root with --python 3.11 on a host without a system 3.11, downloaded
+    # a private interpreter into /root/.local/share/uv -> every start
+    # failed 203/EXEC).  Rebuild such a venv on the system interpreter.
+    if [[ -d "$INSTALL_DIR/venv" ]] && \
+       [[ "$(readlink -f "$INSTALL_DIR/venv/bin/python" 2>/dev/null)" == /root/* ]]; then
+        info "Rebuilding venv (interpreter under /root is unreadable by hsupload)"
+        rm -rf "$INSTALL_DIR/venv"
+    fi
     if [[ ! -d "$INSTALL_DIR/venv" ]]; then
         install -d -m 0755 "$INSTALL_DIR"
         # --seed populates pip/setuptools/wheel for compatibility with
         # tooling that shells out to pip; harmless overhead otherwise.
-        uv venv "$INSTALL_DIR/venv" --python 3.11 --seed --quiet
+        # World-readable system interpreter, NEVER a root-private
+        # uv-managed one (see rebuild guard above).
+        uv venv "$INSTALL_DIR/venv" --python "$(command -v python3)" --seed --quiet
     fi
     # Pre-clean any leftover egg-info from prior dev installs in the
     # source tree -- setuptools' "Cannot update time stamp" check

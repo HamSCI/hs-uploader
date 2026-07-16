@@ -38,7 +38,10 @@ StandardError=inherit
 SyslogIdentifier=hs-uploader
 
 Nice=5
-MemoryMax=512M
+# 512M OOM-looped 637 times during a wspr.cycle replay grind on
+# B4-100 (2026-06/07) — the merge source legitimately needs room
+# when draining a multi-day backlog.
+MemoryMax=4G
 MemorySwapMax=0
 
 # Hardening — the uploader only reads producers and ships via HTTP/SFTP/TCP.
