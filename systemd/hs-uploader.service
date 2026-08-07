@@ -55,7 +55,16 @@ ProtectHome=read-only
 # Producer dataset spools (e.g. /var/lib/timestd/upload) are read-only datasets
 # (KEEP retention) — readable under ProtectSystem=strict via group membership,
 # no write needed.
-ReadWritePaths=/var/lib/sigmond /var/lib/hs-uploader
+#
+# /etc/hs-uploader/keys is the one exception under the read-only /etc tree: on a
+# station with no restored keys, the wsprdaemon transport generates its own
+# station SSH key there on first use and ships the pubkey via the FTP fallback
+# so the gateway can auto-provision SFTP for the next cycle.  install.sh already
+# creates that directory hsupload-owned for exactly this; without the carve-out
+# ssh-keygen fails "Read-only file system" every cycle and SFTP never comes up.
+# Only the keys subdirectory is writable — pipelines.toml and uploader.env stay
+# read-only.  (Greenfield-only: hosts restored from a backup already have keys.)
+ReadWritePaths=/var/lib/sigmond /var/lib/hs-uploader /etc/hs-uploader/keys
 ReadOnlyPaths=/etc/sigmond /etc/hs-uploader
 # No privileged ports / raw sockets: pskreporter 4739, wsprnet 443, SFTP 22 are
 # all outbound client connections.
