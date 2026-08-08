@@ -134,6 +134,8 @@ class WsprCycleSource:
     def iter_batches(self, cursor: bytes, limit: int) -> Iterator[RecordBatch]:
         """Yield one RecordBatch per shippable cycle, oldest first."""
         conn = self._connect()
+        if not self._ensure_ready(conn):
+            return
         cursor_iso = self._effective_cursor(cursor)
 
         if self.expected_reporters:
@@ -239,6 +241,33 @@ class WsprCycleSource:
         if self._conn is None:
             self._conn = sqlite3.connect(str(self.db_path), timeout=30.0)
         return self._conn
+
+    def _ensure_ready(self, conn: sqlite3.Connection) -> bool:
+        """Check that the queue table exists.
+
+        Returns ``True`` if ``pending_uploads`` is present (ready to read);
+        ``False`` if the producer hasn't flushed yet (table absent).
+        Raises on actual SQLite connection failures (file unreadable,
+        corruption, etc.).
+
+        Mirrors ``SqliteSource._ensure_ready`` -- see the note there.  This
+        source needs it for the same reason: bring-up starts the uploader
+        before the recorders exist, so on a greenfield station we poll a
+        database that sqlite3.connect() has just created empty.  Without the
+        guard that is an unhandled OperationalError once per pump cycle
+        (17 tracebacks on AC0G-B4's first boot, appliance v3.21) -- alarming
+        during a first boot, and competing with the real diagnostics at
+        exactly the moment an operator is watching.
+
+        Not cached: unlike SqliteSource this source is long-lived across the
+        transition from "no producer" to "producer running", and the cost is
+        one indexed sqlite_master lookup per pump.
+        """
+        cur = conn.execute(
+            "SELECT name FROM sqlite_master "
+            "WHERE type='table' AND name='pending_uploads'"
+        )
+        return cur.fetchone() is not None
 
     def _cycle_floor_iso(self, now: datetime) -> str:
         """Return ISO timestamp of the START of the current
