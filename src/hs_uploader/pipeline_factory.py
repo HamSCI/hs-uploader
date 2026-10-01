@@ -26,6 +26,10 @@ Manifest shape::
 Source types: ``sqlite``, ``filetree``, ``wspr_cycle``.  Transport types:
 ``psws_dataset``, ``pskreporter``, ``wsprnet``, ``wsprdaemon_tar``.
 
+``discard = true`` on a pipeline wraps its transport in
+:class:`~hs_uploader.transports.discard.DiscardTransport`: every batch acks
+without leaving the host, against the real transport's watermark key.
+
 The cycle-aligned wsprdaemon tar is expressed generically here
 (``wspr_cycle`` source + ``wsprdaemon_tar`` transport): every piece is an
 hs-uploader class, so the daemon builds it from the manifest with NO import
@@ -48,6 +52,7 @@ from .core import Pipeline, RetryPolicy
 from .sources import FileSpec, FileTreeSource
 from .sources.sqlite import SqliteSource
 from .sources.wspr_cycle import WsprCycleSource
+from .transports.discard import wrap_if_discard
 from .transports.heartbeat_sftp import HeartbeatSftp
 from .transports.pskreporter import PskReporterTcp
 from .transports.psws_magnetometer import PswsDatasetSftp
@@ -261,7 +266,7 @@ def build_pipelines(
             continue  # builder-entrypoint pipelines handled by the daemon
         name = str(entry.get("name") or f"pipeline-{len(pipelines)}")
         source = _build_source(entry["source"])
-        transport = _build_transport(entry["transport"])
+        transport = wrap_if_discard(entry, _build_transport(entry["transport"]))
         identity = _identity(base_identity, entry.get("identity"))
         mrpp = entry.get("max_records_per_pump")
         pipelines.append(Pipeline(

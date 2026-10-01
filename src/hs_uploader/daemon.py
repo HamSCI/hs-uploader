@@ -36,6 +36,7 @@ from typing import Any, Mapping
 from .config import StationIdentity
 from .core import Pipeline, Uploader
 from .pipeline_factory import build_pipelines as build_generic_pipelines
+from .transports.discard import wrap_if_discard
 from .wake import WakeListener
 from .watermark.sqlite import SqliteWatermarkStore, default_path
 
@@ -133,6 +134,8 @@ def build_all_pipelines(
             continue
         if isinstance(built, Pipeline):
             built = [built]
+        for p in built:
+            p.transport = wrap_if_discard(entry, p.transport)
         pipelines.extend(built)
         logger.info("daemon: builder %s contributed %d pipeline(s)", name, len(built))
     return pipelines
