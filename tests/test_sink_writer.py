@@ -594,6 +594,12 @@ def _columns(path: Path) -> list:
         return [r[1] for r in c.execute("PRAGMA table_info(pending_uploads)")]
 
 
+def _table_info(path: Path) -> list:
+    """Every column's (cid, name, type, notnull, dflt_value, pk), in order."""
+    with sqlite3.connect(path) as c:
+        return list(c.execute("PRAGMA table_info(pending_uploads)"))
+
+
 def _stored(path: Path) -> list:
     with sqlite3.connect(path) as c:
         return c.execute(
@@ -652,7 +658,9 @@ def test_the_ddl_script_and_ensure_columns_build_the_same_table(tmp_path):
     _old_sink(old)
     with sqlite3.connect(old) as c:
         assert ensure_columns(c) == ["producer", "local"]
-    assert _columns(fresh) == _columns(old)
+    # Whole rows, not names alone: a drift in type, NOT NULL or default
+    # between _QUEUE_DDL and _ADDED_COLUMNS must fail here.
+    assert _table_info(fresh) == _table_info(old)
     with sqlite3.connect(fresh) as c:
         names = {r[0] for r in c.execute(
             "SELECT name FROM sqlite_master WHERE type='index'")}
@@ -923,5 +931,8 @@ def test_large_old_file_gains_columns_without_rewrite(tmp_path):
         ).fetchone()[0] == 200_000
     finally:
         conn.close()
-    # A table rewrite of 200k rows takes seconds; a schema-only change, ms.
+    # The unchanged page_count above pins "no rewrite".  This time bound
+    # guards only against a pathological slowdown: a full-table UPDATE of
+    # 200k rows measures about 0.08 s and a CREATE INDEX about 0.04 s, so
+    # neither would trip it.
     assert elapsed < 1.0, f"ensure_columns took {elapsed:.3f} s"
