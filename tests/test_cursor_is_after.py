@@ -16,6 +16,7 @@ import pytest
 
 from hs_uploader.sources import FileSpec, FileTreeSource, SqliteSource
 from hs_uploader.sources.base import Source
+from hs_uploader.sources.files import _decode_keep_cursor, _keep_cursor_decodes
 from hs_uploader.sources.wspr_cycle import WsprCycleSource
 
 
@@ -100,6 +101,69 @@ def test_keep_reads_a_legacy_float_seconds_record(tmp_path):
 
 def test_keep_empty_stored_answers_true(tmp_path):
     assert _keep(tmp_path).cursor_is_after(b"1", b"") is True
+
+
+@pytest.mark.parametrize("base", [
+    1781583014421470123,   # a 2026 mtime in ns
+    2**53,                 # a float reads 2**53 + 1 as 2**53
+    2**62,                 # float spacing here is 1024 ns
+])
+def test_keep_orders_values_one_nanosecond_apart(tmp_path, base):
+    # ``st_mtime_ns > after`` is an exact integer compare.  A float compare
+    # (spacing 256 ns at this magnitude) or a microsecond compare would call
+    # these equal, and v3.71 would then refuse a legitimate forward write.
+    src = _keep(tmp_path)
+    earlier, later = str(base).encode(), str(base + 1).encode()
+    assert src.cursor_is_after(later, earlier) is True
+    assert src.cursor_is_after(earlier, later) is False
+
+
+# Inputs for the sync test below.  Each row: what a station could hold.
+_KEEP_CURSOR_TABLE = [
+    b"1781583014421470123",     # integer nanoseconds, what KEEP writes today
+    b"0",
+    b"-5",                      # negative
+    b"+7",
+    b" 42 ",                    # whitespace: int() accepts it
+    b"1_000",                   # underscore: int() accepts it
+    b"1781583014.421470",       # legacy float seconds
+    b"1e3",                     # float notation
+    b"1.5e-3",
+    b"",                        # no send record
+    b"garbage",
+    b"12abc",
+    b"0x10",                    # hex: neither int() nor float() takes it
+    b"nan",
+    b"inf",                     # int(float("inf")) overflows
+    b"-inf",
+    b"1e999",                   # float("1e999") is inf
+    b"1e300",                   # x 1e9 overflows to inf
+    b"1" * 5000,                # past int()'s digit limit; float() gives inf
+    b"\xff\xfe",                # not ASCII
+    b"\xc3\xa9",
+    b"\x00",
+]
+
+
+@pytest.mark.parametrize("raw", _KEEP_CURSOR_TABLE, ids=lambda b: repr(b)[:40])
+def test_keep_cursor_decodes_stays_in_step_with_decode_keep_cursor(raw):
+    # _keep_cursor_decodes repeats _decode_keep_cursor's parse steps, and the
+    # brief leaves the original alone.  This pins the two together: if someone
+    # teaches _decode_keep_cursor a new format, the guard must learn it too,
+    # or the comparator would silently answer True for a value iter_batches
+    # reads as a number.
+    try:
+        value, raised = _decode_keep_cursor(raw), None
+    except Exception as exc:  # noqa: BLE001 -- the table wants every kind
+        value, raised = None, exc
+    if _keep_cursor_decodes(raw):
+        assert raised is None, (raw, raised)
+    else:
+        # Undecodable: _decode_keep_cursor reads 0 for want of a number, or
+        # raises the OverflowError that int(float("inf")) raises.
+        assert (raised is None and value == 0) or isinstance(raised, OverflowError), (
+            raw, value, raised,
+        )
 
 
 @pytest.mark.parametrize("new,stored", [

@@ -121,6 +121,9 @@ class SqliteWatermarkStore:
         # In memory only, so each process keeps its own.
         self._clock = clock
         self._warn_windows: dict[tuple[str, str, str], list] = {}
+        # key -> `clock` reading at the last WARNING that a failed check
+        # produced (the read, the comparator or the logging raised).
+        self._check_failed_at: dict[tuple[str, str, str], float] = {}
         self._init_schema()
         # Make the db + its WAL/SHM sidecars group-writable so OTHER
         # users in the same supplementary group (sigmond) can write
@@ -215,32 +218,71 @@ class SqliteWatermarkStore:
         values and then goes ahead, so nothing the station sends
         changes.  v3.71 enforces the rule once each sender owns its key.
         ``_log_not_forward`` keeps that log to one WARNING per key per
-        ``BACKWARD_WARN_INTERVAL_S``.  A comparator that raises counts as
-        True: it logs a WARNING and never blocks the write, because a
-        skipped write would re-send the batch on every pump.
+        ``BACKWARD_WARN_INTERVAL_S``.
+
+        The check is an observation, and it never decides whether the
+        write happens: a skipped write would re-send the batch on every
+        pump.  So the read of the stored cursor, the comparator and the
+        logging all run inside a guard.  When any of them raises, the
+        store logs that (``_log_check_failed``, one WARNING per key per
+        window) and writes anyway, with the arguments ``advance_cursor``
+        would have had.  The return value then reads True when the read
+        or the comparator failed, since no backward move was shown.  A
+        logging failure after the comparator answered leaves that answer
+        in place.
 
         ``self._lock`` covers the read and the write, which serializes
         callers in this process only.  Another process that opens the
         same file (an in-process sender) can still write between them;
         a check that only warns tolerates that.
         """
+        key = (source_id, dest_id, table)
         with self._lock:
-            stored = self.get_cursor(source_id, dest_id, table)
+            forward = True
             try:
-                forward = bool(is_after(cursor, stored))
+                stored = self.get_cursor(source_id, dest_id, table)
+                try:
+                    forward = bool(is_after(cursor, stored))
+                except Exception as exc:  # noqa: BLE001 — never block the write
+                    self._log_check_failed(key, "cursor comparator", exc, cursor)
+                    forward = True
+                if not forward:
+                    self._log_not_forward(key, stored, cursor)
             except Exception as exc:  # noqa: BLE001 — never block the write
-                logger.warning(
-                    "send record (%s, %s, %s): cursor comparator raised %s: %s; "
-                    "writing %r anyway",
-                    source_id, dest_id, table, type(exc).__name__, exc, cursor,
-                )
-                forward = True
-            if not forward:
-                self._log_not_forward((source_id, dest_id, table), stored, cursor)
+                self._log_check_failed(key, "forward check", exc, cursor)
             self.advance_cursor(
                 source_id, dest_id, table, cursor=cursor, last_ack=last_ack,
             )
             return forward
+
+    def _log_check_failed(
+        self, key: tuple[str, str, str], what: str, exc: BaseException,
+        cursor: bytes,
+    ) -> None:
+        """Log that the forward check for ``key`` raised, without raising.
+
+        The first failure on a key logs a WARNING.  Failures within
+        ``BACKWARD_WARN_INTERVAL_S`` of that WARNING log at DEBUG, so a
+        comparator that raises on every acknowledgement cannot flood the
+        journal.  This runs inside the guard that protects the write, so
+        a failure in here (a log filter that raises, a clock that raises)
+        gets swallowed.  The caller holds ``self._lock``.
+        """
+        try:
+            now = self._clock()
+            last = self._check_failed_at.get(key)
+            if last is not None and now - last < BACKWARD_WARN_INTERVAL_S:
+                level = logging.DEBUG
+            else:
+                level = logging.WARNING
+                self._check_failed_at[key] = now
+            logger.log(
+                level,
+                "send record (%s, %s, %s): %s raised %s: %s; writing %r anyway",
+                *key, what, type(exc).__name__, exc, cursor,
+            )
+        except Exception:  # noqa: BLE001 — a logging failure must not block the write
+            pass
 
     def _log_not_forward(
         self, key: tuple[str, str, str], stored: bytes, new: bytes,

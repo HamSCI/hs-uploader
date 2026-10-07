@@ -95,7 +95,9 @@ class WatermarkStore(Protocol):
         log the key and both values when it answers False, then write
         exactly as ``advance_cursor`` does.  Returns the answer.  The
         log holds one WARNING per key per hour, with a count of the
-        writes logged at DEBUG between.  v3.70 never refuses a write.
+        writes logged at DEBUG between.  v3.70 never refuses a write,
+        and a failure in the read, the comparator or the logging does
+        not stop it either.
         """
         ...
 

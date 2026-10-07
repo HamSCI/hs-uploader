@@ -305,7 +305,11 @@ def _decode_keep_cursor(cursor: bytes) -> int:
 def _keep_cursor_decodes(cursor: bytes) -> bool:
     """True when ``_decode_keep_cursor`` reads a number from ``cursor``
     rather than falling back to 0.  ``b"inf"`` counts as undecodable:
-    ``int(float("inf"))`` raises OverflowError."""
+    ``int(float("inf"))`` raises OverflowError.
+
+    This mirrors the parse steps of ``_decode_keep_cursor``, which stays
+    as it is.  ``tests/test_cursor_is_after.py`` pins the two together:
+    change one, and the other has to follow."""
     try:
         text = cursor.decode("ascii")
     except UnicodeDecodeError:
