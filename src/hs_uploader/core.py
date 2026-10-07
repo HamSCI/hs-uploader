@@ -14,7 +14,7 @@ from __future__ import annotations
 
 import logging
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import (
@@ -584,13 +584,14 @@ class Uploader:
                     error=outcome.reason or None,
                 )
                 return
-            from .watermark.base import Deliverable
+            # Change only the attempt count and the next attempt time; keep
+            # every other field, the key, cursor_after and commit_token
+            # among them.  Rebuilding the row field by field once dropped
+            # those five (D15): the retry's eventual ack then advanced no
+            # send record, cleaned nothing up, and the rows went out again.
             pipe.watermark.requeue_deliverable(
-                Deliverable(
-                    id=deliverable.id,
-                    pipeline=deliverable.pipeline,
-                    payload_blob=deliverable.payload_blob,
-                    enqueued_at=deliverable.enqueued_at,
+                replace(
+                    deliverable,
                     attempts=attempts,
                     next_attempt_at=_iso(now + pipe.retry.delay_for(attempts)),
                 )
