@@ -1,16 +1,19 @@
-"""SQLite source — reads from `sigmond.hamsci_sink.Writer`'s
-`pending_uploads` queue.
+"""SQLite source — reads the `pending_uploads` queue that
+`hs_uploader.sink.Writer` fills.
 
 This is hs-uploader's database source: it yields `RecordBatch`es
 starting strictly after the supplied opaque cursor, with strict
-schema-version checking.  `sigmond.hamsci_sink.Writer.from_env()` stages
-rows into this queue by default (`/var/lib/sigmond/sink.db`).
+schema-version checking.  `hs_uploader.sink.Writer.from_env()` stages
+rows into this queue by default (`/var/lib/sigmond/sink.db`).  The
+writer moved into this package in v3.70.  sigmond keeps
+`sigmond.hamsci_sink` as a compatibility import, the name clients still
+use.
 
 Pipeline shape::
 
-    Producer.hamsci_sink.Writer.from_env()  → Writer.flush()
+    Producer: hs_uploader.sink.Writer.from_env()  → Writer.flush()
         → pending_uploads (target_db, target_table, schema_version,
-                           payload_json, queued_at)
+                           payload_json, queued_at, producer, local)
     SqliteSource.iter_batches(cursor, limit)
         → SELECT rows WHERE id > cursor
                        AND target_db   = <database>
@@ -122,7 +125,7 @@ class _ConnectionConfig:
 
         Returns ``None`` (→ no-op source) when neither `SIGMOND_SQLITE_PATH`
         is set nor the default sink db exists — the standalone-safe no-op
-        that mirrors `sigmond.hamsci_sink.Writer.from_env()`.
+        that mirrors `hs_uploader.sink.Writer.from_env()`.
         """
         e = env if env is not None else os.environ
         path = (e.get("SIGMOND_SQLITE_PATH") or "").strip()
@@ -163,8 +166,9 @@ def _default_connect_factory(cfg: _ConnectionConfig) -> sqlite3.Connection:
 
 
 class SqliteSource:
-    """Read-side of sigmond.hamsci_sink.Writer's `pending_uploads`
-    queue.
+    """Read side of the `pending_uploads` queue that
+    `hs_uploader.sink.Writer` fills (clients import the writer as
+    `sigmond.hamsci_sink`, the compatibility import sigmond keeps).
 
     The (database, table) pair filters which rows belong to this
     source — matching the `target_db`/`target_table` tags the writer

@@ -70,11 +70,16 @@ restarts on either side.
 
 ## 3. Non-goals / out of scope
 
-- **Producing records.** Writing `pending_uploads` is the recorders' job
-  via `sigmond.hamsci_sink.Writer`; hs-uploader only reads. (Owner: each
-  recorder + sigmond's hamsci_sink.)
-- **Being a service.** It owns no systemd unit, no daemon loop, no
-  scheduler — the consuming client drives `pump()` / `pump_until_idle()`.
+- **Choosing what to record.** Each recorder decides which observations
+  to store and stores them through the sink writer.  The writer moved
+  here in v3.70, as `hs_uploader.sink.Writer`, and sigmond keeps
+  `sigmond.hamsci_sink` as a compatibility import, the name clients still
+  use.  hs-uploader owns the writer's code and the `pending_uploads`
+  schema; each recorder owns its rows.  (Owner: each recorder.)
+- **Scheduling a client's in-process sender.** A recorder that ships from
+  its own process drives `pump()` / `pump_until_idle()` itself.  The host
+  daemon, `hs-uploader serve` (`systemd/hs-uploader.service`), runs only
+  the pipelines in `/etc/hs-uploader/pipelines.toml`.
 - **Server-side processing.** Dedup across stations, ingest QA,
   long-term storage, Madrigal/HAPI APIs, and visualization are PSWS /
   upstream-community scope (PSWS-INTERFACE-BOUNDARY §2).

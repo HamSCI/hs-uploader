@@ -4,16 +4,22 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this project is
 
-**hs-uploader** is the read-side counterpart to `sigmond.hamsci_sink`'s
-`Writer`. Sigmond clients (the recorders) stage observation records
-into a local SQLite sink (`/var/lib/sigmond/sink.db`); this library
-forwards them up to HamSCI / community ingest destinations —
-wsprdaemon.org, wsprnet.org, PSKReporter, PSWS.
+**hs-uploader** holds both halves of a station's sink.  Its sink
+writer, `hs_uploader.sink.Writer`, stores the observation records of
+sigmond clients (the recorders) in a local SQLite sink
+(`/var/lib/sigmond/sink.db`).  Its sources and transports then forward
+those records to HamSCI and community destinations: wsprdaemon.org,
+wsprnet.org, PSKReporter, PSWS.  The writer moved here from sigmond in
+v3.70; clients still import it as `sigmond.hamsci_sink`, which sigmond
+keeps as a compatibility import.
 
 Part of the HamSCI sigmond suite — see `/opt/git/sigmond/sigmond/CLAUDE.md`
 (orchestrator) and `/opt/git/sigmond/CLAUDE.md` (umbrella) for
-cross-repo context. This is a library; it has no daemon of its own.
-Its consumers run a per-pipeline pump worker in-process.
+cross-repo context.  hs-uploader runs both as a library and as a
+daemon.  The host daemon, `hs-uploader serve` (`daemon.py`,
+`systemd/hs-uploader.service`), runs every pipeline in
+`/etc/hs-uploader/pipelines.toml` in one process.  Some recorders still
+run in-process senders built from the same library.
 
 ## Authors
 
@@ -36,8 +42,9 @@ uv build
 hs-uploader --help
 ```
 
-Consumers integrate via `from hs_uploader import …`, not the CLI.
-The CLI is a thin diagnostic entry point.
+Clients store rows through `hs_uploader.sink.Writer` and build
+in-process senders from `hs_uploader`'s sources and transports.  The CLI
+inspects state and runs the host daemon (`hs-uploader serve`).
 
 ## Architecture
 
@@ -55,8 +62,8 @@ The CLI is a thin diagnostic entry point.
 ### Three orthogonal abstractions
 
 - **Source** (`sources/`) — yields `Record`s from an opaque cursor.
-  - `SqliteSource` (preferred) reads `sigmond.hamsci_sink.Writer`'s
-    `pending_uploads` queue. Supports `extra_where` and `start_at`
+  - `SqliteSource` (preferred) reads the `pending_uploads` queue that
+    `hs_uploader.sink.Writer` fills. Supports `extra_where` and `start_at`
     knobs and enforces a strict `schema_version` check (rows outside
     the pipeline's accepted set flip the source to `stale-schema` —
     a clean halt rather than shipping mis-typed records).
@@ -92,6 +99,10 @@ src/hs_uploader/
   core.py                 # Pipeline + Uploader orchestration
   cli.py                  # diagnostic CLI
   config.py               # config loading helpers
+  daemon.py               # host daemon (`hs-uploader serve`)
+  sink/
+    writer.py             # sink Writer: stores client rows in sink.db
+                          # (moved from sigmond in v3.70)
   sources/
     base.py               # Source ABC + Record / RecordBatch types
     sqlite.py             # SqliteSource (preferred path)
@@ -108,7 +119,7 @@ src/hs_uploader/
     sqlite.py             # SqliteWatermarkStore
   payload/
     psk_pskr.py           # PSK Reporter binary frame builder
-tests/                    # 11 files
+tests/
 install.sh                # convenience installer (rarely used; consumers normally
                           # vendor hs-uploader via [tool.uv.sources] editable)
 tmpfiles.d/               # systemd-tmpfiles snippet for /var/lib/hs-uploader
@@ -147,8 +158,11 @@ explicit even when no third-party deps are required.
 
 ## Production paths
 
-- Sigmond sink: `/var/lib/sigmond/sink.db` (read-side; sigmond owns
-  writes via `hamsci_sink.Writer`).
+- Sigmond sink: `/var/lib/sigmond/sink.db`.  Clients write it through
+  `hs_uploader.sink.Writer` (imported as `sigmond.hamsci_sink`), and the
+  sources here read it.  Since v3.70 each row carries `producer` and
+  `local`; the writer adds both columns when it opens an older file and
+  never rewrites an existing row.
 - Watermark store: `/var/lib/hs-uploader/watermarks.db` (per-consumer
   state; survives restarts).
 - File spool (fallback): consumer-defined per pipeline.
