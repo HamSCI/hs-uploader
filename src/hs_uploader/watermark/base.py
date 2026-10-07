@@ -153,10 +153,12 @@ class WatermarkStore(Protocol):
 
     def requeue_deliverable(self, deliverable: Deliverable) -> None:
         """Re-insert a previously-popped deliverable.  The caller
-        constructs a fresh ``Deliverable`` carrying the updated
-        ``attempts`` and ``next_attempt_at`` while preserving the
-        original ``id``, ``pipeline``, ``payload_blob``, and
-        ``enqueued_at``.
+        passes a copy of the popped ``Deliverable`` that changes only
+        ``attempts`` and ``next_attempt_at`` (``dataclasses.replace``
+        does this).  The store writes every field back, the key,
+        ``cursor_after`` and ``commit_token`` included, so the retry's
+        eventual ack still advances its send record and commits to its
+        source (D15).
         """
         ...
 
