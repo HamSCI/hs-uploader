@@ -38,6 +38,11 @@ uv run pytest -k watermark -v                     # by keyword
 # Build distribution
 uv build
 
+# Do two trees send the same thing?  Runs OLD and NEW on copies of a
+# station's state; never writes the given files (v3.70 neutrality proof)
+.venv/bin/python tools/neutrality_check.py --manifest pipelines.toml \
+    --sink sink.db --watermarks watermarks.db --old OLD/src --new NEW/src
+
 # CLI (operator inspector — not the consumer integration path)
 hs-uploader --help
 hs-uploader migrate --check    # watermarks.db schema version; writes nothing
