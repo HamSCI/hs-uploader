@@ -457,6 +457,183 @@ def test_exit_codes_from_a_real_process(tmp_path):
     assert usage.returncode == 2 and "unrecognized arguments" in usage.stderr
 
 
+# ---- the runner's guards: each one runs once, and only when needed ----
+
+
+def test_nothing_to_do_takes_no_write_lock(tmp_path, monkeypatch, capsys):
+    # A store at the current version needs no write, so a writer that holds
+    # the lock must not make migrate wait or fail.
+    db = _v0_store(tmp_path)
+    assert main(["migrate", "--db", str(db)]) == 0
+    capsys.readouterr()
+    monkeypatch.setattr(schema, "BUSY_TIMEOUT_S", 0.2)
+    holder = sqlite3.connect(db, isolation_level=None)
+    holder.execute("BEGIN IMMEDIATE")
+    try:
+        rc = main(["migrate", "--db", str(db)])
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "watermarks.db: version 1", "  nothing to do"]
+
+
+def test_check_on_a_locked_store_fails_and_does_not_blame_a_crash(
+        tmp_path, monkeypatch, capsys):
+    # A lock held past the timeout is a failure.  Only a hot journal earns
+    # the "a crash left a journal" line.
+    db = _v0_store(tmp_path)
+    monkeypatch.setattr(schema, "BUSY_TIMEOUT_S", 0.2)
+    holder = sqlite3.connect(db, isolation_level=None)
+    holder.execute("BEGIN EXCLUSIVE")
+    try:
+        rc = main(["migrate", "--db", str(db), "--check"])
+    finally:
+        holder.execute("ROLLBACK")
+        holder.close()
+
+    captured = capsys.readouterr()
+    assert rc == 1, captured
+    assert "database is locked" in captured.err
+    assert "crash" not in captured.out
+
+
+def test_a_migrator_that_loses_the_race_applies_nothing(tmp_path, monkeypatch):
+    # Another migrate finishes between this one's first read of the version
+    # and its write lock.  Under the lock it must read the version again and
+    # find nothing left to run.
+    db = _v0_store(tmp_path)
+    ran = []
+    monkeypatch.setattr(schema, "MIGRATIONS", (
+        schema.Migration(1, "counting", lambda conn: ran.append(1)),))
+    real_inspect = schema._inspect
+
+    def stale_inspect(conn, path):
+        seen = real_inspect(conn, path)
+        _set_version(db, 1)        # the other migrate commits in the window
+        return seen                # ... and this one still holds the old 0
+
+    monkeypatch.setattr(schema, "_inspect", stale_inspect)
+
+    report = schema.migrate(str(db))
+
+    assert ran == []
+    assert report.applied == []
+    assert (report.from_version, report.to_version) == (1, 1)
+
+
+def test_the_runner_applies_only_what_the_file_has_not_seen(
+        tmp_path, monkeypatch):
+    db = _v0_store(tmp_path)
+    schema.migrate(str(db))
+    assert _version(db) == 1
+    ran = []
+    second = schema.Migration(2, "second", lambda conn: ran.append(2))
+    monkeypatch.setattr(schema, "MIGRATIONS", (
+        schema.Migration(1, "first", lambda conn: ran.append(1)), second))
+
+    report = schema.migrate(str(db))
+
+    assert ran == [2]
+    assert report.applied == [second.name]
+    assert (report.from_version, report.to_version) == (1, 2)
+    assert _version(db) == 2
+
+
+def test_hot_journal_check_falls_back_when_errors_lack_sqlite_errorname(
+        tmp_path):
+    # requires-python is >=3.10, where sqlite3 errors carry no
+    # sqlite_errorname.  _hot_journal then reads the message and looks for
+    # the journal file beside the store.
+    db = tmp_path / "watermarks.db"
+    readonly = sqlite3.OperationalError("attempt to write a readonly database")
+    unrelated = sqlite3.OperationalError("database is locked")
+    assert getattr(readonly, "sqlite_errorname", None) is None
+
+    assert schema._hot_journal(readonly, db) is False     # no journal file
+    assert schema._hot_journal(unrelated, db) is False
+    Path(f"{db}-journal").write_bytes(b"\x00" * 512)
+    assert schema._hot_journal(readonly, db) is True
+    assert schema._hot_journal(unrelated, db) is False    # journal, wrong error
+
+
+# ---- the CLI's exact lines and its choice of file ----
+
+
+def test_the_failure_line_names_path_type_and_message(tmp_path, capsys):
+    db = tmp_path / "watermarks.db"
+    db.write_bytes(b"this is not sqlite\n" * 10)
+
+    rc = main(["migrate", "--db", str(db)])
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        f"hs-uploader migrate: {db}: DatabaseError: file is not a database"]
+
+
+def test_the_newer_store_line_is_exact(tmp_path, capsys):
+    db = _v0_store(tmp_path)
+    _set_version(db, 2)
+
+    rc = main(["migrate", "--db", str(db)])
+
+    assert rc == 0
+    assert capsys.readouterr().out.splitlines() == [
+        "watermarks.db: version 2",
+        "  newer than this hs-uploader, which knows versions up to 1; "
+        "left as it stands"]
+
+
+@pytest.mark.skipif(os.geteuid() == 0,
+                    reason="root reads through a mode-000 directory")
+def test_a_stat_failure_prints_the_failure_line_and_exits_1(tmp_path, capsys):
+    # A parent directory the caller cannot search makes the existence check
+    # fail with EACCES.  That is a failure with the contract's line, not a
+    # traceback.
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    db = locked / "watermarks.db"
+    locked.chmod(0o000)
+    try:
+        rc = main(["migrate", "--db", str(db)])
+    finally:
+        locked.chmod(0o700)        # so tmp_path can clean up
+
+    assert rc == 1
+    captured = capsys.readouterr()
+    assert captured.out == ""
+    assert captured.err.splitlines() == [
+        f"hs-uploader migrate: {db}: PermissionError: "
+        f"[Errno 13] Permission denied: {str(db)!r}"]
+
+
+def test_db_beats_state(tmp_path):
+    db = _v0_store(tmp_path / "chosen")
+    other = _v0_store(tmp_path / "other")
+
+    rc = main(["--state", str(other), "migrate", "--db", str(db)])
+
+    assert rc == 0
+    assert _version(db) == 1
+    assert _version(other) == 0
+
+
+def test_without_db_or_state_migrate_uses_the_default_path(
+        tmp_path, monkeypatch):
+    # default_path() reads HS_UPLOADER_STATE_DIR each time it runs.
+    db = _v0_store(tmp_path / "state")
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(db.parent))
+
+    rc = main(["migrate"])
+
+    assert rc == 0
+    assert _version(db) == 1
+
+
 # ---- the store never migrates; old code reads a migrated file ----
 
 

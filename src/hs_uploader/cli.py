@@ -198,12 +198,12 @@ def _cmd_migrate(args) -> int:
     from .watermark import schema
 
     path = args.db or args.state or default_path()
-    if not path.exists():
-        # The daemon creates the store on its first start, as hsupload.  A
-        # migrate run as root must not create it first.
-        print(f"watermarks.db: not found at {path}; nothing to migrate")
-        return 0
     try:
+        if not path.exists():
+            # The daemon creates the store on its first start, as hsupload.
+            # A migrate run as root must not create it first.
+            print(f"watermarks.db: not found at {path}; nothing to migrate")
+            return 0
         report = schema.migrate(str(path), check=args.check)
     except schema.JournalRecoveryNeeded:
         # Only --check meets this.  Its read-only open cannot roll back
