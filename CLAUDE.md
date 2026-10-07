@@ -40,6 +40,8 @@ uv build
 
 # CLI (operator inspector — not the consumer integration path)
 hs-uploader --help
+hs-uploader migrate --check    # watermarks.db schema version; writes nothing
+hs-uploader migrate            # run pending migrations (sigmond does this on update)
 ```
 
 Clients store rows through `hs_uploader.sink.Writer` and build
@@ -117,6 +119,7 @@ src/hs_uploader/
   watermark/
     base.py               # WatermarkStore ABC
     sqlite.py             # SqliteWatermarkStore
+    schema.py             # PRAGMA user_version + migrate() (`hs-uploader migrate`)
   payload/
     psk_pskr.py           # PSK Reporter binary frame builder
 tests/
@@ -166,6 +169,44 @@ explicit even when no third-party deps are required.
 - Watermark store: `/var/lib/hs-uploader/watermarks.db` (per-consumer
   state; survives restarts).
 - File spool (fallback): consumer-defined per pipeline.
+
+## watermarks.db schema version (`hs-uploader migrate`)
+
+`PRAGMA user_version` in `watermarks.db` holds the store's schema
+version.  `src/hs_uploader/watermark/schema.py` owns it: `SCHEMA_VERSION`,
+the ordered `MIGRATIONS`, and `migrate(path, *, check=False) -> MigrateReport`.
+
+- Only `hs-uploader migrate` migrates.  `SqliteWatermarkStore`'s
+  constructor never reads or writes `user_version`, and the daemon never
+  migrates while it starts (D10 in sigmond/tasks/plan-sink-control.md).
+  From v3.70, sigmond runs `hs-uploader migrate` once every component's
+  code sits in place and before it starts or restarts the daemon.
+- `migrate` runs every pending migration, in order, inside one
+  `BEGIN IMMEDIATE` transaction.  It waits up to `BUSY_TIMEOUT_S` (30 s)
+  for another process's write lock.  A failure rolls back every step.
+- `migrate` opens the file read-write from its first read.  A crash in
+  the middle of a write leaves a hot journal (`watermarks.db-journal`),
+  and that first read rolls it back, exactly as the daemon's own open
+  would.  A read-only open cannot roll it back and refuses to read.
+- `--check` opens the file read-only and writes nothing.  On a hot
+  journal it prints `watermarks.db: a crash left a journal to recover;
+  run hs-uploader migrate without --check (or start the daemon) to
+  recover it` and exits 0 (`JournalRecoveryNeeded` in the library).
+- A missing file: exit 0, and migrate creates nothing.  The daemon
+  creates the store on its first start, as `hsupload`; a migrate run as
+  root must not create it first.
+- A file without a `watermarks` table, such as `sink.db` passed by
+  mistake: exit 1, file untouched.
+- A store newer than the code, after a rollback: exit 0, and migrate
+  leaves the number as it stands.  Older store code opens a newer file
+  unchanged.
+- Version 1 (v3.70) changes no row and no table.  It records the number
+  and nothing else.
+- To add a migration, append a `Migration` to `MIGRATIONS` and raise
+  `SCHEMA_VERSION` to match.  Never edit a migration that has shipped.
+- Exit codes: 0 done or nothing to do, 1 failure, 2 usage error.  An
+  hs-uploader that predates `migrate` also exits 2, and prints
+  `invalid choice: 'migrate'` on stderr.
 
 ## Library lockfile policy
 

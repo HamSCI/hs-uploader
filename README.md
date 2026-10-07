@@ -103,6 +103,29 @@ pip install -e ".[dev,wsprdaemon,wsprnet,pskreporter,psws]"
 
 Optional extras let consuming clients pull only the transports they use.
 
+## The store's schema version: `hs-uploader migrate`
+
+The watermark store, `/var/lib/hs-uploader/watermarks.db`, records its
+schema version in `PRAGMA user_version`.  `hs-uploader migrate` brings
+the store up to the version this release knows:
+
+```bash
+hs-uploader migrate --check     # print the version and what would run; write nothing
+hs-uploader migrate             # run each pending migration once, in order
+hs-uploader migrate --db PATH   # act on another file (default: --state, else the path above)
+```
+
+Run it once the new code sits in place and before the daemon restarts.
+Neither the daemon nor the store migrates on its own.  Version 1, which
+v3.70 introduced, changes no row and no table.  On a missing file,
+`migrate` says so, creates nothing and leaves the file for the daemon to
+create.  A crash in the middle of a write can leave
+`watermarks.db-journal` beside the store.  `migrate` rolls that journal
+back first, as the daemon does when it opens the store.  `--check` cannot
+roll it back read-only, so it says so, changes nothing and exits 0.  The
+command exits 0 when it finished or found nothing to do, 1 when it
+failed, and 2 on a usage error.
+
 ## License
 
 MIT — see LICENSE.

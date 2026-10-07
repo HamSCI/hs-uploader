@@ -10,6 +10,10 @@ Subcommands:
 * ``hs-uploader kick``   — bump every deliverable's
   ``next_attempt_at`` to now, so the next ``pump`` retries
   immediately instead of waiting out the backoff.
+* ``hs-uploader migrate [--db PATH] [--check]`` — bring watermarks.db
+  to this release's schema version (``PRAGMA user_version``).
+  ``--check`` reports the version and what would run, and writes
+  nothing.  Exit 0 done or nothing to do, 1 failure, 2 usage error.
 
 Phase 1 is read-mostly: ``pump`` is **not** wired up here because there
 are no transports yet.  It will land in Phase 2 once
@@ -62,6 +66,26 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_kick.set_defaults(func=_cmd_kick)
 
+    sp_migrate = sub.add_parser(
+        "migrate",
+        help="Bring watermarks.db to this release's schema version.  Run it "
+             "once the new code sits in place, before the daemon restarts.",
+    )
+    sp_migrate.add_argument(
+        "--db",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="Path to watermarks.db (default: --state, else "
+             f"{default_path()}).",
+    )
+    sp_migrate.add_argument(
+        "--check",
+        action="store_true",
+        help="Report the version and the pending migrations; write nothing.",
+    )
+    sp_migrate.set_defaults(func=None)
+
     sp_serve = sub.add_parser(
         "serve",
         help="Run the host uploader daemon — every outbound pipeline in the "
@@ -91,6 +115,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         from . import daemon
         return daemon.run(args.manifest, dry_run=args.dry_run, once=args.once)
+    # `migrate` opens the file itself.  Constructing the store would create
+    # a missing file and change its mode, and `--check` writes nothing.
+    if args.cmd == "migrate":
+        return _cmd_migrate(args)
     state_path = args.state or default_path()
     if not state_path.exists() and args.cmd in ("reset-cursor", "kick"):
         print(f"hs-uploader: state file not found: {state_path}", file=sys.stderr)
@@ -163,6 +191,41 @@ def _cmd_kick(args, store: SqliteWatermarkStore) -> int:
         )
         n = cur.rowcount
     print(f"kicked {n} deliverable(s) — next pump will retry them")
+    return 0
+
+
+def _cmd_migrate(args) -> int:
+    from .watermark import schema
+
+    path = args.db or args.state or default_path()
+    if not path.exists():
+        # The daemon creates the store on its first start, as hsupload.  A
+        # migrate run as root must not create it first.
+        print(f"watermarks.db: not found at {path}; nothing to migrate")
+        return 0
+    try:
+        report = schema.migrate(str(path), check=args.check)
+    except schema.JournalRecoveryNeeded:
+        # Only --check meets this.  Its read-only open cannot roll back
+        # what a crash left half written, and it leaves the file alone.
+        print("watermarks.db: a crash left a journal to recover; run "
+              "hs-uploader migrate without --check (or start the daemon) "
+              "to recover it")
+        return 0
+    except Exception as exc:  # noqa: BLE001 -- any failure means exit 1
+        print(f"hs-uploader migrate: {path}: {type(exc).__name__}: {exc}",
+              file=sys.stderr)
+        return 1
+    print(f"watermarks.db: version {report.to_version}")
+    for name in report.applied:
+        print(f"  applied {name}")
+    for name in report.pending:
+        print(f"  pending {name}")
+    if report.to_version > schema.SCHEMA_VERSION:
+        print(f"  newer than this hs-uploader, which knows versions up to "
+              f"{schema.SCHEMA_VERSION}; left as it stands")
+    elif not report.applied and not report.pending:
+        print("  nothing to do")
     return 0
 
 
