@@ -21,7 +21,7 @@ intervene.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Optional, Protocol, runtime_checkable
+from typing import Callable, Optional, Protocol, runtime_checkable
 
 
 @dataclass(frozen=True)
@@ -79,6 +79,24 @@ class WatermarkStore(Protocol):
         cursor: bytes,
         last_ack: str,
     ) -> None:
+        ...
+
+    def advance_cursor_checked(
+        self,
+        source_id: str,
+        dest_id: str,
+        table: str,
+        *,
+        cursor: bytes,
+        last_ack: str,
+        is_after: Callable[[bytes, bytes], bool],
+    ) -> bool:
+        """Read the stored cursor, ask ``is_after(cursor, stored)``,
+        log the key and both values when it answers False, then write
+        exactly as ``advance_cursor`` does.  Returns the answer.  The
+        log holds one WARNING per key per hour, with a count of the
+        writes logged at DEBUG between.  v3.70 never refuses a write.
+        """
         ...
 
     # --- attempts (audit log) ---

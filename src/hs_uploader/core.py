@@ -462,9 +462,10 @@ class Uploader:
         ts = _iso(now)
         table = pipe.transport.primary_table()
         if outcome.kind == "acked":
-            pipe.watermark.advance_cursor(
+            pipe.watermark.advance_cursor_checked(
                 pipe.source_id(), pipe.dest_id(), table,
                 cursor=batch.cursor_after, last_ack=ts,
+                is_after=_is_after_for(pipe.source),
             )
             pipe.source.commit(batch.commit_token)
             pipe.watermark.record_attempt(
@@ -478,10 +479,11 @@ class Uploader:
             # whole token (sources that need finer-grained "which rejected
             # records did NOT get acked" can encode that into commit_token,
             # but the v1 file source either acks all or none).
-            pipe.watermark.advance_cursor(
+            pipe.watermark.advance_cursor_checked(
                 pipe.source_id(), pipe.dest_id(), table,
                 cursor=outcome.accepted_cursor or batch.cursor_after,
                 last_ack=ts,
+                is_after=_is_after_for(pipe.source),
             )
             pipe.source.commit(batch.commit_token)
             pipe.watermark.record_attempt(
@@ -542,12 +544,13 @@ class Uploader:
             # missing: without it, a source's cursor would never
             # advance for a batch that succeeded only on retry.
             if deliverable.cursor_after:
-                pipe.watermark.advance_cursor(
+                pipe.watermark.advance_cursor_checked(
                     deliverable.source_id or pipe.source_id(),
                     deliverable.dest_id or pipe.dest_id(),
                     deliverable.table or pipe.transport.primary_table(),
                     cursor=deliverable.cursor_after,
                     last_ack=ts,
+                    is_after=_is_after_for(pipe.source),
                 )
             pipe.source.commit(deliverable.commit_token)
             pipe.watermark.record_attempt(
@@ -646,3 +649,19 @@ def _iso(epoch: float) -> str:
     return datetime.fromtimestamp(epoch, tz=timezone.utc).isoformat(
         timespec="seconds"
     )
+
+
+def _always_after(new: bytes, stored: bytes) -> bool:
+    return True
+
+
+def _is_after_for(source: "Source") -> Callable[[bytes, bytes], bool]:
+    """The source's own cursor order, for ``advance_cursor_checked``.
+
+    A source written before v3.70 (or a test double) may lack
+    ``cursor_is_after``.  The concrete sources do not subclass the
+    ``Source`` protocol, so they inherit no default; such a source gets
+    "always after", which never warns.
+    """
+    fn = getattr(source, "cursor_is_after", None)
+    return fn if callable(fn) else _always_after

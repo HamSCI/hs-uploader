@@ -192,6 +192,24 @@ class WsprCycleSource:
         ``smd storage trim`` (24 h retention).  Doing it here would
         race the wsprnet pipeline, which also reads ``wspr.spots``."""
 
+    def cursor_is_after(self, new: bytes, stored: bytes) -> bool:
+        """Compare as text, the order of the SQL filter
+        ``json_extract(payload_json, '$.time') > ?`` in ``iter_batches``.
+        Parsing the times could disagree with that query when a producer
+        writes ``+00:00`` or fractional seconds, so the compare stays
+        lexical.  An empty ``stored`` answers True; so does a value that
+        is not ASCII (logged at DEBUG)."""
+        if not stored:
+            return True
+        try:
+            return new.decode("ascii") > stored.decode("ascii")
+        except UnicodeDecodeError as exc:
+            logger.debug(
+                "WsprCycleSource: cannot order send records %r and %r (%s); "
+                "treating the new one as after", new, stored, exc,
+            )
+            return True
+
     def close(self) -> None:
         if self._conn is not None:
             try:

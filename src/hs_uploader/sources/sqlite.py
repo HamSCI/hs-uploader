@@ -415,6 +415,23 @@ class SqliteSource:
                 self.database, self.table, last_id, exc,
             )
 
+    def cursor_is_after(self, new: bytes, stored: bytes) -> bool:
+        """Compare two send records as integer ids, the order of the
+        ``id > ?`` filter.  A byte compare would rank ``b"999"`` above
+        ``b"1000"``.  An empty ``stored`` answers True; so does a value
+        that is not an ASCII integer (logged at DEBUG)."""
+        if not stored:
+            return True
+        try:
+            return _Cursor.from_bytes(new).last_id > _Cursor.from_bytes(stored).last_id
+        except ValueError as exc:
+            logger.debug(
+                "SqliteSource %s.%s: cannot order send records %r and %r (%s); "
+                "treating the new one as after",
+                self.database, self.table, new, stored, exc,
+            )
+            return True
+
     # ---- internals ----
 
     def _ensure_ready(self) -> bool:

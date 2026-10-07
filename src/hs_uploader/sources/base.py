@@ -52,3 +52,21 @@ class Source(Protocol):
         previously-failed deliverable.
         """
         return None
+
+    def cursor_is_after(self, new: bytes, stored: bytes) -> bool:
+        """True when ``new`` lies after ``stored`` in this source's own
+        order, so that writing ``new`` moves the send record forward.
+
+        The watermark store keeps cursors as opaque bytes, and a byte
+        compare ranks ``b"999"`` above ``b"1000"``.  Only the source
+        knows its encoding, so the orchestrator asks the source before
+        each cursor write.  An empty ``stored`` (no send record yet)
+        answers True, and so does a value the source cannot decode.
+        In v3.70 a False answer only gets logged (one WARNING per key
+        per hour); the write still happens.
+
+        This default answers True.  The concrete sources do not
+        subclass this protocol, so each defines its own; core falls
+        back to True for a source that lacks the method.
+        """
+        return True

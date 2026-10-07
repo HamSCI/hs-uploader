@@ -230,6 +230,29 @@ class FileTreeSource:
                 if d.parent != self.root:
                     to_try.append(d.parent)
 
+    def cursor_is_after(self, new: bytes, stored: bytes) -> bool:
+        """KEEP: compare integer nanoseconds, the order of the
+        ``st_mtime_ns > after`` filter in ``iter_batches``, reading a
+        legacy float-seconds record through ``_decode_keep_cursor`` just
+        as ``iter_batches`` does.  delete_on_ack: always True, since its
+        cursor never changes (``b"<delete-on-ack>"``).
+
+        An empty ``stored`` answers True; so does a value
+        ``_decode_keep_cursor`` would read as 0 for want of a number
+        (logged at DEBUG)."""
+        if self.retention == self.DELETE_ON_ACK:
+            return True
+        if not stored:
+            return True
+        if not (_keep_cursor_decodes(new) and _keep_cursor_decodes(stored)):
+            logger.debug(
+                "FileTreeSource %s: cannot order send records %r and %r; "
+                "treating the new one as after",
+                self._source_id, new, stored,
+            )
+            return True
+        return _decode_keep_cursor(new) > _decode_keep_cursor(stored)
+
     # -- internals --
 
     def _collect_files(self) -> list[Path]:
@@ -277,3 +300,23 @@ def _decode_keep_cursor(cursor: bytes) -> int:
             return int(float(text) * 1_000_000_000)
         except ValueError:
             return 0
+
+
+def _keep_cursor_decodes(cursor: bytes) -> bool:
+    """True when ``_decode_keep_cursor`` reads a number from ``cursor``
+    rather than falling back to 0.  ``b"inf"`` counts as undecodable:
+    ``int(float("inf"))`` raises OverflowError."""
+    try:
+        text = cursor.decode("ascii")
+    except UnicodeDecodeError:
+        return False
+    try:
+        int(text)
+        return True
+    except ValueError:
+        pass
+    try:
+        int(float(text) * 1_000_000_000)
+        return True
+    except (ValueError, OverflowError):
+        return False

@@ -23,8 +23,9 @@ import os
 import logging
 import sqlite3
 import threading
+import time
 from pathlib import Path
-from typing import Optional
+from typing import Callable, Optional
 
 from .base import Deliverable
 
@@ -86,6 +87,12 @@ def default_path() -> Path:
 
 logger = logging.getLogger(__name__)
 
+# advance_cursor_checked logs a send record that does not move forward
+# with one WARNING per key per this many seconds, and at DEBUG between.
+# A shared key can run backward on every acknowledgement, and a WARNING
+# each time would bury every other line in the journal.
+BACKWARD_WARN_INTERVAL_S = 3600.0
+
 
 class SqliteWatermarkStore:
     """SQLite-backed implementation of ``WatermarkStore``.
@@ -96,7 +103,12 @@ class SqliteWatermarkStore:
     supported and is an operator config error.
     """
 
-    def __init__(self, path: Path | str = ":memory:"):
+    def __init__(
+        self,
+        path: Path | str = ":memory:",
+        *,
+        clock: Callable[[], float] = time.monotonic,
+    ):
         self.path = str(path)
         # ``check_same_thread=False`` because the orchestrator may dispatch
         # from a thread that's different from the constructor's; we
@@ -104,6 +116,11 @@ class SqliteWatermarkStore:
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
+        # advance_cursor_checked's warning windows, one per key:
+        # key -> [window start on `clock`, writes since the last WARNING].
+        # In memory only, so each process keeps its own.
+        self._clock = clock
+        self._warn_windows: dict[tuple[str, str, str], list] = {}
         self._init_schema()
         # Make the db + its WAL/SHM sidecars group-writable so OTHER
         # users in the same supplementary group (sigmond) can write
@@ -178,6 +195,92 @@ class SqliteWatermarkStore:
                 "cursor=excluded.cursor, last_ack=excluded.last_ack",
                 (source_id, dest_id, table, cursor, last_ack),
             )
+
+    def advance_cursor_checked(
+        self,
+        source_id: str,
+        dest_id: str,
+        table: str,
+        *,
+        cursor: bytes,
+        last_ack: str,
+        is_after: Callable[[bytes, bytes], bool],
+    ) -> bool:
+        """Write the send record exactly as ``advance_cursor`` does, after
+        asking ``is_after(cursor, stored)`` whether the write moves it
+        forward.  Returns that answer.
+
+        v3.70 warns only.  A write that would move the record backward,
+        or leave it where it stands, gets logged with the key and both
+        values and then goes ahead, so nothing the station sends
+        changes.  v3.71 enforces the rule once each sender owns its key.
+        ``_log_not_forward`` keeps that log to one WARNING per key per
+        ``BACKWARD_WARN_INTERVAL_S``.  A comparator that raises counts as
+        True: it logs a WARNING and never blocks the write, because a
+        skipped write would re-send the batch on every pump.
+
+        ``self._lock`` covers the read and the write, which serializes
+        callers in this process only.  Another process that opens the
+        same file (an in-process sender) can still write between them;
+        a check that only warns tolerates that.
+        """
+        with self._lock:
+            stored = self.get_cursor(source_id, dest_id, table)
+            try:
+                forward = bool(is_after(cursor, stored))
+            except Exception as exc:  # noqa: BLE001 — never block the write
+                logger.warning(
+                    "send record (%s, %s, %s): cursor comparator raised %s: %s; "
+                    "writing %r anyway",
+                    source_id, dest_id, table, type(exc).__name__, exc, cursor,
+                )
+                forward = True
+            if not forward:
+                self._log_not_forward((source_id, dest_id, table), stored, cursor)
+            self.advance_cursor(
+                source_id, dest_id, table, cursor=cursor, last_ack=last_ack,
+            )
+            return forward
+
+    def _log_not_forward(
+        self, key: tuple[str, str, str], stored: bytes, new: bytes,
+    ) -> None:
+        """Log a write that does not move ``key``'s send record forward.
+
+        The first such write on a key logs a WARNING naming the key and
+        both values, and opens a window of ``BACKWARD_WARN_INTERVAL_S``
+        on ``self._clock``.  Inside the window each further one adds to
+        the key's count and logs at DEBUG.  The first one after the
+        window logs one WARNING with the key, the count since the last
+        WARNING (itself included) and the latest pair of values, then
+        opens a new window.  The caller holds ``self._lock``.
+        """
+        now = self._clock()
+        window = self._warn_windows.get(key)
+        if window is None:
+            self._warn_windows[key] = [now, 0]
+            logger.warning(
+                "send record (%s, %s, %s) does not move forward: stored %r, "
+                "new %r; writing it anyway (v3.70 warns only; repeats on this "
+                "key log at DEBUG for %d s, then one WARNING counts them)",
+                *key, stored, new, BACKWARD_WARN_INTERVAL_S,
+            )
+            return
+        window[1] += 1
+        if now - window[0] < BACKWARD_WARN_INTERVAL_S:
+            logger.debug(
+                "send record (%s, %s, %s) again fails to move forward: "
+                "stored %r, new %r (%d since the last warning)",
+                *key, stored, new, window[1],
+            )
+            return
+        logger.warning(
+            "send record (%s, %s, %s) does not move forward: %d %s since the "
+            "last warning, the latest stored %r, new %r; writing it anyway "
+            "(v3.70 warns only)",
+            *key, window[1], "time" if window[1] == 1 else "times", stored, new,
+        )
+        self._warn_windows[key] = [now, 0]
 
     # -- attempts (audit log) --
 
