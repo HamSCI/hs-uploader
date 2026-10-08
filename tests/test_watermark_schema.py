@@ -658,9 +658,11 @@ def test_store_constructor_leaves_user_version_alone(tmp_path):
 
 
 def test_current_store_opens_a_version_1_file(tmp_path):
-    # Rollback safety.  This commit leaves watermark/sqlite.py as v3.69
-    # shipped it, so here the store IS the v3.69 store code, and it must
-    # carry on against a file that v3.70's migrate has stamped.
+    # The store at head must carry on against a file that v3.70's migrate
+    # has stamped.  This covers the forward direction only: a later commit
+    # changed watermark/sqlite.py, so the store here no longer matches the
+    # v3.69 code.  The rollback itself, v3.69's store on a version-1 file,
+    # runs in PHASE G-bis of sigmond-appliance's test-update-v3.sh.
     db = _v0_store(tmp_path)
     schema.migrate(str(db))
     assert _version(db) == 1

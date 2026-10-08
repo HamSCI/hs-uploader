@@ -46,7 +46,7 @@ uv build
 # CLI (operator inspector — not the consumer integration path)
 hs-uploader --help
 hs-uploader migrate --check    # watermarks.db schema version; writes nothing
-hs-uploader migrate            # run pending migrations (sigmond does this on update)
+hs-uploader migrate            # run pending migrations (sigmond does this on each manifest write)
 ```
 
 Clients store rows through `hs_uploader.sink.Writer` and build
@@ -184,8 +184,11 @@ the ordered `MIGRATIONS`, and `migrate(path, *, check=False) -> MigrateReport`.
 - Only `hs-uploader migrate` migrates.  `SqliteWatermarkStore`'s
   constructor never reads or writes `user_version`, and the daemon never
   migrates while it starts (D10 in sigmond/tasks/plan-sink-control.md).
-  From v3.70, sigmond runs `hs-uploader migrate` once every component's
-  code sits in place and before it starts or restarts the daemon.
+  From v3.70, sigmond runs `hs-uploader migrate` on each manifest write
+  (`smd admin uploader manifest`, which `smd apply`, `smd align`,
+  bring-up, `smd sink …` and `smd admin manifest restore` run), after
+  the write and before it starts or restarts the daemon.  `smd update`
+  alone does not run it.
 - `migrate` runs every pending migration, in order, inside one
   `BEGIN IMMEDIATE` transaction.  It waits up to `BUSY_TIMEOUT_S` (30 s)
   for another process's write lock.  A failure rolls back every step.
