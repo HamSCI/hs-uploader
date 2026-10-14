@@ -66,6 +66,21 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_kick.set_defaults(func=_cmd_kick)
 
+    sp_purge = sub.add_parser(
+        "purge-dead-letters",
+        help="Save dead letters as SQL that restores them, then delete them.",
+    )
+    sp_purge.add_argument(
+        "--before", default=None,
+        help="Only rows older than this ISO time (rows whose time cannot be "
+             "read are kept).")
+    sp_purge.add_argument("--pipeline", default=None,
+                          help="Only this pipeline's rows.")
+    sp_purge.add_argument(
+        "--backup-dir", type=Path, default=None,
+        help="Where to write dead_letter-<UTC>.sql (default: beside the store).")
+    sp_purge.set_defaults(func=_cmd_purge_dead_letters)
+
     sp_migrate = sub.add_parser(
         "migrate",
         help="Bring watermarks.db to this release's schema version.  Run it "
@@ -120,7 +135,8 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "migrate":
         return _cmd_migrate(args)
     state_path = args.state or default_path()
-    if not state_path.exists() and args.cmd in ("reset-cursor", "kick"):
+    if not state_path.exists() and args.cmd in ("reset-cursor", "kick",
+                                                  "purge-dead-letters"):
         print(f"hs-uploader: state file not found: {state_path}", file=sys.stderr)
         return 2
     state_path.parent.mkdir(parents=True, exist_ok=True)
@@ -191,6 +207,79 @@ def _cmd_kick(args, store: SqliteWatermarkStore) -> int:
         )
         n = cur.rowcount
     print(f"kicked {n} deliverable(s) — next pump will retry them")
+    return 0
+
+
+def _sql_text(v: str) -> str:
+    return "'" + str(v).replace("'", "''") + "'"
+
+
+def _cmd_purge_dead_letters(args, store: SqliteWatermarkStore) -> int:
+    """Clear dead letters, saving them first.
+
+    A dead letter never leaves the store on its own, and the heartbeat
+    reported every one ever written: one bring-up hiccup kept a station
+    INVALID for good (2026-10-14: 390 rows on four stations, cleared by a
+    hand-typed sqlite3 line on each).  The rows go to a file of INSERTs that
+    restores them (``sqlite3 watermarks.db < file``); the DELETE runs only
+    after that file is written and synced.
+    """
+    from datetime import datetime, timezone
+
+    before = None
+    if args.before:
+        before = datetime.fromisoformat(args.before)
+        if before.tzinfo is None:
+            before = before.replace(tzinfo=timezone.utc)
+
+    with store._lock:  # noqa: SLF001
+        rows = store._conn.execute(  # noqa: SLF001
+            "SELECT rowid, ts, pipeline, payload_blob, final_error "
+            "FROM dead_letter ORDER BY rowid").fetchall()
+
+    def _matches(row) -> bool:
+        if args.pipeline is not None and row["pipeline"] != args.pipeline:
+            return False
+        if before is None:
+            return True
+        try:
+            t = datetime.fromisoformat(row["ts"])
+        except (TypeError, ValueError):
+            return False            # an unreadable age is never "old enough"
+        if t.tzinfo is None:
+            t = t.replace(tzinfo=timezone.utc)
+        return t < before
+
+    chosen = [r for r in rows if _matches(r)]
+    if not chosen:
+        print("nothing to purge")
+        return 0
+
+    out_dir = args.backup_dir or Path(store.path).parent
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+    backup = Path(out_dir) / f"dead_letter-{stamp}.sql"
+    lines = [
+        "INSERT INTO dead_letter(ts, pipeline, payload_blob, final_error) "
+        f"VALUES({_sql_text(r['ts'])}, {_sql_text(r['pipeline'])}, "
+        f"X'{bytes(r['payload_blob']).hex()}', {_sql_text(r['final_error'])});"
+        for r in chosen
+    ]
+    try:
+        with open(backup, "x", encoding="utf-8") as fh:
+            fh.write("BEGIN;\n" + "\n".join(lines) + "\nCOMMIT;\n")
+            fh.flush()
+            import os
+            os.fsync(fh.fileno())
+    except OSError as exc:
+        print(f"hs-uploader: cannot write {backup}: {exc} — nothing deleted",
+              file=sys.stderr)
+        return 1
+
+    with store._lock, store._conn:  # noqa: SLF001
+        store._conn.executemany(  # noqa: SLF001
+            "DELETE FROM dead_letter WHERE rowid = ?",
+            [(r["rowid"],) for r in chosen])
+    print(f"purged {len(chosen)} dead letter(s); saved to {backup}")
     return 0
 
 

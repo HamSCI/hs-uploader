@@ -236,3 +236,96 @@ def test_cli_missing_db_exits_zero_readable_false(tmp_path):
     payload = json.loads(proc.stdout)
     assert payload["readable"] is False
     assert "reason" in payload
+
+
+# ── dead-letter age (sigmond v3.72 #1) ───────────────────────────────────
+# A dead letter never leaves the store on its own, so a bare count kept a
+# station INVALID for good after one bring-up hiccup (K3LR: 376 rows from
+# 09-30..10-08 still condemning it on 10-14), and that verdict hid a real
+# fault behind it (B4's RX888 off the bus for 10 h on 10-14).  summarize()
+# therefore says how many are RECENT and when the newest arrived, so the
+# consumer can tell a live fault from history.
+
+from datetime import datetime, timedelta, timezone
+
+NOW = datetime(2026, 10, 14, 12, 0, tzinfo=timezone.utc)
+
+
+def _seed_dead(path: Path, *stamps: str, pipeline: str = "heartbeat") -> None:
+    store = SqliteWatermarkStore(path)
+    try:
+        for ts in stamps:
+            store.send_to_dead_letter(ts=ts, pipeline=pipeline,
+                                      payload_blob=b"x", final_error="denied")
+    finally:
+        store.close()
+
+
+def _iso(dt: datetime) -> str:
+    return dt.isoformat()
+
+
+def _pipe(result: dict, name: str = "heartbeat") -> dict:
+    return {p["name"]: p for p in result["pipelines"]}[name]
+
+
+def test_old_dead_letters_are_not_recent(tmp_path):
+    db = tmp_path / "wm.db"
+    old = _iso(NOW - timedelta(days=3))
+    _seed_dead(db, old)
+
+    p = _pipe(summarize(db, now=NOW))
+
+    assert p["dead_letter_count"] == 1
+    assert p["dead_letter_recent_count"] == 0
+    assert p["dead_letter_newest"] == old
+
+
+def test_dead_letter_inside_the_window_is_recent(tmp_path):
+    db = tmp_path / "wm.db"
+    _seed_dead(db, _iso(NOW - timedelta(hours=1)))
+
+    assert _pipe(summarize(db, now=NOW))["dead_letter_recent_count"] == 1
+
+
+def test_window_edge_is_twenty_four_hours(tmp_path):
+    db = tmp_path / "wm.db"
+    _seed_dead(db, _iso(NOW - timedelta(hours=23, minutes=59)),
+               _iso(NOW - timedelta(hours=24, minutes=1)))
+
+    p = _pipe(summarize(db, now=NOW))
+
+    assert p["dead_letter_count"] == 2
+    assert p["dead_letter_recent_count"] == 1
+
+
+def test_mixed_ages_report_the_newest(tmp_path):
+    db = tmp_path / "wm.db"
+    newest = _iso(NOW - timedelta(minutes=5))
+    _seed_dead(db, _iso(NOW - timedelta(days=9)), newest,
+               _iso(NOW - timedelta(days=2)))
+
+    p = _pipe(summarize(db, now=NOW))
+
+    assert p["dead_letter_count"] == 3
+    assert p["dead_letter_recent_count"] == 1
+    assert p["dead_letter_newest"] == newest
+
+
+def test_unparseable_stamp_counts_as_recent(tmp_path):
+    # Never greener than the truth: a row whose age we cannot read is
+    # treated as a live fault, not as history.
+    db = tmp_path / "wm.db"
+    _seed_dead(db, "not-a-time")
+
+    assert _pipe(summarize(db, now=NOW))["dead_letter_recent_count"] == 1
+
+
+def test_pipeline_without_dead_letters_reports_zero_recent(tmp_path):
+    db = tmp_path / "wm.db"
+    _seed_populated(db)
+
+    p = _pipe(summarize(db, now=NOW), "wsprnet")
+
+    assert p["dead_letter_recent_count"] == 0
+    assert p["dead_letter_newest"] is None

@@ -105,3 +105,138 @@ def test_status_on_missing_state_errors_for_mutating_cmds(tmp_path, capsys):
         "--source", "x", "--dest", "y", "--table", "z",
     ])
     assert rc == 2
+
+
+# ── purge-dead-letters (sigmond v3.72 #1) ────────────────────────────────
+# A dead letter never leaves the store on its own.  Clearing them used to be
+# a hand-typed sqlite3 one-liner per station (2026-10-14: 390 rows on four
+# stations).  The command saves the rows as SQL that restores them, and
+# deletes only after that file is safely written.
+
+import os
+import sqlite3
+
+
+def _seed_dead(path: Path, rows) -> None:
+    store = SqliteWatermarkStore(path)
+    try:
+        for ts, pipeline in rows:
+            store.send_to_dead_letter(ts=ts, pipeline=pipeline,
+                                      payload_blob=b"it's\x00binary",
+                                      final_error="can't log in: Permission denied (publickey)")
+    finally:
+        store.close()
+
+
+def _dead(path: Path):
+    with sqlite3.connect(path) as c:
+        return sorted(c.execute("SELECT ts, pipeline FROM dead_letter"))
+
+
+def _backups(d: Path):
+    return sorted(d.glob("dead_letter-*.sql"))
+
+
+OLD = ("2026-10-01T00:00:00+00:00", "heartbeat")
+NEW = ("2026-10-14T11:00:00+00:00", "heartbeat")
+OTHER = ("2026-10-02T00:00:00+00:00", "wsprnet")
+
+
+def test_purge_removes_all_and_saves_them(tmp_path, capsys):
+    db = tmp_path / "wm.db"
+    _seed_dead(db, [OLD, NEW, OTHER])
+
+    rc = main(["--state", str(db), "purge-dead-letters"])
+
+    assert rc == 0
+    assert _dead(db) == []
+    [backup] = _backups(tmp_path)
+    out = capsys.readouterr().out
+    assert "3 dead letter(s)" in out and backup.name in out
+
+
+def test_purge_backup_restores_the_rows_byte_for_byte(tmp_path):
+    db = tmp_path / "wm.db"
+    _seed_dead(db, [OLD, OTHER])
+    main(["--state", str(db), "purge-dead-letters"])
+    [backup] = _backups(tmp_path)
+
+    fresh = tmp_path / "fresh.db"
+    SqliteWatermarkStore(fresh).close()
+    with sqlite3.connect(fresh) as c:
+        c.executescript(backup.read_text())
+        rows = sorted(c.execute(
+            "SELECT ts, pipeline, payload_blob, final_error FROM dead_letter"))
+
+    assert [(r[0], r[1]) for r in rows] == sorted([OLD, OTHER])
+    assert all(r[2] == b"it's\x00binary" for r in rows)
+    assert all(r[3] == "can't log in: Permission denied (publickey)" for r in rows)
+
+
+def test_purge_before_keeps_newer_rows(tmp_path):
+    db = tmp_path / "wm.db"
+    _seed_dead(db, [OLD, NEW])
+
+    main(["--state", str(db), "purge-dead-letters",
+          "--before", "2026-10-10T00:00:00+00:00"])
+
+    assert _dead(db) == [NEW]
+
+
+def test_purge_pipeline_keeps_other_pipelines(tmp_path):
+    db = tmp_path / "wm.db"
+    _seed_dead(db, [OLD, OTHER])
+
+    main(["--state", str(db), "purge-dead-letters", "--pipeline", "heartbeat"])
+
+    assert _dead(db) == [OTHER]
+
+
+def test_purge_nothing_matching_writes_no_file(tmp_path, capsys):
+    db = tmp_path / "wm.db"
+    _seed_dead(db, [NEW])
+
+    rc = main(["--state", str(db), "purge-dead-letters", "--pipeline", "nope"])
+
+    assert rc == 0
+    assert _backups(tmp_path) == []
+    assert _dead(db) == [NEW]
+    assert "nothing to purge" in capsys.readouterr().out
+
+
+def test_purge_deletes_nothing_when_the_backup_cannot_be_written(tmp_path):
+    if os.geteuid() == 0:
+        import pytest
+        pytest.skip("root ignores directory permissions")
+    # The store stays writable; only the backup's directory refuses.  A
+    # read-only store directory would also block sqlite's journal, so the
+    # delete would fail by itself and the test would prove nothing.
+    db = tmp_path / "wm.db"
+    _seed_dead(db, [OLD])
+    locked = tmp_path / "locked"
+    locked.mkdir()
+    os.chmod(locked, 0o555)
+    try:
+        rc = main(["--state", str(db), "purge-dead-letters",
+                   "--backup-dir", str(locked)])
+    finally:
+        os.chmod(locked, 0o755)
+
+    assert rc != 0
+    assert _dead(db) == [OLD]
+
+
+def test_purge_on_missing_state_errors(tmp_path, capsys):
+    rc = main(["--state", str(tmp_path / "nope.db"), "purge-dead-letters"])
+    assert rc == 2
+    assert not (tmp_path / "nope.db").exists()
+
+
+def test_purge_before_keeps_rows_whose_time_cannot_be_read(tmp_path):
+    db = tmp_path / "wm.db"
+    _seed_dead(db, [OLD, ("not-a-time", "heartbeat")])
+
+    main(["--state", str(db), "purge-dead-letters",
+          "--before", "2026-10-10T00:00:00+00:00"])
+
+    assert _dead(db) == [("not-a-time", "heartbeat")]
