@@ -33,12 +33,12 @@ SRC = str(REPO_ROOT / "src")
 def _seed_populated(path: Path) -> None:
     store = SqliteWatermarkStore(path)
     try:
-        store.advance_cursor(
+        store._write_cursor(
             "ch:wspr.spots", "wsprnet", "wspr.spots",
             cursor=b'{"time":"2026-05-08","tiebreak":"42"}',
             last_ack="2026-05-08T12:00:00+00:00",
         )
-        store.advance_cursor(
+        store._write_cursor(
             "ch:psk.spots", "pskreporter", "psk.spots",
             cursor=b"cursor-bytes",
             last_ack="2026-05-09T00:00:00+00:00",

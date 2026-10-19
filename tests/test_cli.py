@@ -14,7 +14,7 @@ from hs_uploader.watermark import SqliteWatermarkStore
 
 def _seed_store(path: Path) -> SqliteWatermarkStore:
     store = SqliteWatermarkStore(path)
-    store.advance_cursor(
+    store._write_cursor(
         "ch:wspr.spots", "wsprnet", "wspr.spots",
         cursor=b'{"time":"2026-05-08","tiebreak":"42"}',
         last_ack="2026-05-08T12:00:00+00:00",

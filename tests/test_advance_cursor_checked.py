@@ -1,12 +1,19 @@
-"""The warn-only forward check on send records (sigmond plan-sink-control §10.4 item 4).
+"""Send records move forward only, enforced (sigmond spec-key-split-v373 §4.6).
 
-advance_cursor_checked asks the source whether a write moves the send record
-forward.  When it does not, the store logs the key and both values, then
-writes exactly as advance_cursor does.  The first such write on a key logs a
-WARNING; for the next hour further ones log at DEBUG and add to a count; the
-first one after the hour logs one WARNING with that count.  v3.70 changes
-nothing the station sends; the warnings measure how often a shared key runs
-backward before v3.71 enforces the rule.
+advance_cursor reads the stored send record, asks the source's own order
+``is_after(new, stored)``, and then, all inside one BEGIN IMMEDIATE
+transaction:
+
+| Comparison          | Action                   | Log                           | Returns           |
+|---------------------|--------------------------|-------------------------------|-------------------|
+| new after stored    | write                    | none                          | WRITTEN           |
+| new equal to stored | refresh last_ack only    | none                          | REFRESHED         |
+| new before stored   | refuse                   | WARNING, both values          | REFUSED           |
+| comparison raises   | write                    | WARNING, both values, error   | WRITTEN_UNCHECKED |
+
+A refused write logs one WARNING per key per hour; further ones inside the
+hour log at DEBUG and add to a count; the first one after the hour logs one
+WARNING with that count.  Core logs a refused advance as "acked, record held".
 """
 from __future__ import annotations
 
@@ -15,6 +22,7 @@ import json
 import logging
 import os
 import sqlite3
+import threading
 import time
 
 import pytest
@@ -23,29 +31,32 @@ from hs_uploader import Outcome, Pipeline, RetryPolicy, Uploader
 from hs_uploader.core import _is_after_for
 from hs_uploader.sources import FileSpec, FileTreeSource
 from hs_uploader.sources.wspr_cycle import WsprCycleSource
-from hs_uploader.watermark import SqliteWatermarkStore
+from hs_uploader.watermark import Advance, SqliteWatermarkStore
 from hs_uploader.watermark.sqlite import BACKWARD_WARN_INTERVAL_S
 from tests.conftest import MemorySource
 from tests.test_core_orchestration import _ident, _records
 from tests.test_sqlite_source import _insert, _seed_table, _src
 
 _STORE_LOG = "hs_uploader.watermark.sqlite"
+_CORE_LOG = "hs_uploader.core"
 _KEY = ("memory:test", "memory", "test.spots")
-_PSK = ("sqlite:psk.spots", "pskreporter", "psk.spots")
+_PSK = ("sqlite:psk.spots@psk-recorder", "pskreporter", "psk.spots")
 
 
 def _int_order(new: bytes, stored: bytes) -> bool:
     return not stored or int(new) > int(stored)
 
 
-def _last_ack(store: SqliteWatermarkStore) -> str:
-    (row,) = store.all_cursors()
-    return row["last_ack"]
+def _last_ack(store: SqliteWatermarkStore, key=_KEY) -> str:
+    for row in store.all_cursors():
+        if (row["source_id"], row["dest_id"], row["table_name"]) == tuple(key):
+            return row["last_ack"]
+    raise AssertionError(f"no send record for {key}")
 
 
-def _warnings(caplog) -> list[logging.LogRecord]:
+def _warnings(caplog, name=_STORE_LOG) -> list[logging.LogRecord]:
     return [r for r in caplog.records
-            if r.name == _STORE_LOG and r.levelno == logging.WARNING]
+            if r.name == name and r.levelno == logging.WARNING]
 
 
 def _debugs(caplog) -> list[logging.LogRecord]:
@@ -63,108 +74,189 @@ class _Clock:
         return self.t
 
 
-def _write(store: SqliteWatermarkStore, key, cursor: bytes, last_ack: str) -> bool:
-    return store.advance_cursor_checked(*key, cursor=cursor, last_ack=last_ack,
-                                        is_after=_int_order)
+def _write(store: SqliteWatermarkStore, key, cursor: bytes, last_ack: str) -> Advance:
+    return store.advance_cursor(*key, cursor=cursor, last_ack=last_ack,
+                                is_after=_int_order)
 
 
-# ---- the store ---------------------------------------------------------------
+# ---- the interface ------------------------------------------------------------
 
 
-def test_a_forward_write_returns_true_and_stays_quiet(tmp_path, caplog):
+def test_advance_names_the_four_outcomes():
+    assert [a.name for a in Advance] == [
+        "WRITTEN", "REFRESHED", "REFUSED", "WRITTEN_UNCHECKED"]
+
+
+def test_the_unchecked_write_left_the_public_interface():
+    assert not hasattr(SqliteWatermarkStore, "advance_cursor_checked")
+    params = inspect.signature(SqliteWatermarkStore.advance_cursor).parameters
+    assert params["is_after"].default is inspect.Parameter.empty
+    assert callable(getattr(SqliteWatermarkStore, "_write_cursor"))
+
+
+# ---- one test per row of §4.6 ---------------------------------------------------
+
+
+def test_after_writes_and_stays_quiet(tmp_path, caplog):
     store = SqliteWatermarkStore(tmp_path / "wm.db")
-    store.advance_cursor("s", "d", "t", cursor=b"999", last_ack="t1")
+    store._write_cursor(*_KEY, cursor=b"999", last_ack="t1")
+    with caplog.at_level(logging.DEBUG, logger=_STORE_LOG):
+        assert _write(store, _KEY, b"1000", "t2") is Advance.WRITTEN
+    assert store.get_cursor(*_KEY) == b"1000"
+    assert _last_ack(store) == "t2"
+    assert [r for r in caplog.records if r.name == _STORE_LOG] == []
+
+
+def test_equal_refreshes_last_ack_only_and_stays_quiet(tmp_path, caplog):
+    store = SqliteWatermarkStore(tmp_path / "wm.db")
+    store._write_cursor(*_KEY, cursor=b"42", last_ack="t1")
+    with caplog.at_level(logging.DEBUG, logger=_STORE_LOG):
+        assert _write(store, _KEY, b"42", "t2") is Advance.REFRESHED
+    assert store.get_cursor(*_KEY) == b"42"
+    assert _last_ack(store) == "t2"
+    assert [r for r in caplog.records if r.name == _STORE_LOG] == []
+
+
+def test_equal_in_the_sources_order_keeps_the_stored_bytes(tmp_path, caplog):
+    # b"042" and b"42" differ as bytes and tie as integers: the source's
+    # order calls them equal, so only last_ack moves.
+    store = SqliteWatermarkStore(tmp_path / "wm.db")
+    store._write_cursor(*_KEY, cursor=b"042", last_ack="t1")
     with caplog.at_level(logging.WARNING, logger=_STORE_LOG):
-        assert store.advance_cursor_checked(
-            "s", "d", "t", cursor=b"1000", last_ack="t2", is_after=_int_order,
-        ) is True
-    assert store.get_cursor("s", "d", "t") == b"1000"
+        assert _write(store, _KEY, b"42", "t2") is Advance.REFRESHED
+    assert store.get_cursor(*_KEY) == b"042"
     assert _last_ack(store) == "t2"
     assert _warnings(caplog) == []
 
 
-def test_a_backward_write_warns_with_key_and_both_values_and_still_writes(tmp_path, caplog):
+def test_before_refuses_changes_nothing_and_warns_once(tmp_path, caplog):
     store = SqliteWatermarkStore(tmp_path / "wm.db")
-    store.advance_cursor("sqlite:psk.spots", "pskreporter", "psk.spots",
-                         cursor=b"1000", last_ack="t1")
+    store._write_cursor(*_PSK, cursor=b"1000", last_ack="t1")
     with caplog.at_level(logging.WARNING, logger=_STORE_LOG):
-        assert store.advance_cursor_checked(
-            "sqlite:psk.spots", "pskreporter", "psk.spots",
-            cursor=b"999", last_ack="t2", is_after=_int_order,
-        ) is False
-    # v3.70 warns only: the write happens exactly as advance_cursor makes it.
-    assert store.get_cursor("sqlite:psk.spots", "pskreporter", "psk.spots") == b"999"
-    assert _last_ack(store) == "t2"
+        assert _write(store, _PSK, b"999", "t2") is Advance.REFUSED
+    assert store.get_cursor(*_PSK) == b"1000"
+    assert _last_ack(store, _PSK) == "t1"
     (rec,) = _warnings(caplog)
     msg = rec.getMessage()
-    for part in ("sqlite:psk.spots", "pskreporter", "psk.spots", "b'1000'", "b'999'"):
+    for part in (*_PSK, "b'1000'", "b'999'", "refused"):
         assert part in msg, (part, msg)
 
 
-def test_a_write_that_stands_still_warns_too(tmp_path, caplog):
+def test_a_comparator_that_raises_writes_unchecked_and_warns(tmp_path, caplog):
     store = SqliteWatermarkStore(tmp_path / "wm.db")
-    store.advance_cursor("s", "d", "t", cursor=b"42", last_ack="t1")
-    with caplog.at_level(logging.WARNING, logger=_STORE_LOG):
-        assert store.advance_cursor_checked(
-            "s", "d", "t", cursor=b"42", last_ack="t2", is_after=_int_order,
-        ) is False
-    assert len(_warnings(caplog)) == 1
-    assert _last_ack(store) == "t2"
-
-
-def test_the_first_write_hands_the_comparator_an_empty_stored_value(tmp_path):
-    store = SqliteWatermarkStore(tmp_path / "wm.db")
-    seen: list[tuple[bytes, bytes]] = []
-
-    def spy(new: bytes, stored: bytes) -> bool:
-        seen.append((new, stored))
-        return True
-
-    assert store.advance_cursor_checked(
-        "s", "d", "t", cursor=b"7", last_ack="t1", is_after=spy,
-    ) is True
-    assert seen == [(b"7", b"")]
-    assert store.get_cursor("s", "d", "t") == b"7"
-
-
-def test_a_comparator_that_raises_never_blocks_the_write(tmp_path, caplog):
-    store = SqliteWatermarkStore(tmp_path / "wm.db")
-    store.advance_cursor("s", "d", "t", cursor=b"1", last_ack="t1")
+    store._write_cursor(*_KEY, cursor=b"1", last_ack="t1")
 
     def broken(new: bytes, stored: bytes) -> bool:
         raise RuntimeError("comparator bug")
 
     with caplog.at_level(logging.WARNING, logger=_STORE_LOG):
-        assert store.advance_cursor_checked(
-            "s", "d", "t", cursor=b"2", last_ack="t2", is_after=broken,
-        ) is True
-    assert store.get_cursor("s", "d", "t") == b"2"
-    assert any("comparator bug" in r.getMessage() for r in _warnings(caplog))
+        assert store.advance_cursor(
+            *_KEY, cursor=b"2", last_ack="t2", is_after=broken,
+        ) is Advance.WRITTEN_UNCHECKED
+    assert store.get_cursor(*_KEY) == b"2"
+    assert _last_ack(store) == "t2"
+    (rec,) = _warnings(caplog)
+    msg = rec.getMessage()
+    for part in ("comparator bug", "RuntimeError", "b'1'", "b'2'"):
+        assert part in msg, (part, msg)
 
 
-# ---- one WARNING per key per hour --------------------------------------------
+def test_the_first_write_on_a_key_needs_no_comparison(tmp_path):
+    store = SqliteWatermarkStore(tmp_path / "wm.db")
+
+    def never(new: bytes, stored: bytes) -> bool:
+        raise AssertionError("nothing stored, nothing to compare")
+
+    assert store.advance_cursor(
+        *_KEY, cursor=b"7", last_ack="t1", is_after=never,
+    ) is Advance.WRITTEN
+    assert store.get_cursor(*_KEY) == b"7"
 
 
-def test_a_repeat_within_the_hour_logs_at_debug_and_still_writes(tmp_path, caplog):
+def test_reset_cursor_still_rewinds_unchecked(tmp_path):
+    store = SqliteWatermarkStore(tmp_path / "wm.db")
+    _write(store, _KEY, b"1000", "t1")
+    assert store.reset_cursor(*_KEY) is True
+    assert _write(store, _KEY, b"5", "t2") is Advance.WRITTEN
+    assert store.get_cursor(*_KEY) == b"5"
+
+
+# ---- two processes racing one key ------------------------------------------------
+
+
+def test_two_connections_race(tmp_path):
+    """Two store objects on one file stand in for two processes.
+
+    A's comparator runs while B, on its own connection, advances the same
+    key further.  With the read, the comparison and the write in one
+    BEGIN IMMEDIATE transaction, B waits for A and then compares against
+    A's write, so the record ends at B's value.  A read-then-write would let
+    B write 20 inside A's comparison and A overwrite it with 10.
+    """
+    path = tmp_path / "wm.db"
+    a = SqliteWatermarkStore(path)
+    b = SqliteWatermarkStore(path)
+    a._write_cursor(*_KEY, cursor=b"5", last_ack="t0")
+
+    b_started = threading.Event()
+    results: dict[str, Advance] = {}
+
+    def b_writes() -> None:
+        b_started.set()
+        results["b"] = _write(b, _KEY, b"20", "tb")
+
+    def slow_order(new: bytes, stored: bytes) -> bool:
+        if "thread" not in results:
+            results["thread"] = threading.Thread(target=b_writes)
+            results["thread"].start()
+            b_started.wait(5.0)
+            time.sleep(0.3)          # B attempts its write in here
+        return _int_order(new, stored)
+
+    results["a"] = a.advance_cursor(*_KEY, cursor=b"10", last_ack="ta",
+                                    is_after=slow_order)
+    results["thread"].join(10.0)
+    assert results["a"] is Advance.WRITTEN
+    assert results["b"] is Advance.WRITTEN
+    assert a.get_cursor(*_KEY) == b"20"
+    assert b.get_cursor(*_KEY) == b"20"
+
+
+def test_interleaved_writers_never_move_the_record_back(tmp_path):
+    path = tmp_path / "wm.db"
+    a = SqliteWatermarkStore(path)
+    b = SqliteWatermarkStore(path)
+    seen = []
+    for i, (store, cursor) in enumerate(
+            [(a, b"3"), (b, b"7"), (a, b"5"), (b, b"6"), (a, b"9"), (b, b"8")]):
+        _write(store, _KEY, cursor, f"t{i}")
+        seen.append(int(a.get_cursor(*_KEY)))
+    assert seen == [3, 7, 7, 7, 9, 9]
+
+
+# ---- one WARNING per key per hour ----------------------------------------------
+
+
+def test_a_repeat_within_the_hour_logs_at_debug_and_still_refuses(tmp_path, caplog):
     clock = _Clock()
     store = SqliteWatermarkStore(tmp_path / "wm.db", clock=clock)
-    store.advance_cursor(*_KEY, cursor=b"1000", last_ack="t0")
+    store._write_cursor(*_KEY, cursor=b"1000", last_ack="t0")
     with caplog.at_level(logging.DEBUG, logger=_STORE_LOG):
-        assert _write(store, _KEY, b"999", "t1") is False     # the first: warns
+        assert _write(store, _KEY, b"999", "t1") is Advance.REFUSED   # warns
         clock.t += 3599.0
-        assert _write(store, _KEY, b"998", "t2") is False     # inside the hour
+        assert _write(store, _KEY, b"998", "t2") is Advance.REFUSED   # inside the hour
     assert len(_warnings(caplog)) == 1
     (debug,) = _debugs(caplog)
-    assert "stored b'999', new b'998'" in debug.getMessage()
+    assert "stored b'1000', new b'998'" in debug.getMessage()
     assert "(1 since the last warning)" in debug.getMessage()
-    assert store.get_cursor(*_KEY) == b"998"
-    assert _last_ack(store) == "t2"
+    assert store.get_cursor(*_KEY) == b"1000"
+    assert _last_ack(store) == "t0"
 
 
-def test_after_the_hour_one_warning_counts_the_writes_since_the_last(tmp_path, caplog):
+def test_after_the_hour_one_warning_counts_the_refusals_since_the_last(tmp_path, caplog):
     clock = _Clock()
     store = SqliteWatermarkStore(tmp_path / "wm.db", clock=clock)
-    store.advance_cursor(*_KEY, cursor=b"1000", last_ack="t0")
+    store._write_cursor(*_KEY, cursor=b"1000", last_ack="t0")
     with caplog.at_level(logging.WARNING, logger=_STORE_LOG):
         _write(store, _KEY, b"999", "t1")          # the first: warns at t = 1000
         for cursor in (b"998", b"997", b"996"):    # three more, at DEBUG
@@ -179,9 +271,9 @@ def test_after_the_hour_one_warning_counts_the_writes_since_the_last(tmp_path, c
     msg = summary.getMessage()
     assert msg.startswith("send record (%s, %s, %s) " % _KEY)
     assert "does not move forward: 4 times since the last warning" in msg
-    assert "the latest stored b'996', new b'990'" in msg
-    assert store.get_cursor(*_KEY) == b"989"
-    assert _last_ack(store) == "t4"
+    assert "the latest stored b'1000', new b'990'" in msg
+    assert store.get_cursor(*_KEY) == b"1000"
+    assert _last_ack(store) == "t0"
 
 
 @pytest.mark.parametrize("other", [
@@ -193,7 +285,7 @@ def test_each_key_keeps_its_own_window(tmp_path, caplog, other):
     clock = _Clock()
     store = SqliteWatermarkStore(tmp_path / "wm.db", clock=clock)
     for key in (_PSK, other):
-        store.advance_cursor(*key, cursor=b"100", last_ack="t0")
+        store._write_cursor(*key, cursor=b"100", last_ack="t0")
     with caplog.at_level(logging.WARNING, logger=_STORE_LOG):
         _write(store, _PSK, b"99", "t1")      # _PSK's first: warns
         clock.t += 1800.0
@@ -208,21 +300,21 @@ def test_each_key_keeps_its_own_window(tmp_path, caplog, other):
     assert warned[1].startswith("send record (%s, %s, %s) " % other)
     assert warned[2].startswith("send record (%s, %s, %s) " % _PSK)
     assert "2 times since the last warning" in warned[2]
-    assert store.get_cursor(*_PSK) == b"97"
-    assert store.get_cursor(*other) == b"98"
+    assert store.get_cursor(*_PSK) == b"100"
+    assert store.get_cursor(*other) == b"100"
 
 
-def test_every_write_goes_ahead_whatever_it_logs(tmp_path, caplog):
+def test_every_backward_write_is_refused_whatever_it_logs(tmp_path, caplog):
     clock = _Clock()
     store = SqliteWatermarkStore(tmp_path / "wm.db", clock=clock)
-    store.advance_cursor(*_KEY, cursor=b"100", last_ack="t0")
+    store._write_cursor(*_KEY, cursor=b"100", last_ack="t0")
     steps = [(0.0, b"99"), (10.0, b"98"), (3600.0, b"97"), (5.0, b"96"), (7200.0, b"95")]
     with caplog.at_level(logging.DEBUG, logger=_STORE_LOG):
         for i, (step, cursor) in enumerate(steps, start=1):
             clock.t += step
-            assert _write(store, _KEY, cursor, f"t{i}") is False
-            assert store.get_cursor(*_KEY) == cursor
-            assert _last_ack(store) == f"t{i}"
+            assert _write(store, _KEY, cursor, f"t{i}") is Advance.REFUSED
+            assert store.get_cursor(*_KEY) == b"100"
+            assert _last_ack(store) == "t0"
     levels = [r.levelname for r in caplog.records if r.name == _STORE_LOG]
     assert levels == ["WARNING", "DEBUG", "WARNING", "DEBUG", "WARNING"]
 
@@ -231,28 +323,31 @@ def test_every_write_goes_ahead_whatever_it_logs(tmp_path, caplog):
 
 
 class _SpyStore(SqliteWatermarkStore):
-    """Counts checked advances, and bare advance_cursor calls made from outside one."""
+    """Counts checked advances, and unchecked writes made from outside one."""
 
     def __init__(self, path):
         super().__init__(path)
         self.checked: list[tuple] = []
+        self.results: list[Advance] = []
         self.bare = 0
         self._in_checked = False
 
-    def advance_cursor(self, *a, **kw):
+    def _write_cursor(self, *a, **kw):
         if not self._in_checked:
             self.bare += 1
-        return super().advance_cursor(*a, **kw)
+        return super()._write_cursor(*a, **kw)
 
-    def advance_cursor_checked(self, source_id, dest_id, table, *, cursor,
-                               last_ack, is_after):
+    def advance_cursor(self, source_id, dest_id, table, *, cursor,
+                       last_ack, is_after):
         self.checked.append((source_id, dest_id, table, cursor, is_after))
         self._in_checked = True
         try:
-            return super().advance_cursor_checked(
+            got = super().advance_cursor(
                 source_id, dest_id, table, cursor=cursor, last_ack=last_ack,
                 is_after=is_after,
             )
+            self.results.append(got)
+            return got
         finally:
             self._in_checked = False
 
@@ -277,6 +372,7 @@ def test_a_first_attempt_ack_uses_the_checked_call(tmp_path, memory_transport):
     assert wm.bare == 0
     assert [c[:4] for c in wm.checked] == [(*_KEY, b"3")]
     assert wm.checked[0][4] == src.cursor_is_after
+    assert wm.results == [Advance.WRITTEN]
     assert wm.get_cursor(*_KEY) == b"3"
 
 
@@ -320,22 +416,93 @@ def test_a_source_without_the_method_gets_always_forward(tmp_path, memory_transp
     assert _warnings(caplog) == []
 
 
-def test_core_warns_on_a_backward_ack_and_still_writes(tmp_path, memory_transport, caplog):
+def test_core_logs_acked_record_held(tmp_path, memory_transport, caplog):
     # The stored record reads b"10".  MemorySource filters with a byte compare,
-    # so it yields b"2" and b"3", and the ack moves the record from 10 to 3.
+    # so it yields b"2" and b"3"; the ack would move the record from 10 to 3.
     src = _IntOrderSource(records=_records(3))
     pipe, wm = _pipe(tmp_path, memory_transport, src)
-    wm.advance_cursor(*_KEY, cursor=b"10", last_ack="t0")
+    wm._write_cursor(*_KEY, cursor=b"10", last_ack="t0")
     wm.bare = 0
-    with caplog.at_level(logging.WARNING, logger=_STORE_LOG):
+    with caplog.at_level(logging.INFO):
         Uploader([pipe]).pump()
     assert wm.bare == 0
-    assert wm.get_cursor(*_KEY) == b"3"
-    (rec,) = _warnings(caplog)
+    assert wm.results == [Advance.REFUSED]
+    assert wm.get_cursor(*_KEY) == b"10"
+    (rec,) = _warnings(caplog)             # the store's WARNING, both values
     assert "b'10'" in rec.getMessage() and "b'3'" in rec.getMessage()
+    held = [r.getMessage() for r in caplog.records
+            if r.name == _CORE_LOG and "acked, record held" in r.getMessage()]
+    assert len(held) == 1, held
+    assert "test" in held[0] and "b'3'" in held[0]
+    # The destination took the batch, so the attempt still records an ack.
+    (attempt,) = wm.recent_attempts(limit=1)
+    assert attempt["outcome"] == "acked"
 
 
-# ---- the check never decides whether the write happens ----------------------
+def test_core_logs_a_refused_replay_ack_as_record_held(tmp_path, memory_transport, caplog):
+    src = _IntOrderSource(records=_records(2))
+    pipe, wm = _pipe(tmp_path, memory_transport, src,
+                     retry=RetryPolicy(base=1.0, cap_sec=1.0, max_attempts=5))
+    memory_transport.next_outcomes = [Outcome.retry_later("blip")]
+    Uploader([pipe]).pump()
+    wm._write_cursor(*_KEY, cursor=b"50", last_ack="t0")   # another writer went on
+
+    far = time.time() + 86_400.0
+    memory_transport.next_outcomes = [Outcome.acked()]
+    with caplog.at_level(logging.INFO, logger=_CORE_LOG):
+        Uploader([pipe], now_fn=lambda: far).pump()
+    assert wm.results == [Advance.REFUSED]
+    assert wm.get_cursor(*_KEY) == b"50"
+    assert any("acked, record held" in r.getMessage()
+               for r in caplog.records if r.name == _CORE_LOG)
+
+
+def test_a_written_advance_never_says_record_held(tmp_path, memory_transport, caplog):
+    src = _IntOrderSource(records=_records(3))
+    pipe, wm = _pipe(tmp_path, memory_transport, src)
+    with caplog.at_level(logging.DEBUG, logger=_CORE_LOG):
+        Uploader([pipe]).pump()
+    assert not any("record held" in r.getMessage() for r in caplog.records)
+
+
+# ---- the GRAPE spool: kept files are checked too (review N1) --------------------
+
+
+def _spool(tmp_path, retention):
+    spool = tmp_path / "spool"
+    spool.mkdir()
+    return FileTreeSource(spool, specs=[FileSpec("*")], retention=retention)
+
+
+def test_filetree_keep_spool_is_checked(tmp_path, caplog):
+    src = _spool(tmp_path, FileTreeSource.KEEP)
+    key = (src.source_id(), "psws", "grape.files")
+    store = SqliteWatermarkStore(tmp_path / "wm.db")
+    later = b"1781583005000000000"
+    earlier = b"1781583001000000000"
+    store._write_cursor(*key, cursor=later, last_ack="t0")
+    with caplog.at_level(logging.WARNING, logger=_STORE_LOG):
+        got = store.advance_cursor(*key, cursor=earlier, last_ack="t1",
+                                   is_after=_is_after_for(src))
+    assert got is Advance.REFUSED
+    assert store.get_cursor(*key) == later
+    assert len(_warnings(caplog)) == 1
+    # A legacy float-seconds record compares by the same clock.
+    assert store.advance_cursor(*key, cursor=b"1781583010.5", last_ack="t2",
+                                is_after=_is_after_for(src)) is Advance.WRITTEN
+
+
+def test_a_delete_on_ack_spool_answers_after_always(tmp_path):
+    src = _spool(tmp_path, FileTreeSource.DELETE_ON_ACK)
+    key = (src.source_id(), "psws", "grape.files")
+    store = SqliteWatermarkStore(tmp_path / "wm.db")
+    store._write_cursor(*key, cursor=b"<delete-on-ack>", last_ack="t0")
+    assert store.advance_cursor(*key, cursor=b"<delete-on-ack>", last_ack="t1",
+                                is_after=_is_after_for(src)) is Advance.WRITTEN
+    assert _last_ack(store, key) == "t1"
+
+
+# ---- the check's own failures -----------------------------------------------------
 
 
 def _edit_cursor_as_text(path, key, value: str) -> None:
@@ -362,18 +529,16 @@ def _cursor_type(path, key) -> str:
         conn.close()
 
 
-def test_a_text_typed_stored_cursor_does_not_block_the_write(tmp_path, caplog):
+def test_a_text_typed_stored_cursor_writes_unchecked(tmp_path, caplog):
     path = tmp_path / "wm.db"
     store = SqliteWatermarkStore(path)
-    store.advance_cursor(*_KEY, cursor=b"5", last_ack="t0")
+    store._write_cursor(*_KEY, cursor=b"5", last_ack="t0")
     _edit_cursor_as_text(path, _KEY, "5")
     assert _cursor_type(path, _KEY) == "text"      # the premise of this test
 
     with caplog.at_level(logging.DEBUG, logger=_STORE_LOG):
-        # The read raises, so the check cannot run: it counts as forward.
-        assert _write(store, _KEY, b"6", "t1") is True
+        assert _write(store, _KEY, b"6", "t1") is Advance.WRITTEN_UNCHECKED
 
-    # advance_cursor made the write, as it would have without the check.
     assert store.get_cursor(*_KEY) == b"6"
     assert _last_ack(store) == "t1"
     assert _cursor_type(path, _KEY) == "blob"
@@ -381,7 +546,6 @@ def test_a_text_typed_stored_cursor_does_not_block_the_write(tmp_path, caplog):
     msg = rec.getMessage()
     assert "send record (%s, %s, %s)" % _KEY in msg
     assert "forward check raised TypeError" in msg
-    # Task 10 greps for this phrase to count backward writes: keep it out.
     assert "does not move forward" not in msg
 
 
@@ -392,41 +556,48 @@ class _RaisingFilter(logging.Filter):
         raise RuntimeError("log filter bug")
 
 
-def test_a_logging_failure_does_not_block_the_write(tmp_path):
+def test_a_logging_failure_changes_no_decision(tmp_path):
     store = SqliteWatermarkStore(tmp_path / "wm.db")
-    store.advance_cursor(*_KEY, cursor=b"1000", last_ack="t0")
+    store._write_cursor(*_KEY, cursor=b"1000", last_ack="t0")
     log = logging.getLogger(_STORE_LOG)
     flt = _RaisingFilter()
     log.addFilter(flt)
+
+    def broken(new: bytes, stored: bytes) -> bool:
+        raise RuntimeError("comparator bug")
+
     try:
-        # The write moves backward, so the store tries to log, and the log
-        # call raises.  The answer is the comparator's; the write still happens.
-        assert _write(store, _KEY, b"999", "t1") is False
+        assert _write(store, _KEY, b"999", "t1") is Advance.REFUSED
+        assert store.get_cursor(*_KEY) == b"1000"
+        assert store.advance_cursor(*_KEY, cursor=b"7", last_ack="t2",
+                                    is_after=broken) is Advance.WRITTEN_UNCHECKED
+        assert store.get_cursor(*_KEY) == b"7"
     finally:
         log.removeFilter(flt)
-    assert store.get_cursor(*_KEY) == b"999"
-    assert _last_ack(store) == "t1"
+    # The store's connection holds no open transaction afterwards.
+    assert store._conn.in_transaction is False
 
 
 def test_a_comparator_that_keeps_raising_logs_one_warning_per_window(tmp_path, caplog):
     clock = _Clock()
     store = SqliteWatermarkStore(tmp_path / "wm.db", clock=clock)
+    store._write_cursor(*_KEY, cursor=b"0", last_ack="t")
 
     def broken(new: bytes, stored: bytes) -> bool:
         raise RuntimeError("comparator bug")
 
-    def write(cursor: bytes) -> bool:
-        return store.advance_cursor_checked(
+    def write(cursor: bytes) -> Advance:
+        return store.advance_cursor(
             *_KEY, cursor=cursor, last_ack="t", is_after=broken,
         )
 
     with caplog.at_level(logging.DEBUG, logger=_STORE_LOG):
-        assert write(b"1") is True                  # the first: warns
+        assert write(b"1") is Advance.WRITTEN_UNCHECKED   # the first: warns
         clock.t += 60.0
-        assert write(b"2") is True                  # inside the hour: DEBUG
-        assert write(b"3") is True
+        assert write(b"2") is Advance.WRITTEN_UNCHECKED   # inside the hour: DEBUG
+        assert write(b"3") is Advance.WRITTEN_UNCHECKED
         clock.t += BACKWARD_WARN_INTERVAL_S
-        assert write(b"4") is True                  # after the hour: warns again
+        assert write(b"4") is Advance.WRITTEN_UNCHECKED   # after the hour: warns
         assert store.get_cursor(*_KEY) == b"4"
     levels = [r.levelname for r in caplog.records if r.name == _STORE_LOG]
     assert levels == ["WARNING", "DEBUG", "DEBUG", "WARNING"]
@@ -434,13 +605,23 @@ def test_a_comparator_that_keeps_raising_logs_one_warning_per_window(tmp_path, c
                for r in caplog.records if r.name == _STORE_LOG)
 
 
-# ---- the warning windows count from zero, and the texts stay as Task 10 reads them
+def test_a_database_error_rolls_back_and_raises(tmp_path):
+    store = SqliteWatermarkStore(tmp_path / "wm.db")
+    store._write_cursor(*_KEY, cursor=b"1", last_ack="t0")
+    store._conn.execute("DROP TABLE watermarks")
+    store._conn.commit()
+    with pytest.raises(sqlite3.OperationalError):
+        _write(store, _KEY, b"2", "t1")
+    assert store._conn.in_transaction is False
+
+
+# ---- the warning windows count from zero, and the texts stay exact -------------
 
 
 def test_each_window_counts_from_zero_after_a_summary(tmp_path, caplog):
     clock = _Clock()
     store = SqliteWatermarkStore(tmp_path / "wm.db", clock=clock)
-    store.advance_cursor(*_KEY, cursor=b"1000", last_ack="t0")
+    store._write_cursor(*_KEY, cursor=b"1000", last_ack="t0")
     with caplog.at_level(logging.DEBUG, logger=_STORE_LOG):
         _write(store, _KEY, b"999", "t1")                # the first: warns
         for cursor in range(998, 992, -1):               # three full windows
@@ -448,7 +629,6 @@ def test_each_window_counts_from_zero_after_a_summary(tmp_path, caplog):
             _write(store, _KEY, str(cursor).encode(), "t")
     summaries = [r.getMessage() for r in _warnings(caplog)][1:]
     assert len(summaries) == 3
-    # Each summary counts the DEBUG write and itself, and nothing from before.
     assert all("does not move forward: 2 times since the last warning" in m
                for m in summaries), summaries
     counts = [r.getMessage() for r in _debugs(caplog)]
@@ -457,11 +637,11 @@ def test_each_window_counts_from_zero_after_a_summary(tmp_path, caplog):
 
 
 def test_the_warning_and_debug_texts_are_exact(tmp_path, caplog):
-    # Task 10 greps the journal for these lines and sums their counts.
+    # An operator greps the journal for "does not move forward" and sums the counts.
     clock = _Clock()
     store = SqliteWatermarkStore(tmp_path / "wm.db", clock=clock)
     key = ("s", "d", "t")
-    store.advance_cursor(*key, cursor=b"1000", last_ack="t0")
+    store._write_cursor(*key, cursor=b"1000", last_ack="t0")
     with caplog.at_level(logging.DEBUG, logger=_STORE_LOG):
         _write(store, key, b"999", "t1")                 # the first form
         clock.t += 10.0
@@ -475,28 +655,24 @@ def test_the_warning_and_debug_texts_are_exact(tmp_path, caplog):
     assert got == [
         ("WARNING",
          "send record (s, d, t) does not move forward: stored b'1000', new b'999'; "
-         "writing it anyway (v3.70 warns only; repeats on this key log at DEBUG "
-         "for 3600 s, then one WARNING counts them)"),
+         "refused, record held (repeats on this key log at DEBUG for 3600 s, "
+         "then one WARNING counts them)"),
         ("DEBUG",
-         "send record (s, d, t) again fails to move forward: stored b'999', "
+         "send record (s, d, t) again fails to move forward: stored b'1000', "
          "new b'998' (1 since the last warning)"),
         ("WARNING",
          "send record (s, d, t) does not move forward: 2 times since the last "
-         "warning, the latest stored b'998', new b'997'; writing it anyway "
-         "(v3.70 warns only)"),
+         "warning, the latest stored b'1000', new b'997'; refused, record held"),
         ("WARNING",
          "send record (s, d, t) does not move forward: 1 time since the last "
-         "warning, the latest stored b'997', new b'996'; writing it anyway "
-         "(v3.70 warns only)"),
+         "warning, the latest stored b'1000', new b'996'; refused, record held"),
     ]
-    # A grep for the phrase finds WARNINGs alone.
     assert all("does not move forward" in m for lvl, m in got if lvl == "WARNING")
     assert all("does not move forward" not in m for lvl, m in got if lvl == "DEBUG")
 
 
 def test_the_window_is_3600_seconds_on_the_monotonic_clock():
     assert BACKWARD_WARN_INTERVAL_S == 3600.0
-    # A wall clock would let a host-clock step stretch or cut a window.
     default = inspect.signature(SqliteWatermarkStore.__init__).parameters["clock"].default
     assert default is time.monotonic
 
@@ -569,11 +745,10 @@ def test_a_real_sources_own_cursors_stay_silent(tmp_path, memory_transport, capl
         up = Uploader([pipe])
         for _ in range(batches + 2):
             up.pump()
-    # The run did real work: every batch shipped, and the record moved with it.
     assert len(memory_transport.shipped) == batches
     key = (src.source_id(), "memory", "test.spots")
     assert wm.get_cursor(*key) == memory_transport.shipped[-1].cursor_after
-    # And it stayed silent: normal operation never reads as a backward write.
     assert [r for r in caplog.records if r.levelno >= logging.WARNING] == []
     assert [r for r in caplog.records
             if r.name == _STORE_LOG and r.levelno == logging.DEBUG] == []
+    assert not any("record held" in r.getMessage() for r in caplog.records)

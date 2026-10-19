@@ -45,11 +45,11 @@ def _v0_store(directory: Path, name: str = "watermarks.db") -> Path:
     directory.mkdir(parents=True, exist_ok=True)
     db = directory / name
     s = SqliteWatermarkStore(db)
-    s.advance_cursor(*PSK_KEY, cursor=b"1204",
+    s._write_cursor(*PSK_KEY, cursor=b"1204",
                      last_ack="2026-10-07T12:00:00+00:00")
-    s.advance_cursor(*WSPR_KEY, cursor=b"2026-10-07T11:58:00Z",
+    s._write_cursor(*WSPR_KEY, cursor=b"2026-10-07T11:58:00Z",
                      last_ack="2026-10-07T12:00:30+00:00")
-    s.advance_cursor(*GRAPE_KEY, cursor=b"\x00\xff\x10binary",
+    s._write_cursor(*GRAPE_KEY, cursor=b"\x00\xff\x10binary",
                      last_ack="2026-10-07T01:10:00+00:00")
     for i, outcome in enumerate(("acked", "retry-later", "acked")):
         s.record_attempt(
@@ -647,14 +647,14 @@ def test_store_constructor_leaves_user_version_alone(tmp_path):
 
     old = _v0_store(tmp_path / "old")
     s = SqliteWatermarkStore(old)
-    s.advance_cursor(*PSK_KEY, cursor=b"1300",
+    s._write_cursor(*PSK_KEY, cursor=b"1300",
                      last_ack="2026-10-07T13:00:00+00:00")
     s.close()
     assert _version(old) == 0      # nor does reopening a v0 store
 
     _set_version(old, 1)
     s = SqliteWatermarkStore(old)
-    s.advance_cursor(*PSK_KEY, cursor=b"1301",
+    s._write_cursor(*PSK_KEY, cursor=b"1301",
                      last_ack="2026-10-07T13:00:30+00:00")
     s.close()
     assert _version(old) == 1      # and reopening never resets the number
@@ -679,7 +679,7 @@ def test_current_store_opens_a_version_1_file(tmp_path):
         assert d is not None
         assert (d.cursor_after, d.commit_token) == (b"1205", b"commit-1205")
         s.requeue_deliverable(d)
-        s.advance_cursor(*PSK_KEY, cursor=b"1300",
+        s._write_cursor(*PSK_KEY, cursor=b"1300",
                          last_ack="2026-10-07T13:00:05+00:00")
         s.record_attempt(ts="2026-10-07T13:00:05+00:00",
                          source_id=PSK_KEY[0], dest_id=PSK_KEY[1],

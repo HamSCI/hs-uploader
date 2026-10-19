@@ -5,6 +5,10 @@ from __future__ import annotations
 from hs_uploader.watermark import Deliverable, SqliteWatermarkStore
 
 
+def _lexical(new: bytes, stored: bytes) -> bool:
+    return new > stored
+
+
 def test_cursor_round_trip(tmp_path):
     store = SqliteWatermarkStore(tmp_path / "wm.db")
     assert store.get_cursor("ch:wspr.spots", "wsprnet", "wspr.spots") == b""
@@ -12,7 +16,7 @@ def test_cursor_round_trip(tmp_path):
     store.advance_cursor(
         "ch:wspr.spots", "wsprnet", "wspr.spots",
         cursor=b'{"time":"2026-05-08","tiebreak":"42"}',
-        last_ack="2026-05-08T12:00:00+00:00",
+        last_ack="2026-05-08T12:00:00+00:00", is_after=_lexical,
     )
     got = store.get_cursor("ch:wspr.spots", "wsprnet", "wspr.spots")
     assert got == b'{"time":"2026-05-08","tiebreak":"42"}'
@@ -23,7 +27,7 @@ def test_cursor_advance_is_upsert(tmp_path):
     for ts, n in [("2026-05-08", "1"), ("2026-05-09", "2"), ("2026-05-10", "3")]:
         store.advance_cursor(
             "src", "dest", "tbl",
-            cursor=ts.encode(), last_ack=ts,
+            cursor=ts.encode(), last_ack=ts, is_after=_lexical,
         )
     assert store.get_cursor("src", "dest", "tbl") == b"2026-05-10"
 
@@ -32,11 +36,11 @@ def test_cursors_are_per_destination(tmp_path):
     store = SqliteWatermarkStore(tmp_path / "wm.db")
     store.advance_cursor(
         "ch:wspr.spots", "wsprdaemon", "wspr.spots",
-        cursor=b"A", last_ack="t1",
+        cursor=b"A", last_ack="t1", is_after=_lexical,
     )
     store.advance_cursor(
         "ch:wspr.spots", "wsprnet", "wspr.spots",
-        cursor=b"B", last_ack="t2",
+        cursor=b"B", last_ack="t2", is_after=_lexical,
     )
     assert store.get_cursor("ch:wspr.spots", "wsprdaemon", "wspr.spots") == b"A"
     assert store.get_cursor("ch:wspr.spots", "wsprnet", "wspr.spots") == b"B"
@@ -44,7 +48,8 @@ def test_cursors_are_per_destination(tmp_path):
 
 def test_reset_cursor(tmp_path):
     store = SqliteWatermarkStore(tmp_path / "wm.db")
-    store.advance_cursor("s", "d", "t", cursor=b"X", last_ack="t1")
+    store.advance_cursor("s", "d", "t", cursor=b"X", last_ack="t1",
+                         is_after=_lexical)
     assert store.reset_cursor("s", "d", "t") is True
     assert store.get_cursor("s", "d", "t") == b""
     # Second reset is a no-op return.

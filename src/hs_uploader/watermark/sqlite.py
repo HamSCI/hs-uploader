@@ -27,7 +27,7 @@ import time
 from pathlib import Path
 from typing import Callable, Optional
 
-from .base import Deliverable
+from .base import Advance, Deliverable
 
 _ATTEMPTS_RING_SIZE = 10_000
 
@@ -87,10 +87,10 @@ def default_path() -> Path:
 
 logger = logging.getLogger(__name__)
 
-# advance_cursor_checked logs a send record that does not move forward
-# with one WARNING per key per this many seconds, and at DEBUG between.
-# A shared key can run backward on every acknowledgement, and a WARNING
-# each time would bury every other line in the journal.
+# advance_cursor logs a refused (backward) write, or a failed check, with
+# one WARNING per key per this many seconds, and at DEBUG between.  A
+# key that runs backward on every acknowledgement would otherwise bury
+# every other line in the journal.
 BACKWARD_WARN_INTERVAL_S = 3600.0
 
 
@@ -98,9 +98,10 @@ class SqliteWatermarkStore:
     """SQLite-backed implementation of ``WatermarkStore``.
 
     All public methods take the connection lock so concurrent callers
-    from the same process serialize cleanly.  Cross-process access
-    (multiple hs-uploader pumps writing the same db file) is not
-    supported and is an operator config error.
+    from the same process serialize cleanly.  Two pumps on the same
+    key remain an operator config error, but ``advance_cursor`` runs
+    its read, comparison and write in one ``BEGIN IMMEDIATE``
+    transaction, so a second process cannot move a send record back.
     """
 
     def __init__(
@@ -116,13 +117,13 @@ class SqliteWatermarkStore:
         self._conn = sqlite3.connect(self.path, check_same_thread=False)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
-        # advance_cursor_checked's warning windows, one per key:
+        # advance_cursor's warning windows, one per key:
         # key -> [window start on `clock`, writes since the last WARNING].
         # In memory only, so each process keeps its own.
         self._clock = clock
         self._warn_windows: dict[tuple[str, str, str], list] = {}
         # key -> `clock` reading at the last WARNING that a failed check
-        # produced (the read, the comparator or the logging raised).
+        # produced (the stored value or the comparator raised).
         self._check_failed_at: dict[tuple[str, str, str], float] = {}
         self._init_schema()
         # Make the db + its WAL/SHM sidecars group-writable so OTHER
@@ -189,6 +190,36 @@ class SqliteWatermarkStore:
             ).fetchone()
             return bytes(row["cursor"]) if row else b""
 
+    def _write_cursor(
+        self,
+        source_id: str,
+        dest_id: str,
+        table: str,
+        *,
+        cursor: bytes,
+        last_ack: str,
+    ) -> None:
+        """Write the send record without asking the source's order.
+
+        Private: only ``advance_cursor`` (when the comparison raises) and
+        tests that seed a store call it.  ``reset_cursor`` remains the
+        one public way to move a record backward.
+        """
+        with self._lock, self._conn:
+            self._upsert(source_id, dest_id, table, cursor, last_ack)
+
+    def _upsert(
+        self, source_id: str, dest_id: str, table: str, cursor: bytes,
+        last_ack: str,
+    ) -> None:
+        self._conn.execute(
+            "INSERT INTO watermarks(source_id, dest_id, table_name, "
+            "cursor, last_ack) VALUES(?,?,?,?,?) "
+            "ON CONFLICT(source_id, dest_id, table_name) DO UPDATE SET "
+            "cursor=excluded.cursor, last_ack=excluded.last_ack",
+            (source_id, dest_id, table, cursor, last_ack),
+        )
+
     def advance_cursor(
         self,
         source_id: str,
@@ -197,84 +228,104 @@ class SqliteWatermarkStore:
         *,
         cursor: bytes,
         last_ack: str,
-    ) -> None:
-        with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT INTO watermarks(source_id, dest_id, table_name, "
-                "cursor, last_ack) VALUES(?,?,?,?,?) "
-                "ON CONFLICT(source_id, dest_id, table_name) DO UPDATE SET "
-                "cursor=excluded.cursor, last_ack=excluded.last_ack",
-                (source_id, dest_id, table, cursor, last_ack),
-            )
-
-    def advance_cursor_checked(
-        self,
-        source_id: str,
-        dest_id: str,
-        table: str,
-        *,
-        cursor: bytes,
-        last_ack: str,
         is_after: Callable[[bytes, bytes], bool],
-    ) -> bool:
-        """Write the send record exactly as ``advance_cursor`` does, after
-        asking ``is_after(cursor, stored)`` whether the write moves it
-        forward.  Returns that answer.
+    ) -> Advance:
+        """Move the send record forward only (spec §4.6).  Returns what it did.
 
-        v3.70 warns only.  A write that would move the record backward,
-        or leave it where it stands, gets logged with the key and both
-        values and then goes ahead, so nothing the station sends
-        changes.  v3.71 enforces the rule once each sender owns its key.
-        ``_log_not_forward`` keeps that log to one WARNING per key per
-        ``BACKWARD_WARN_INTERVAL_S``.
+        One ``BEGIN IMMEDIATE`` transaction holds the read of the stored
+        record, the comparison and the write, so another connection (a
+        second process on the same file) cannot write between them.  It
+        waits on the connection's busy timeout for that lock instead.
 
-        The check is an observation, and it never decides whether the
-        write happens: a skipped write would re-send the batch on every
-        pump.  So the read of the stored cursor, the comparator and the
-        logging all run inside a guard.  When any of them raises, the
-        store logs that (``_log_check_failed``, one WARNING per key per
-        window) and writes anyway, with the arguments ``advance_cursor``
-        would have had.  The return value then reads True when the read
-        or the comparator failed, since no backward move was shown.  A
-        logging failure after the comparator answered leaves that answer
-        in place.
+        * No stored record: write it; ``WRITTEN``.
+        * ``is_after(cursor, stored)``: write; ``WRITTEN``.
+        * Neither lies after the other in the source's order: refresh
+          ``last_ack`` and keep the stored cursor bytes; ``REFRESHED``.
+        * ``cursor`` lies before ``stored``: change nothing and log a
+          WARNING with both values (``_log_not_forward``, one per key per
+          ``BACKWARD_WARN_INTERVAL_S``); ``REFUSED``.
+        * The comparison raises, or the stored value cannot be read as
+          bytes: write anyway and log a WARNING with both values and the
+          error (``_log_check_failed``, same throttle);
+          ``WRITTEN_UNCHECKED``.  A broken comparator must not freeze a
+          key, since every pump would then re-send the same batch.
 
-        ``self._lock`` covers the read and the write, which serializes
-        callers in this process only.  Another process that opens the
-        same file (an in-process sender) can still write between them;
-        a check that only warns tolerates that.
+        A logging failure changes no decision.  A database error rolls the
+        transaction back and propagates.
         """
         key = (source_id, dest_id, table)
         with self._lock:
-            forward = True
+            if self._conn.in_transaction:
+                # Every writer here commits before it returns, so an open
+                # transaction means a caller broke that rule; a nested
+                # BEGIN would fail anyway.
+                raise RuntimeError(
+                    "advance_cursor called inside an open transaction")
+            self._conn.execute("BEGIN IMMEDIATE")
             try:
-                stored = self.get_cursor(source_id, dest_id, table)
-                try:
-                    forward = bool(is_after(cursor, stored))
-                except Exception as exc:  # noqa: BLE001 — never block the write
-                    self._log_check_failed(key, "cursor comparator", exc, cursor)
-                    forward = True
-                if not forward:
-                    self._log_not_forward(key, stored, cursor)
-            except Exception as exc:  # noqa: BLE001 — never block the write
-                self._log_check_failed(key, "forward check", exc, cursor)
-            self.advance_cursor(
-                source_id, dest_id, table, cursor=cursor, last_ack=last_ack,
-            )
-            return forward
+                result = self._advance_in_txn(key, cursor, last_ack, is_after)
+                self._conn.commit()
+            except BaseException:
+                self._conn.rollback()
+                raise
+            return result
+
+    def _advance_in_txn(
+        self,
+        key: tuple[str, str, str],
+        cursor: bytes,
+        last_ack: str,
+        is_after: Callable[[bytes, bytes], bool],
+    ) -> Advance:
+        row = self._conn.execute(
+            "SELECT cursor FROM watermarks "
+            "WHERE source_id=? AND dest_id=? AND table_name=?", key,
+        ).fetchone()
+        if row is None:
+            self._upsert(*key, cursor, last_ack)
+            return Advance.WRITTEN
+        raw = row["cursor"]
+        try:
+            stored = bytes(raw)
+        except Exception as exc:  # noqa: BLE001 — e.g. a TEXT cursor from a hand edit
+            self._log_check_failed(key, "forward check", exc, raw, cursor)
+            self._upsert(*key, cursor, last_ack)
+            return Advance.WRITTEN_UNCHECKED
+        try:
+            after = bool(is_after(cursor, stored))
+            before = (not after and cursor != stored
+                      and bool(is_after(stored, cursor)))
+        except Exception as exc:  # noqa: BLE001 — never freeze the key
+            self._log_check_failed(key, "cursor comparator", exc, stored, cursor)
+            self._upsert(*key, cursor, last_ack)
+            return Advance.WRITTEN_UNCHECKED
+        if after:
+            self._upsert(*key, cursor, last_ack)
+            return Advance.WRITTEN
+        if before:
+            try:
+                self._log_not_forward(key, stored, cursor)
+            except Exception:  # noqa: BLE001 — a logging failure changes nothing
+                pass
+            return Advance.REFUSED
+        self._conn.execute(
+            "UPDATE watermarks SET last_ack=? "
+            "WHERE source_id=? AND dest_id=? AND table_name=?",
+            (last_ack, *key),
+        )
+        return Advance.REFRESHED
 
     def _log_check_failed(
         self, key: tuple[str, str, str], what: str, exc: BaseException,
-        cursor: bytes,
+        stored: object, cursor: bytes,
     ) -> None:
         """Log that the forward check for ``key`` raised, without raising.
 
         The first failure on a key logs a WARNING.  Failures within
         ``BACKWARD_WARN_INTERVAL_S`` of that WARNING log at DEBUG, so a
         comparator that raises on every acknowledgement cannot flood the
-        journal.  This runs inside the guard that protects the write, so
-        a failure in here (a log filter that raises, a clock that raises)
-        gets swallowed.  The caller holds ``self._lock``.
+        journal.  A failure in here (a log filter that raises, a clock
+        that raises) gets swallowed.  The caller holds ``self._lock``.
         """
         try:
             now = self._clock()
@@ -286,8 +337,9 @@ class SqliteWatermarkStore:
                 self._check_failed_at[key] = now
             logger.log(
                 level,
-                "send record (%s, %s, %s): %s raised %s: %s; writing %r anyway",
-                *key, what, type(exc).__name__, exc, cursor,
+                "send record (%s, %s, %s): %s raised %s: %s; stored %r, "
+                "new %r; writing it unchecked",
+                *key, what, type(exc).__name__, exc, stored, cursor,
             )
         except Exception:  # noqa: BLE001 — a logging failure must not block the write
             pass
@@ -295,15 +347,16 @@ class SqliteWatermarkStore:
     def _log_not_forward(
         self, key: tuple[str, str, str], stored: bytes, new: bytes,
     ) -> None:
-        """Log a write that does not move ``key``'s send record forward.
+        """Log a refused write: ``new`` lies before ``key``'s send record.
 
-        The first such write on a key logs a WARNING naming the key and
-        both values, and opens a window of ``BACKWARD_WARN_INTERVAL_S``
-        on ``self._clock``.  Inside the window each further one adds to
-        the key's count and logs at DEBUG.  The first one after the
-        window logs one WARNING with the key, the count since the last
-        WARNING (itself included) and the latest pair of values, then
-        opens a new window.  The caller holds ``self._lock``.
+        The first refusal on a key logs a WARNING naming the key and both
+        values, and opens a window of ``BACKWARD_WARN_INTERVAL_S`` on
+        ``self._clock``.  Inside the window each further one adds to the
+        key's count and logs at DEBUG.  The first one after the window
+        logs one WARNING with the key, the count since the last WARNING
+        (itself included) and the latest pair of values, then opens a new
+        window.  A grep for "does not move forward" finds the WARNINGs
+        alone.  The caller holds ``self._lock``.
         """
         now = self._clock()
         window = self._warn_windows.get(key)
@@ -311,8 +364,8 @@ class SqliteWatermarkStore:
             self._warn_windows[key] = [now, 0]
             logger.warning(
                 "send record (%s, %s, %s) does not move forward: stored %r, "
-                "new %r; writing it anyway (v3.70 warns only; repeats on this "
-                "key log at DEBUG for %d s, then one WARNING counts them)",
+                "new %r; refused, record held (repeats on this key log at "
+                "DEBUG for %d s, then one WARNING counts them)",
                 *key, stored, new, BACKWARD_WARN_INTERVAL_S,
             )
             return
@@ -326,8 +379,7 @@ class SqliteWatermarkStore:
             return
         logger.warning(
             "send record (%s, %s, %s) does not move forward: %d %s since the "
-            "last warning, the latest stored %r, new %r; writing it anyway "
-            "(v3.70 warns only)",
+            "last warning, the latest stored %r, new %r; refused, record held",
             *key, window[1], "time" if window[1] == 1 else "times", stored, new,
         )
         self._warn_windows[key] = [now, 0]

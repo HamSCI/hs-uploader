@@ -143,7 +143,7 @@ def test_legacy_keyless_row_survives_a_failed_replay_and_its_ack_advances_nothin
     up = Uploader([pipe], now_fn=lambda: clock[0])
 
     # A send record that a keyless ack must leave alone.
-    wm.advance_cursor(*_KEY, cursor=b"1", last_ack=_iso(t0))
+    wm._write_cursor(*_KEY, cursor=b"1", last_ack=_iso(t0))
     # The row as an older release left it: no key, no cursor_after, no token.
     wm.enqueue_deliverable(pipeline="test", payload_blob=b"legacy",
                            enqueued_at=_iso(t0), next_attempt_at=_iso(t0))

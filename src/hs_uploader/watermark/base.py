@@ -20,8 +20,24 @@ intervene.
 
 from __future__ import annotations
 
+import enum
 from dataclasses import dataclass
 from typing import Callable, Optional, Protocol, runtime_checkable
+
+
+class Advance(enum.Enum):
+    """What ``WatermarkStore.advance_cursor`` did with one write (spec §4.6).
+
+    ``WRITTEN``: the new cursor lies after the stored one; both fields written.
+    ``REFRESHED``: the two tie in the source's order; ``last_ack`` alone moved.
+    ``REFUSED``: the new cursor lies before the stored one; nothing changed.
+    ``WRITTEN_UNCHECKED``: the comparison raised; written without the check.
+    """
+
+    WRITTEN = "written"
+    REFRESHED = "refreshed"
+    REFUSED = "refused"
+    WRITTEN_UNCHECKED = "written_unchecked"
 
 
 @dataclass(frozen=True)
@@ -78,26 +94,18 @@ class WatermarkStore(Protocol):
         *,
         cursor: bytes,
         last_ack: str,
-    ) -> None:
-        ...
-
-    def advance_cursor_checked(
-        self,
-        source_id: str,
-        dest_id: str,
-        table: str,
-        *,
-        cursor: bytes,
-        last_ack: str,
         is_after: Callable[[bytes, bytes], bool],
-    ) -> bool:
-        """Read the stored cursor, ask ``is_after(cursor, stored)``,
-        log the key and both values when it answers False, then write
-        exactly as ``advance_cursor`` does.  Returns the answer.  The
-        log holds one WARNING per key per hour, with a count of the
-        writes logged at DEBUG between.  v3.70 never refuses a write,
-        and a failure in the read, the comparator or the logging does
-        not stop it either.
+    ) -> Advance:
+        """Move the send record forward only (spec §4.6), in one
+        transaction that reads the stored record, asks
+        ``is_after(cursor, stored)`` and writes.  After: write
+        (``WRITTEN``).  Equal in the source's order: refresh
+        ``last_ack`` only (``REFRESHED``).  Before: change nothing and
+        log a WARNING with both values (``REFUSED``; one WARNING per key
+        per hour, a count at DEBUG between).  The comparison raises:
+        write and log the error (``WRITTEN_UNCHECKED``).  No public
+        method writes a send record unchecked; ``reset_cursor`` deletes
+        one (``SqliteWatermarkStore.reset_cursor``, the deliberate rewind).
         """
         ...
 

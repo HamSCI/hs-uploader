@@ -159,9 +159,9 @@ def _station(tmp_path: Path, manifest_text: str = MANIFEST):
 
     watermarks = snap / "watermarks.db"
     store = SqliteWatermarkStore(watermarks)
-    store.advance_cursor(*PSK_KEY, cursor=b"1", last_ack="2026-10-07T12:01:00+00:00")
-    store.advance_cursor(*WSPRNET_KEY, cursor=b"6", last_ack="2026-10-07T12:01:00+00:00")
-    store.advance_cursor(*CYCLE_KEY, cursor=b"2026-10-07T12:00:00Z",
+    store._write_cursor(*PSK_KEY, cursor=b"1", last_ack="2026-10-07T12:01:00+00:00")
+    store._write_cursor(*WSPRNET_KEY, cursor=b"6", last_ack="2026-10-07T12:01:00+00:00")
+    store._write_cursor(*CYCLE_KEY, cursor=b"2026-10-07T12:00:00Z",
                          last_ack="2026-10-07T12:02:10+00:00")
     store.enqueue_deliverable(
         pipeline="wspr-wsprdaemon", payload_blob=b"tar-bytes",

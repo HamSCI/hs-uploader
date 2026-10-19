@@ -62,8 +62,10 @@ class Source(Protocol):
         knows its encoding, so the orchestrator asks the source before
         each cursor write.  An empty ``stored`` (no send record yet)
         answers True, and so does a value the source cannot decode.
-        In v3.70 a False answer only gets logged (one WARNING per key
-        per hour); the write still happens.
+        The store also asks ``cursor_is_after(stored, new)`` when the
+        first answer reads False, to tell a tie from a backward write.
+        A backward write gets refused (spec §4.6): the record stays, and
+        the store logs one WARNING per key per hour.
 
         This default answers True.  The concrete sources do not
         subclass this protocol, so each defines its own; core falls
