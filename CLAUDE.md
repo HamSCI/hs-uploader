@@ -71,9 +71,13 @@ inspects state and runs the host daemon (`hs-uploader serve`).
 - **Source** (`sources/`) — yields `Record`s from an opaque cursor.
   - `SqliteSource` (preferred) reads the `pending_uploads` queue that
     `hs_uploader.sink.Writer` fills. Supports `extra_where` and `start_at`
-    knobs and enforces a strict `schema_version` check (rows outside
-    the pipeline's accepted set flip the source to `stale-schema` —
-    a clean halt rather than shipping mis-typed records).
+    knobs.  `producer` (and, with it, `radiod_id`) scopes every row
+    statement to one client (instance) and names it in the key,
+    `sqlite:<db>.<table>@<producer>[/<radiod_id>]`; rows stored with
+    `producer = ''` follow the writer's D12 rule.  It enforces a strict
+    `schema_version` check (rows outside the pipeline's accepted set
+    flip the source to `stale-schema` — a clean halt rather than
+    shipping mis-typed records).
   - `WsprCycleSource` — cycle-aligned variant over the same queue;
     yields one `RecordBatch` per 2-minute WSPR cycle, bundling
     `wspr.spots` + `wspr.noise` so a single tar can ship both.

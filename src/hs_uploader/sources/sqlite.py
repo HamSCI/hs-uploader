@@ -50,6 +50,26 @@ multi-instance host can scope a pipeline to one producer.  Values
 pass through SQLite parameterization; column names are validated
 alnum before being inlined.
 
+`producer` and `radiod_id`
+--------------------------
+
+`producer="psk-recorder"` scopes the source to one client's rows and
+names it in the key: `source_id()` becomes
+`sqlite:<db>.<table>@<producer>`.  `radiod_id="rx-a"` (allowed only
+with a producer) narrows it to one instance, by the payload's
+`radiod_id`, and gives `sqlite:<db>.<table>@<producer>/<radiod_id>`.
+Every statement that touches rows applies the scope: the batch
+selection, the de-duplication query, the `start_at` anchor, the
+stale-schema probe and `commit()`'s DELETE.
+
+Rows stored with `producer = ''` (before v3.70) belong where the
+writer's `infer_producer` would put them (D12): MSK144, compared
+trimmed and case-folded, to meteor-scatter; every other mode, a
+missing one included, to psk-recorder.  A `sink.db` without the
+`producer` column gets that rule alone.  Any other producer matches
+the column only.  With neither set, the source behaves as before,
+key included.
+
 `start_at`
 ----------
 
@@ -82,6 +102,17 @@ HEALTH_NOOP = "noop"
 
 
 _ALLOWED_EXTRA_OPS = {"=", "!=", "<", ">", "<=", ">=", "IN", "NOT IN"}
+
+
+# D12 in SQL, for rows that name no producer.  It must agree with
+# `hs_uploader.sink.writer.infer_producer` on every row: mode trimmed
+# and case-folded, a missing or non-string mode counted as not MSK144.
+# (A JSON number 144 reads as '144', which is not 'msk144'.)
+_D12_MODE = "lower(trim(coalesce(json_extract(payload_json, '$.mode'), '')))"
+_D12_BY_PRODUCER = {
+    "meteor-scatter": f"{_D12_MODE} = 'msk144'",
+    "psk-recorder": f"{_D12_MODE} != 'msk144'",
+}
 
 
 # ---- cursor ----------------------------------------------------------------
@@ -196,9 +227,21 @@ class SqliteSource:
         ceiling_provider: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None,
         config: Optional[_ConnectionConfig] = None,
         connect_factory: Optional[Callable[[_ConnectionConfig], sqlite3.Connection]] = None,
+        producer: Optional[str] = None,
+        radiod_id: Optional[str] = None,
     ):
         self.database = database
         self.table = table
+        # `producer` and `radiod_id` scope every statement that touches
+        # rows and name the scope in source_id() (spec-key-split-v373
+        # §4.1, §3.3).  An empty string counts as unset.
+        self.producer = producer or None
+        self.radiod_id = radiod_id or None
+        if self.radiod_id is not None and self.producer is None:
+            raise ValueError("radiod_id needs a producer")
+        # Whether pending_uploads has the `producer` column; probed once
+        # per connection (an old sink.db lacks it).
+        self._has_producer_column: Optional[bool] = None
         self.accepted_schema_versions = list(accepted_schema_versions)
         self.select_columns = list(select_columns) if select_columns else None
         self.start_at = start_at
@@ -312,6 +355,8 @@ class SqliteSource:
         ceiling_provider: Optional[Callable[[sqlite3.Connection], Optional[str]]] = None,
         env: Optional[dict] = None,
         connect_factory: Optional[Callable[[_ConnectionConfig], sqlite3.Connection]] = None,
+        producer: Optional[str] = None,
+        radiod_id: Optional[str] = None,
     ) -> "SqliteSource":
         cfg = _ConnectionConfig.from_env(env)
         return cls(
@@ -328,12 +373,23 @@ class SqliteSource:
             ceiling_provider=ceiling_provider,
             config=cfg,
             connect_factory=connect_factory,
+            producer=producer,
+            radiod_id=radiod_id,
         )
 
     # ---- Source protocol ----
 
     def source_id(self) -> str:
+        if self.producer is not None:
+            return self._scoped_source_id()
         return f"sqlite:{self.database}.{self.table}"
+
+    def _scoped_source_id(self) -> str:
+        """`sqlite:<db>.<table>@<producer>[/<radiod_id>]` (spec §3.1)."""
+        sid = f"sqlite:{self.database}.{self.table}@{self.producer}"
+        if self.radiod_id is not None:
+            sid += f"/{self.radiod_id}"
+        return sid
 
     def health(self) -> str:
         return self._health
@@ -399,11 +455,13 @@ class SqliteSource:
             return
         try:
             conn = self._connect()
+            scope_sql, scope_params = self._scope_clauses(conn)
             with conn:
                 conn.execute(
                     "DELETE FROM pending_uploads "
-                    "WHERE id <= ? AND target_db = ? AND target_table = ?",
-                    (last_id, self.database, self.table),
+                    "WHERE id <= ? AND target_db = ? AND target_table = ?"
+                    + "".join(f" AND {c}" for c in scope_sql),
+                    (last_id, self.database, self.table, *scope_params),
                 )
         except Exception as exc:
             # Don't promote to a hard error — the watermark store has
@@ -458,7 +516,41 @@ class SqliteSource:
         if self._conn is None:
             assert self._config is not None
             self._conn = self._connect_factory(self._config)
+            self._has_producer_column = None
         return self._conn
+
+    def _scope_clauses(
+        self, conn: Optional[sqlite3.Connection],
+    ) -> tuple[list[str], list[Any]]:
+        """The producer and radiod_id clauses, each to be ANDed into a
+        statement on pending_uploads.  Empty when no producer is set.
+
+        With the `producer` column: rows naming this producer, plus rows
+        naming none that D12 assigns to it.  Without the column (a
+        sink.db older than v3.70): D12 alone.  A producer D12 does not
+        know matches the column only, and nothing on an old file.
+        """
+        if self.producer is None:
+            return [], []
+        if self._has_producer_column is None:
+            conn = conn or self._connect()
+            cols = {r[1] for r in conn.execute("PRAGMA table_info(pending_uploads)")}
+            self._has_producer_column = "producer" in cols
+        d12 = _D12_BY_PRODUCER.get(self.producer)
+        clauses: list[str] = []
+        params: list[Any] = []
+        if self._has_producer_column:
+            if d12 is not None:
+                clauses.append(f"(producer = ? OR (producer = '' AND {d12}))")
+            else:
+                clauses.append("producer = ?")
+            params.append(self.producer)
+        else:
+            clauses.append(d12 if d12 is not None else "0")
+        if self.radiod_id is not None:
+            clauses.append("json_extract(payload_json, '$.radiod_id') = ?")
+            params.append(self.radiod_id)
+        return clauses, params
 
     def _iter_one_batch(self, cur: _Cursor, limit: int) -> Iterator[RecordBatch]:
         conn = self._connect()
@@ -470,7 +562,7 @@ class SqliteSource:
                 # cycle is still waiting on a receiver, none past the
                 # backstop).  Empty batch — try again next pump.
                 return
-        sql, params = self._build_query(cur, limit, ceiling=ceiling)
+        sql, params = self._build_query(cur, limit, ceiling=ceiling, conn=conn)
         rows = conn.execute(sql, params).fetchall()
         if not rows:
             # Probe for stale-schema rows — only when no in-band data
@@ -510,6 +602,7 @@ class SqliteSource:
 
     def _build_query(
         self, cur: _Cursor, limit: int, *, ceiling: Optional[str] = None,
+        conn: Optional[sqlite3.Connection] = None,
     ) -> tuple[str, list]:
         clauses = [
             "id > ?",
@@ -517,6 +610,12 @@ class SqliteSource:
             "target_table = ?",
         ]
         params: list[Any] = [cur.last_id, self.database, self.table]
+
+        # Producer/instance scope.  It lands after the leading cursor
+        # clause, so the dedup CTE (clauses[1:]) carries it too.
+        scope_sql, scope_params = self._scope_clauses(conn)
+        clauses.extend(scope_sql)
+        params.extend(scope_params)
 
         if self.accepted_schema_versions:
             placeholders = ",".join("?" for _ in self.accepted_schema_versions)
@@ -654,12 +753,17 @@ class SqliteSource:
         if not self.accepted_schema_versions:
             return
         placeholders = ",".join("?" for _ in self.accepted_schema_versions)
+        scope_sql, scope_params = self._scope_clauses(conn)
         sql = (
             "SELECT schema_version FROM pending_uploads "
             "WHERE target_db = ? AND target_table = ? "
-            f"AND schema_version NOT IN ({placeholders}) LIMIT 1"
+            + "".join(f"AND {c} " for c in scope_sql)
+            + f"AND schema_version NOT IN ({placeholders}) LIMIT 1"
         )
-        params = [self.database, self.table, *self.accepted_schema_versions]
+        params = [
+            self.database, self.table, *scope_params,
+            *self.accepted_schema_versions,
+        ]
         row = conn.execute(sql, params).fetchone()
         if row is not None:
             self._health = HEALTH_STALE_SCHEMA
@@ -716,10 +820,12 @@ class SqliteSource:
         if self._start_at_cursor is not None:
             return self._start_at_cursor
         conn = self._connect()
+        scope_sql, scope_params = self._scope_clauses(conn)
         row = conn.execute(
             "SELECT COALESCE(MAX(id), 0) FROM pending_uploads "
-            "WHERE target_db = ? AND target_table = ?",
-            (self.database, self.table),
+            "WHERE target_db = ? AND target_table = ?"
+            + "".join(f" AND {c}" for c in scope_sql),
+            (self.database, self.table, *scope_params),
         ).fetchone()
         self._start_at_cursor = _Cursor(last_id=int(row[0]))
         return self._start_at_cursor

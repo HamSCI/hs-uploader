@@ -109,6 +109,8 @@ def _build_source(spec: Mapping[str, Any]):
             delete_on_commit=bool(spec.get("delete_on_commit", True)),
             dedup_partition_by=spec.get("dedup_partition_by"),
             dedup_order_by_desc=spec.get("dedup_order_by_desc"),
+            producer=spec.get("producer"),
+            radiod_id=spec.get("radiod_id"),
         )
     if stype == "wspr_cycle":
         # Cycle-aligned source over sink.db: one RecordBatch per WSPR
