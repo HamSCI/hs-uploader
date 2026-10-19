@@ -276,7 +276,8 @@ def test_check_writes_nothing(tmp_path, capsys):
 
     rc = main(["migrate", "--db", str(db), "--check"])
 
-    assert rc == 0
+    # Exit 3: a migration is pending (sigmond's manifest step reads it).
+    assert rc == 3
     assert capsys.readouterr().out.splitlines() == [
         "watermarks.db: version 0",
         "  pending 1: record the schema version; changes no row and no table",
@@ -319,7 +320,8 @@ def test_check_on_a_crash_copy_says_so_and_writes_nothing(tmp_path, capsys):
 
     rc = main(["migrate", "--db", str(db), "--check"])
 
-    assert rc == 0
+    # Exit 3: only a writing migrate recovers the journal.
+    assert rc == 3
     assert capsys.readouterr().out.splitlines() == [
         "watermarks.db: a crash left a journal to recover; run hs-uploader "
         "migrate without --check (or start the daemon) to recover it"]
@@ -503,6 +505,7 @@ def test_exit_codes_from_a_real_process(tmp_path):
     first = _cli("migrate", "--db", str(db), "--keep-retry-for", PSK_PIPE)
     again = _cli("migrate", "--db", str(db))
     check = _cli("migrate", "--db", str(db), "--check")
+    missing = _cli("migrate", "--db", str(tmp_path / "none.db"), "--check")
     failed = _cli("migrate", "--db", str(junk))
     usage = _cli("migrate", "--bogus")
 
@@ -511,6 +514,7 @@ def test_exit_codes_from_a_real_process(tmp_path):
     assert again.returncode == 0 and "nothing to do" in again.stdout
     assert check.returncode == 0 and check.stdout.splitlines() == [
         "watermarks.db: version 2", "  nothing to do"]
+    assert missing.returncode == 0 and "not found" in missing.stdout
     assert failed.returncode == 1
     assert usage.returncode == 2 and "unrecognized arguments" in usage.stderr
 

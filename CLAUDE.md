@@ -204,7 +204,14 @@ the ordered `MIGRATIONS`, and `migrate(path, *, check=False, ctx=MigrateContext(
 - `--check` opens the file read-only and writes nothing.  On a hot
   journal it prints `watermarks.db: a crash left a journal to recover;
   run hs-uploader migrate without --check (or start the daemon) to
-  recover it` and exits 0 (`JournalRecoveryNeeded` in the library).
+  recover it` and exits 3 (`JournalRecoveryNeeded` in the library).
+- `--check` exits 3 when a real migrate would write anything: a pending
+  migration, a `psk-pskreporter` retry the pass would delete or move
+  (given the same `--sink` and `--keep-retry-for`), or a hot journal.  It
+  exits 0 when a migrate would write nothing, a missing file included.
+  sigmond's manifest step (spec-key-split-v373 §5.2 step 3) stops the
+  daemon and migrates only on 3; `MigrateReport.would_write` carries the
+  answer in the library.
 - A missing file: exit 0, and migrate creates nothing.  The daemon
   creates the store on its first start, as `hsupload`; a migrate run as
   root must not create it first.
@@ -230,7 +237,8 @@ the ordered `MIGRATIONS`, and `migrate(path, *, check=False, ctx=MigrateContext(
   Dead letters stay.  `--check` reports all of it and writes nothing.
 - To add a migration, append a `Migration` to `MIGRATIONS`; `SCHEMA_VERSION`
   follows.  Never edit a migration that has shipped.
-- Exit codes: 0 done or nothing to do, 1 failure, 2 usage error.  An
+- Exit codes: 0 done or nothing to do, 1 failure, 2 usage error, and
+  with `--check` 3 for "a migrate would write".  An
   hs-uploader that predates `migrate` also exits 2, and prints
   `invalid choice: 'migrate'` on stderr.
 

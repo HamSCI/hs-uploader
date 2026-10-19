@@ -15,7 +15,8 @@ Subcommands:
   schema version (``PRAGMA user_version``), then handle each retry still
   queued under ``psk-pskreporter``.  ``--check`` reports the version and
   what would run, and writes nothing.  Exit 0 done or nothing to do,
-  1 failure, 2 usage error.
+  1 failure, 2 usage error; ``--check`` exits 3 when a migrate would
+  write.
 
 Phase 1 is read-mostly: ``pump`` is **not** wired up here because there
 are no transports yet.  It will land in Phase 2 once
@@ -100,7 +101,8 @@ def _build_parser() -> argparse.ArgumentParser:
     sp_migrate.add_argument(
         "--check",
         action="store_true",
-        help="Report the version and the pending migrations; write nothing.",
+        help="Report the version and the pending migrations; write nothing.  "
+             "Exits 3 when a migrate would write, 0 when it would not.",
     )
     sp_migrate.add_argument(
         "--sink",
@@ -333,6 +335,13 @@ def _cmd_purge_dead_letters(args, store: SqliteWatermarkStore) -> int:
     return 0
 
 
+# `migrate --check` exits this when a real migrate would write: a pending
+# migration, a psk-pskreporter retry the pass would delete or move, or a
+# crash's journal to recover.  sigmond's manifest step stops the daemon
+# and migrates only then (spec-key-split-v373 §5.2 step 3).
+MIGRATE_CHECK_PENDING = 3
+
+
 def _cmd_migrate(args) -> int:
     from .watermark import schema
 
@@ -354,7 +363,7 @@ def _cmd_migrate(args) -> int:
         print("watermarks.db: a crash left a journal to recover; run "
               "hs-uploader migrate without --check (or start the daemon) "
               "to recover it")
-        return 0
+        return MIGRATE_CHECK_PENDING
     except Exception as exc:  # noqa: BLE001 -- any failure means exit 1
         print(f"hs-uploader migrate: {path}: {type(exc).__name__}: {exc}",
               file=sys.stderr)
@@ -371,6 +380,8 @@ def _cmd_migrate(args) -> int:
               f"{schema.SCHEMA_VERSION}; left as it stands")
     elif not report.applied and not report.pending and not report.lines:
         print("  nothing to do")
+    if args.check and report.would_write:
+        return MIGRATE_CHECK_PENDING
     return 0
 
 

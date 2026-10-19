@@ -130,6 +130,9 @@ class MigrateReport:
     # What the migrations and the retry pass copied, deleted, moved or
     # left, one line each; with check=True, what they would do.
     lines: list[str] = field(default_factory=list)
+    # check=True only: whether a migrate would write anything, a pending
+    # migration or a retry the pass would delete or move.
+    would_write: bool = False
 
 
 def _record_version_only(conn: sqlite3.Connection,
@@ -440,11 +443,14 @@ def _check(db: Path, ctx: MigrateContext) -> MigrateReport:
         for m in pending:
             if m.preview is not None:
                 lines.extend(m.preview(conn, ctx))
-        lines.extend(_retry_lines(_plan_retries(conn, ctx), done=False))
+        plan = _plan_retries(conn, ctx)
+        lines.extend(_retry_lines(plan, done=False))
     finally:
         conn.close()
-    return MigrateReport(from_version=current, to_version=current,
-                         pending=[m.name for m in pending], lines=lines)
+    return MigrateReport(
+        from_version=current, to_version=current,
+        pending=[m.name for m in pending], lines=lines,
+        would_write=bool(pending) or any(a.action != "stay" for a in plan))
 
 
 def migrate(path: str, *, check: bool = False,

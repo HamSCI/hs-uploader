@@ -462,6 +462,21 @@ def test_cli_passes_sink_and_keep_retry_for(tmp_path, capsys):
     assert rc == 1
 
 
+def test_check_exit_code_says_whether_a_migrate_would_write(tmp_path, capsys):
+    # sigmond's manifest step stops the daemon only when this says 3.
+    db = _store_v1(tmp_path)
+    assert main(["migrate", "--db", str(db), "--check"]) == 3   # migration 2
+    assert main(["migrate", "--db", str(db)]) == 0
+    assert main(["migrate", "--db", str(db), "--check"]) == 0   # current
+    _retry(db)
+    # A retry with nowhere to go stays: a migrate would write nothing.
+    assert main(["migrate", "--db", str(db), "--check"]) == 0
+    # The same retry, with a pipeline to move to: a migrate would move it.
+    assert main(["migrate", "--db", str(db), "--check",
+                 "--keep-retry-for", MS_PIPE]) == 3
+    capsys.readouterr()
+
+
 # ---- end to end: neither re-send nor skip ------------------------------------------
 
 

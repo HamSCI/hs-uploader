@@ -110,7 +110,7 @@ schema version in `PRAGMA user_version`.  `hs-uploader migrate` brings
 the store up to the version this release knows:
 
 ```bash
-hs-uploader migrate --check     # print the version and what would run; write nothing
+hs-uploader migrate --check     # print the version and what would run; write nothing; exit 3 if a migrate would write
 hs-uploader migrate             # run each pending migration once, in order
 hs-uploader migrate --db PATH   # act on another file (default: --state, else the path above)
 ```
