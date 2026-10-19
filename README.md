@@ -103,6 +103,43 @@ pip install -e ".[dev,wsprdaemon,wsprnet,pskreporter,psws]"
 
 Optional extras let consuming clients pull only the transports they use.
 
+## Send records: one key per producer
+
+A send record is the cursor that says how far one pipeline has sent.  The
+store keeps one per `(source, destination, table)`.  The source part of
+the key names what the pipeline reads:
+
+- `sqlite:<db>.<table>` reads every row of the table.
+- `sqlite:<db>.<table>@<producer>` reads one client's rows.
+- `sqlite:<db>.<table>@<producer>/<radiod_id>` reads one client's rows on
+  one radiod instance.
+
+A pipeline sets `producer` (and, for a multi-instance host, `radiod_id`)
+on its SQLite source to take the second or third form.  Two clients that
+send to the same destination then keep two records, and one never moves
+the other's cursor.  The pskreporter pipelines show this.  Sigmond renders
+`psk-recorder-pskreporter` (modes ft8 and ft4, key
+`sqlite:psk.spots@psk-recorder`) and `meteor-scatter-pskreporter` (mode
+msk144, key `sqlite:psk.spots@meteor-scatter`).  A row with an empty
+`producer` belongs to meteor-scatter when its mode is msk144, and to
+psk-recorder otherwise.
+
+A send record moves forward only.  A new cursor that lies before the
+stored one changes nothing.  The pipeline logs "acked, record held",
+once per interval per key.  If the cursor comparison itself raises, the
+store writes the cursor anyway and logs the error, so a broken comparison
+never freezes a pipeline.
+
+A pipeline with a `producer` needs store version 2.  On an older store the
+daemon refuses that pipeline, runs the others, and records the refusal in
+the store's `pipeline_state` table.  `hs-uploader status` prints it.
+`hs-uploader capabilities` prints the store version this release writes.
+
+`hs-uploader status` marks a superseded key `[SUPERSEDED by ...]`, and
+counts dead letters whose pipeline the manifest no longer builds as
+orphaned.  `reset-cursor` refuses a superseded key and names the keys to
+reset instead.
+
 ## The store's schema version: `hs-uploader migrate`
 
 The watermark store, `/var/lib/hs-uploader/watermarks.db`, records its
@@ -113,18 +150,41 @@ the store up to the version this release knows:
 hs-uploader migrate --check     # print the version and what would run; write nothing; exit 3 if a migrate would write
 hs-uploader migrate             # run each pending migration once, in order
 hs-uploader migrate --db PATH   # act on another file (default: --state, else the path above)
+hs-uploader migrate --sink PATH --keep-retry-for NAME   # settle a queued psk-pskreporter retry
 ```
 
 Run it once the new code sits in place and before the daemon restarts.
-Neither the daemon nor the store migrates on its own.  Version 1, which
-v3.70 introduced, changes no row and no table.  On a missing file,
-`migrate` says so, creates nothing and leaves the file for the daemon to
-create.  A crash in the middle of a write can leave
+Neither the daemon nor the store migrates on its own.  Sigmond's manifest
+step (`smd admin uploader manifest`) stops the daemon, runs the migrate and
+starts the daemon again.
+
+- Version 1 changes no row and no table.  It records the number.
+- Version 2 copies each record keyed `sqlite:psk.spots` with a pskreporter
+  destination to both producer keys, unless a record already sits there.
+  The old row stays, frozen, and the store records which keys superseded it
+  in `superseded_keys`.
+- The retry pass runs on every migrate.  It handles a retry still queued
+  under `psk-pskreporter`.  With `--sink PATH`, a retry whose rows the sink
+  still holds is deleted, and each new pipeline re-reads those rows.
+  Otherwise the retry moves to the pipeline named by `--keep-retry-for`
+  (`psk-recorder-pskreporter` or `meteor-scatter-pskreporter`).  Without
+  that flag the retry stays.  Dead letters stay.
+- `--check` exits 3 when a migrate would write: a pending migration, a retry
+  the pass would delete or move, or a hot journal.  It exits 0 when a
+  migrate would write nothing.
+
+On a missing file, `migrate` says so, creates nothing and leaves the file
+for the daemon to create.  A crash in the middle of a write can leave
 `watermarks.db-journal` beside the store.  `migrate` rolls that journal
 back first, as the daemon does when it opens the store.  `--check` cannot
-roll it back read-only, so it says so, changes nothing and exits 0.  The
+roll it back read-only, so it says so, changes nothing and exits 3.  The
 command exits 0 when it finished or found nothing to do, 1 when it
 failed, and 2 on a usage error.
+
+`scripts/prove_key_split.py --sink SINK.db --store WM.db` checks the split
+against a copy of a station's files.  It runs the old shared source and the
+two new sources over the copy, and exits 0 when the two new row sets are
+disjoint and their union equals the old set.
 
 ## License
 

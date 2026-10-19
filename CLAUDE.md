@@ -186,9 +186,11 @@ version.  `src/hs_uploader/watermark/schema.py` owns it: `SCHEMA_VERSION`,
 the ordered `MIGRATIONS`, and `migrate(path, *, check=False, ctx=MigrateContext())
 -> MigrateReport`.
 
-- Only `hs-uploader migrate` migrates.  `SqliteWatermarkStore`'s
-  constructor never reads or writes `user_version`, and the daemon never
-  migrates while it starts (D10 in sigmond/tasks/plan-sink-control.md).
+- Only `hs-uploader migrate` migrates.  The store constructor never
+  writes `user_version` and the daemon never migrates while it starts
+  (D10 in sigmond/tasks/plan-sink-control.md).  The daemon does read the
+  version: it refuses a pipeline with a `producer` on a store below
+  version 2 and records that in `pipeline_state`.
   From v3.70, sigmond runs `hs-uploader migrate` on each manifest write
   (`smd admin uploader manifest`, which `smd apply`, `smd align`,
   bring-up, `smd sink …` and `smd admin manifest restore` run), after
