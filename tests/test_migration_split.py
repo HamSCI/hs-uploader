@@ -522,3 +522,119 @@ def test_end_to_end_no_resend_no_skip(tmp_path, with_column):
         assert sorted(shipped) == expected            # exactly once each
         assert len(shipped) == len(set(shipped))
     assert transports[PSK].shipped and transports[MS].shipped
+
+
+# ---- every migrate fills a missing producer key (final review I1) -------------------
+
+
+def _store_v2_shared(directory: Path, *, cursor: bytes = b"5") -> Path:
+    """A store the daemon created (born at version 2, no producer keys),
+    which a shared ``psk-pskreporter`` pipeline then used."""
+    directory.mkdir(parents=True, exist_ok=True)
+    db = directory / "watermarks.db"
+    s = SqliteWatermarkStore(db)
+    assert s.schema_version() == 2
+    s._write_cursor(*OLD, cursor=cursor, last_ack=OLD_ACK)
+    s.close()
+    return db
+
+
+def test_every_migrate_copies_the_old_record_to_a_missing_producer_key(tmp_path):
+    db = _store_v2_shared(tmp_path)
+    s = SqliteWatermarkStore(db)
+    s._write_cursor(*NEW_PSK, cursor=b"9", last_ack="2026-10-18T12:30:00+00:00")
+    s.close()
+
+    report = schema.migrate(str(db))
+
+    assert report.applied == []
+    rows = _watermarks(db)
+    assert rows[NEW_PSK] == (b"9", "2026-10-18T12:30:00+00:00")   # never touched
+    assert rows[NEW_MS] == (b"5", OLD_ACK)                        # filled
+    assert rows[OLD] == (b"5", OLD_ACK)
+    assert [r[:6] for r in _table(db, "superseded_keys")] == [(*OLD, *NEW_MS)]
+    assert any("copied" in line and NEW_MS[0] in line for line in report.lines)
+
+    # Nothing missing now: the next migrate writes nothing.
+    assert schema.migrate(str(db)).lines == []
+
+
+def test_check_reports_a_missing_producer_key_as_pending(tmp_path, capsys):
+    db = _store_v2_shared(tmp_path)
+    before = db.read_bytes()
+
+    report = schema.migrate(str(db), check=True)
+
+    assert db.read_bytes() == before
+    assert report.pending == [] and report.would_write
+    assert any("would copy" in line and NEW_PSK[0] in line for line in report.lines)
+    assert main(["migrate", "--db", str(db), "--check"]) == 3
+    assert main(["migrate", "--db", str(db)]) == 0
+    assert main(["migrate", "--db", str(db), "--check"]) == 0
+    capsys.readouterr()
+
+
+def test_retry_moved_not_deleted_while_a_producer_key_is_missing(tmp_path,
+                                                                monkeypatch):
+    # The guard on its own: with the copy disabled, the sink's proof alone
+    # must not delete the retry.
+    monkeypatch.setattr(schema, "_fill_missing_producer_keys",
+                        lambda conn, *, write: [])
+    db = _store_v2_shared(tmp_path)
+    _retry(db)
+    sink = _sink(tmp_path / "sink.db", _psk_rows(range(5, 11)))
+
+    report = schema.migrate(str(db), ctx=MigrateContext(
+        sink_path=sink, keep_retry_for=PSK_PIPE))
+
+    (after,) = _deliverables(db)
+    assert after[1] == PSK_PIPE
+    assert any("moved" in line and "producer key" in line
+               for line in report.lines)
+
+
+def test_v2_born_shared_store_splits_without_a_skip(tmp_path):
+    # Final review I1, its reproduction: a version-2 store with no producer
+    # keys, used by the shared pipeline, then split with a queued retry.
+    sink = tmp_path / "sink.db"
+    truth = _build(sink, with_column=True)
+    _tag_ids(sink)
+    ids = sorted(truth)
+    L, X = ids[len(ids) // 3], ids[2 * len(ids) // 3]
+    db = _store_v2_shared(tmp_path / "state", cursor=str(L).encode())
+    s = SqliteWatermarkStore(db)
+    s.enqueue_deliverable(
+        pipeline="psk-pskreporter", payload_blob=b"RETRY",
+        enqueued_at="2026-10-18T12:01:00+00:00",
+        next_attempt_at="2000-01-01T00:00:00+00:00",
+        cursor_after=str(X).encode(), commit_token=str(X).encode(),
+        source_id=OLD[0], dest_id=OLD[1], table=OLD[2])
+    s.close()
+
+    schema.migrate(str(db), ctx=MigrateContext(sink_path=sink,
+                                               keep_retry_for=PSK_PIPE))
+
+    store = SqliteWatermarkStore(db)
+    transports, pipes = {}, []
+    for name, producer in ((PSK_PIPE, PSK), (MS_PIPE, MS)):
+        transports[producer] = _Pskreporter()
+        pipes.append(Pipeline(
+            name=name,
+            source=_src(sink, producer=producer, delete_on_commit=False,
+                        start_at="now"),
+            transport=transports[producer], watermark=store, identity=_ident(),
+            batch_limit=2))
+    uploader = Uploader(pipes)
+    try:
+        uploader.pump_until_idle()
+    finally:
+        uploader.close()
+
+    for producer, transport in transports.items():
+        shipped = [r.columns["_id"] for b in transport.shipped for r in b.records]
+        replayed = len(transport.replayed)
+        expected = sorted(i for i, t in truth.items()
+                          if i > L and t["owner"] == producer)
+        assert sorted(shipped) == expected, producer   # nothing skipped
+        assert len(shipped) == len(set(shipped))
+        assert replayed == 0

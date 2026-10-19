@@ -208,7 +208,7 @@ the ordered `MIGRATIONS`, and `migrate(path, *, check=False, ctx=MigrateContext(
   run hs-uploader migrate without --check (or start the daemon) to
   recover it` and exits 3 (`JournalRecoveryNeeded` in the library).
 - `--check` exits 3 when a real migrate would write anything: a pending
-  migration, a `psk-pskreporter` retry the pass would delete or move
+  migration, a producer key to fill, a `psk-pskreporter` retry the pass would delete or move
   (given the same `--sink` and `--keep-retry-for`), or a hot journal.  It
   exits 0 when a migrate would write nothing, a missing file included.
   sigmond's manifest step (spec-key-split-v373 §5.2 step 3) stops the
@@ -229,10 +229,16 @@ the ordered `MIGRATIONS`, and `migrate(path, *, check=False, ctx=MigrateContext(
   `sqlite:psk.spots@meteor-scatter`, unless a record already sits there.
   The old row stays, frozen, and `superseded_keys` pairs each old key
   with each new one (spec-key-split-v373 §4.4).
-- The retry pass runs on every migrate, after the migrations and in the
-  same transaction.  For each retry still queued under `psk-pskreporter`:
-  when `--sink PATH` shows the sink still holds a `psk.spots` row at or
-  before the old record, it deletes the retry; otherwise it moves the
+- Every migrate at version 2 or above (up to this code's) then copies the
+  old record to any producer key that holds no record yet, and records it
+  in `superseded_keys`; it never touches an existing key.  A store the
+  daemon created stands at version 2 with no producer keys (final review
+  I1).  `--check` counts that copy as a write.
+- The retry pass runs on every migrate, after the migrations and the
+  copy, in the same transaction.  For each retry still queued under
+  `psk-pskreporter`: when `--sink PATH` shows the sink still holds a
+  `psk.spots` row at or before the old record, and both producer keys
+  hold a record, it deletes the retry; otherwise it moves the
   retry whole to `--keep-retry-for NAME` (one of the two new pipelines),
   under that pipeline's source part; with no `--keep-retry-for` the retry
   stays.  When nothing needs a write, migrate takes no write lock.

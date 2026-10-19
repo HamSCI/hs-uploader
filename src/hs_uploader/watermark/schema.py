@@ -36,13 +36,20 @@ two producer keys, ``sqlite:psk.spots@psk-recorder`` and
 there.  The old row stays, frozen, and ``superseded_keys`` records each
 old key beside each new one.
 
-The retry pass runs after the versioned migrations on every migrate that
-writes, at version 2 as at version 1, inside the same transaction (spec
-§4.4 item 4, §6).  It handles each deliverable still queued under
-``psk-pskreporter``:
+Every migrate that writes, at a version from 2 up to this code's, first
+copies each old pskreporter record to any producer key that holds no
+record yet, and records the pair in ``superseded_keys``.  It never
+touches a key that exists.  A store the daemon created stands at version
+2 with no producer keys; a shared pipeline may then have used it, and
+without the copy each producer pipeline would start at "now" (final
+review I1).
 
-* the sink still holds its rows: delete it, and each new pipeline
-  re-reads its own rows;
+The retry pass runs after that, on every migrate that writes, at version
+2 as at version 1, inside the same transaction (spec §4.4 item 4, §6).
+It handles each deliverable still queued under ``psk-pskreporter``:
+
+* the sink still holds its rows and both producer keys hold a record:
+  delete it, and each new pipeline re-reads its own rows;
 * otherwise, with ``keep_retry_for`` named: move it whole to that
   pipeline, under that pipeline's source part;
 * otherwise: leave it where it stands, and say so.
@@ -184,6 +191,23 @@ def _key(source_id: str, dest_id: str, table: str) -> str:
     return f"({source_id}, {dest_id}, {table})"
 
 
+def _old_pskreporter_records(conn: sqlite3.Connection) -> list[tuple]:
+    """Each send record under the old source part with a pskreporter
+    destination: (source_id, dest_id, table_name, cursor, last_ack)."""
+    return conn.execute(
+        "SELECT source_id, dest_id, table_name, cursor, last_ack "
+        "FROM watermarks WHERE source_id = ? AND dest_id LIKE 'pskreporter%' "
+        "ORDER BY dest_id, table_name", (OLD_PSK_SOURCE,)).fetchall()
+
+
+def _has_record(conn: sqlite3.Connection, source_id: str, dest_id: str,
+                table: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM watermarks "
+        "WHERE source_id = ? AND dest_id = ? AND table_name = ?",
+        (source_id, dest_id, table)).fetchone() is not None
+
+
 def _split_pskreporter(conn: sqlite3.Connection, ctx: MigrateContext, *,
                        write: bool = True) -> list[str]:
     """Copy each shared pskreporter send record to both producer keys.
@@ -197,10 +221,7 @@ def _split_pskreporter(conn: sqlite3.Connection, ctx: MigrateContext, *,
         conn.execute(_SUPERSEDED_KEYS_DDL)
     now = datetime.now(timezone.utc).isoformat()
     lines: list[str] = []
-    olds = conn.execute(
-        "SELECT source_id, dest_id, table_name, cursor, last_ack "
-        "FROM watermarks WHERE source_id = ? AND dest_id LIKE 'pskreporter%' "
-        "ORDER BY dest_id, table_name", (OLD_PSK_SOURCE,)).fetchall()
+    olds = _old_pskreporter_records(conn)
     for src, dest, table, cursor, last_ack in olds:
         for new_src in NEW_PSKREPORTER_PIPELINES.values():
             existing = conn.execute(
@@ -247,6 +268,61 @@ MIGRATIONS: tuple[Migration, ...] = (
 )
 
 
+# ---- every migrate: fill a missing producer key (spec §4.4 item 4) --------
+
+
+def _fill_missing_producer_keys(conn: sqlite3.Connection, *,
+                                write: bool) -> list[str]:
+    """Copy each old pskreporter send record to any producer key that
+    holds no record yet, and record the pair in ``superseded_keys``.
+
+    Migration 2 runs once.  A store the daemon created stands at version 2
+    with no producer keys, and a shared pipeline may then have used it.
+    Without this copy, each producer pipeline would start at its own
+    anchor ("now") and skip the rows the shared pipeline had not sent
+    (final review I1).  The copy fills only a missing key, with a position
+    the old pipeline has acked through.  It never touches a key that
+    exists, so it never moves a producer's record.  With ``write=False``
+    it only reads and reports what it would do.
+    """
+    if not _has_table(conn, "watermarks"):
+        return []
+    now = datetime.now(timezone.utc).isoformat()
+    lines: list[str] = []
+    made_table = False
+    for src, dest, table, cursor, last_ack in _old_pskreporter_records(conn):
+        for new_src in NEW_PSKREPORTER_PIPELINES.values():
+            if _has_record(conn, new_src, dest, table):
+                continue
+            if write:
+                if not made_table:
+                    conn.execute(_SUPERSEDED_KEYS_DDL)
+                    made_table = True
+                conn.execute(
+                    "INSERT INTO watermarks (source_id, dest_id, "
+                    "table_name, cursor, last_ack) VALUES (?,?,?,?,?)",
+                    (new_src, dest, table, cursor, last_ack))
+                conn.execute(
+                    "INSERT OR IGNORE INTO superseded_keys (old_source_id, "
+                    "old_dest_id, old_table, new_source_id, new_dest_id, "
+                    "new_table, migrated_at) VALUES (?,?,?,?,?,?,?)",
+                    (src, dest, table, new_src, dest, table, now))
+            lines.append(
+                f"{'copied' if write else 'would copy'} send record "
+                f"{_key(src, dest, table)} (cursor {_show(cursor)}, "
+                f"last_ack {last_ack}) to {_key(new_src, dest, table)}: "
+                "that producer key held no record")
+    return lines
+
+
+def _fills(version: int) -> bool:
+    """Whether a store at ``version`` gets the fill: one this code knows,
+    from version 2 (the split) up.  A newer store stays as it stands; the
+    retry pass's own guard still refuses to delete a retry there while a
+    producer key is missing."""
+    return 2 <= version <= max(m.version for m in MIGRATIONS)
+
+
 # ---- the retry pass: every migrate, not once (spec §4.4 item 4, §6) -------
 
 
@@ -266,13 +342,15 @@ def _has_table(conn: sqlite3.Connection, name: str) -> bool:
 
 
 def _old_last_id(conn: sqlite3.Connection, source_id: str, dest_id: str,
-                 table: str) -> tuple[Optional[int], str]:
-    """The row id the old send record names for this retry, or None and why.
+                 table: str) -> tuple[Optional[int], str, tuple[str, str]]:
+    """The row id the old send record names for this retry, or None and
+    why, and the record's (dest_id, table_name).
 
     A keyless retry (queued before v3.70) names no destination; it counts
     only when exactly one pskreporter record exists under the old source.
     """
-    sql = ("SELECT cursor FROM watermarks WHERE source_id = ? "
+    sql = ("SELECT cursor, dest_id, table_name FROM watermarks "
+           "WHERE source_id = ? "
            "AND dest_id LIKE 'pskreporter%'")
     params: list = [source_id or OLD_PSK_SOURCE]
     if dest_id:
@@ -284,16 +362,18 @@ def _old_last_id(conn: sqlite3.Connection, source_id: str, dest_id: str,
     rows = conn.execute(sql, params).fetchall()
     if len(rows) != 1:
         return None, (f"{len(rows)} old pskreporter send records match it, "
-                      "so its position cannot be told")
-    raw = rows[0][0]
+                      "so its position cannot be told"), ("", "")
+    raw, rdest, rtable = rows[0]
+    where = (rdest, rtable)
     if not raw:
-        return None, "the old send record is empty, so its position cannot be told"
+        return None, ("the old send record is empty, so its position cannot "
+                      "be told"), where
     from ..sources.sqlite import _Cursor
     try:
-        return _Cursor.from_bytes(bytes(raw)).last_id, ""
+        return _Cursor.from_bytes(bytes(raw)).last_id, "", where
     except (TypeError, ValueError):
         return None, (f"the old send record's cursor {_show(raw)} is not a "
-                      "row id, so its position cannot be told")
+                      "row id, so its position cannot be told"), where
 
 
 def _sink_holds(sink_path: Optional[Path], last_id: int) -> tuple[bool, str]:
@@ -321,9 +401,22 @@ def _sink_holds(sink_path: Optional[Path], last_id: int) -> tuple[bool, str]:
                   f"({last_id}) on, so each new pipeline re-reads its own")
 
 
-def _plan_retries(conn: sqlite3.Connection,
-                  ctx: MigrateContext) -> list[_RetryAction]:
-    """Decide, reading only, what to do with each retry under the old name."""
+def _missing_producer_keys(conn: sqlite3.Connection, dest_id: str,
+                           table: str) -> list[str]:
+    return [src for src in NEW_PSKREPORTER_PIPELINES.values()
+            if not _has_record(conn, src, dest_id, table)]
+
+
+def _plan_retries(conn: sqlite3.Connection, ctx: MigrateContext, *,
+                  assume_filled: bool = False) -> list[_RetryAction]:
+    """Decide, reading only, what to do with each retry under the old name.
+
+    A retry may be deleted only when both producer keys exist: a pipeline
+    without its key starts at its own anchor and would skip the retry's
+    rows (final review I1).  ``assume_filled`` reads them as existing, for
+    a read before ``_fill_missing_producer_keys`` runs; that copy fills
+    them from the very record that gives the retry its position.
+    """
     if not _has_table(conn, "deliverables"):
         return []
     plan: list[_RetryAction] = []
@@ -331,10 +424,18 @@ def _plan_retries(conn: sqlite3.Connection,
             "SELECT id, source_id, dest_id, table_name, cursor_after "
             "FROM deliverables WHERE pipeline = ? ORDER BY id",
             (OLD_PSKREPORTER_PIPELINE,)).fetchall():
-        last_id, why = _old_last_id(conn, src or "", dest or "", table or "")
+        last_id, why, (rdest, rtable) = _old_last_id(
+            conn, src or "", dest or "", table or "")
         holds = False
         if last_id is not None:
             holds, why = _sink_holds(ctx.sink_path, last_id)
+        if holds and not assume_filled:
+            missing = _missing_producer_keys(conn, rdest, rtable)
+            if missing:
+                holds = False
+                why = (f"no send record under producer key "
+                       f"{', '.join(missing)}, so that pipeline would start "
+                       "at its own anchor and could skip the retry's rows")
         after = bytes(cursor_after or b"")
         if holds:
             plan.append(_RetryAction(rid, after, "delete", "", "", why))
@@ -443,25 +544,32 @@ def _check(db: Path, ctx: MigrateContext) -> MigrateReport:
         for m in pending:
             if m.preview is not None:
                 lines.extend(m.preview(conn, ctx))
-        plan = _plan_retries(conn, ctx)
+        final = max([current] + [m.version for m in pending])
+        # A pending migration 2 copies every missing key itself, so the
+        # fill would find nothing left to copy after it.
+        fill = (_fill_missing_producer_keys(conn, write=False)
+                if _fills(final) and not pending else [])
+        lines.extend(fill)
+        plan = _plan_retries(conn, ctx, assume_filled=_fills(final))
         lines.extend(_retry_lines(plan, done=False))
     finally:
         conn.close()
     return MigrateReport(
         from_version=current, to_version=current,
         pending=[m.name for m in pending], lines=lines,
-        would_write=bool(pending) or any(a.action != "stay" for a in plan))
+        would_write=(bool(pending) or bool(fill)
+                     or any(a.action != "stay" for a in plan)))
 
 
 def migrate(path: str, *, check: bool = False,
             ctx: MigrateContext = MigrateContext()) -> MigrateReport:
-    """Bring the store at ``path`` to ``SCHEMA_VERSION``, then run the
-    retry pass.
+    """Bring the store at ``path`` to ``SCHEMA_VERSION``, fill any missing
+    producer key, then run the retry pass.
 
     ``check=True`` opens the file read-only and reports what would run,
-    the retry pass included.  A store already at, or above, this code's
-    version, with no retry under ``psk-pskreporter`` to delete or move,
-    needs nothing and gets no write lock: a station rolled back from a
+    the fill and the retry pass included.  A store already at, or above,
+    this code's version, with no producer key to fill and no retry under
+    ``psk-pskreporter`` to delete or move, needs nothing and gets no write lock: a station rolled back from a
     newer release keeps its newer number.  ``ctx`` names the sink and the
     pipeline that keeps a retry (``MigrateContext``); a ``keep_retry_for``
     outside ``NEW_PSKREPORTER_PIPELINES`` raises ValueError before any
@@ -491,8 +599,10 @@ def migrate(path: str, *, check: bool = False,
     conn = _connect(db, "rw")
     try:
         current = _inspect(conn, db)
-        plan = _plan_retries(conn, ctx)
+        plan = _plan_retries(conn, ctx, assume_filled=_fills(current))
         if (not any(m.version > current for m in MIGRATIONS)
+                and not (_fills(current)
+                         and _fill_missing_producer_keys(conn, write=False))
                 and all(a.action == "stay" for a in plan)):
             # Nothing to do: no write lock taken, no byte written.  A
             # retry that stays still gets its line.
@@ -514,6 +624,10 @@ def migrate(path: str, *, check: bool = False,
                 conn.execute("PRAGMA user_version = %d" % m.version)
                 version = m.version
                 applied.append(m.name)
+            # Every migrate: fill a missing producer key before the retry
+            # pass, so a deleted retry's rows get re-read (spec §4.4 item 4).
+            if _fills(version):
+                lines.extend(_fill_missing_producer_keys(conn, write=True))
             # The retry pass, decided again under the lock.
             plan = _plan_retries(conn, ctx)
             _apply_retries(conn, plan)

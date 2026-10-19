@@ -163,14 +163,22 @@ starts the daemon again.
   destination to both producer keys, unless a record already sits there.
   The old row stays, frozen, and the store records which keys superseded it
   in `superseded_keys`.
-- The retry pass runs on every migrate.  It handles a retry still queued
-  under `psk-pskreporter`.  With `--sink PATH`, a retry whose rows the sink
-  still holds is deleted, and each new pipeline re-reads those rows.
+- Every migrate also copies the old record to a producer key that holds no
+  record yet, and records it in `superseded_keys`.  It never touches a key
+  that exists.  A store the daemon created stands at version 2 with no
+  producer keys, and without this copy each producer pipeline would start
+  at "now" and skip the rows the shared pipeline had not sent.
+- The retry pass runs on every migrate, after that copy.  It handles a
+  retry still queued under `psk-pskreporter`.  With `--sink PATH`, a retry
+  whose rows the sink still holds is deleted, and each new pipeline
+  re-reads those rows.  It deletes one only when both producer keys hold a
+  record.
   Otherwise the retry moves to the pipeline named by `--keep-retry-for`
   (`psk-recorder-pskreporter` or `meteor-scatter-pskreporter`).  Without
   that flag the retry stays.  Dead letters stay.
-- `--check` exits 3 when a migrate would write: a pending migration, a retry
-  the pass would delete or move, or a hot journal.  It exits 0 when a
+- `--check` exits 3 when a migrate would write: a pending migration, a
+  producer key to fill, a retry the pass would delete or move, or a hot
+  journal.  It exits 0 when a
   migrate would write nothing.
 
 On a missing file, `migrate` says so, creates nothing and leaves the file
