@@ -174,7 +174,8 @@ CREATE TABLE IF NOT EXISTS superseded_keys (
     new_dest_id   TEXT NOT NULL,
     new_table     TEXT NOT NULL,
     migrated_at   TEXT NOT NULL,
-    PRIMARY KEY (old_source_id, old_dest_id, old_table, new_source_id)
+    PRIMARY KEY (old_source_id, old_dest_id, old_table,
+                 new_source_id, new_dest_id, new_table)
 )
 """
 

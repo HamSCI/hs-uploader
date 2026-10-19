@@ -718,3 +718,41 @@ def test_a_moved_retry_without_cursor_after_says_both_producers_resend(tmp_path)
     _retry(db)
     report = schema.migrate(str(db), ctx=MigrateContext(keep_retry_for=PSK_PIPE))
     assert not any("re-send" in l for l in report.lines)
+
+
+# ---- superseded_keys keys on the whole new key (final review M8) -------------------
+
+
+def _two_successors_by_destination(db: Path) -> list[tuple]:
+    conn = sqlite3.connect(db)
+    try:
+        for dest in ("pskreporter-tcp:a:4739", "pskreporter-tcp:b:4739"):
+            conn.execute(
+                "INSERT OR IGNORE INTO superseded_keys VALUES (?,?,?,?,?,?,?)",
+                (*OLD, NEW_PSK[0], dest, NEW_PSK[2], "t"))
+        conn.commit()
+        return conn.execute(
+            "SELECT new_dest_id FROM superseded_keys ORDER BY 1").fetchall()
+    finally:
+        conn.close()
+
+
+def test_superseded_keys_keeps_successors_that_differ_only_by_destination(tmp_path):
+    # The store's own schema, on a new file.
+    fresh = tmp_path / "fresh" / "watermarks.db"
+    fresh.parent.mkdir()
+    SqliteWatermarkStore(fresh).close()
+    assert len(_two_successors_by_destination(fresh)) == 2
+
+    # Migration 2's CREATE, on a version-1 file without the table.
+    db = _store_v1(tmp_path / "v1", others=False)
+    conn = sqlite3.connect(db)
+    conn.execute("DROP TABLE superseded_keys")
+    conn.commit()
+    conn.close()
+    schema.migrate(str(db))
+    conn = sqlite3.connect(db)
+    conn.execute("DELETE FROM superseded_keys")
+    conn.commit()
+    conn.close()
+    assert len(_two_successors_by_destination(db)) == 2
