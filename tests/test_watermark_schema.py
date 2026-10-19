@@ -96,6 +96,51 @@ def _set_version(db: Path, n: int) -> None:
         conn.close()
 
 
+PSK_PIPE = "psk-recorder-pskreporter"
+NEW_PSK_KEYS = [("sqlite:psk.spots@meteor-scatter", *PSK_KEY[1:]),
+                ("sqlite:psk.spots@psk-recorder", *PSK_KEY[1:])]
+
+_V0_STORE_LINES = [
+    "  applied 1: record the schema version; changes no row and no table",
+    "  applied 2: split the pskreporter send record by producer",
+    "  copied send record (sqlite:psk.spots, "
+    "pskreporter-tcp:report.pskreporter.info:4739, psk.spots) (cursor 1204, "
+    "last_ack 2026-10-07T12:00:00+00:00) to (sqlite:psk.spots@psk-recorder, "
+    "pskreporter-tcp:report.pskreporter.info:4739, psk.spots)",
+    "  copied send record (sqlite:psk.spots, "
+    "pskreporter-tcp:report.pskreporter.info:4739, psk.spots) (cursor 1204, "
+    "last_ack 2026-10-07T12:00:00+00:00) to (sqlite:psk.spots@meteor-scatter, "
+    "pskreporter-tcp:report.pskreporter.info:4739, psk.spots)",
+]
+_RETRY_STAYS = (
+    "  retry 1 (psk-pskreporter, cursor_after 1205): stays under "
+    "psk-pskreporter; no --sink given, and no --keep-retry-for names a "
+    "pipeline to move it to")
+
+
+def _only_migration_1(monkeypatch) -> None:
+    """Run migration 1 alone, for tests of what it, or the runner, does
+    to a file byte by byte.  Migration 2's rows: test_migration_split.py."""
+    monkeypatch.setattr(schema, "MIGRATIONS", schema.MIGRATIONS[:1])
+
+
+def _assert_kept_and_split(before: dict, after: dict) -> None:
+    """Every row survives; migration 2 adds only the two producer copies
+    of the pskreporter record and their superseded_keys rows."""
+    assert set(after) == set(before)
+    for name in before:
+        if name in ("watermarks", "superseded_keys"):
+            continue
+        assert after[name] == before[name], name
+    added = [r for r in after["watermarks"] if r not in before["watermarks"]]
+    assert set(before["watermarks"]) <= set(after["watermarks"])
+    old = next(r for r in before["watermarks"] if tuple(r[:3]) == PSK_KEY)
+    assert sorted(added) == sorted((*k, *old[3:]) for k in NEW_PSK_KEYS)
+    assert before["superseded_keys"] == []
+    assert sorted(r[:6] for r in after["superseded_keys"]) == sorted(
+        (*PSK_KEY, *k) for k in NEW_PSK_KEYS)
+
+
 def _rows(db: Path) -> dict:
     """Every row of every table, BLOBs as bytes, plus the schema itself."""
     conn = sqlite3.connect(db)
@@ -151,7 +196,7 @@ def _crash_copy(directory: Path) -> tuple[Path, dict]:
 def test_versions_run_from_1_to_schema_version_without_gaps():
     assert [m.version for m in schema.MIGRATIONS] == list(
         range(1, schema.SCHEMA_VERSION + 1))
-    assert schema.SCHEMA_VERSION == 1
+    assert schema.SCHEMA_VERSION == 2
 
 
 def test_busy_timeout_constant_is_at_least_30_s():
@@ -161,7 +206,7 @@ def test_busy_timeout_constant_is_at_least_30_s():
 # ---- migrate ----
 
 
-def test_fresh_store_file_migrates_to_version_1(tmp_path, capsys):
+def test_fresh_store_file_migrates_to_the_current_version(tmp_path, capsys):
     db = tmp_path / "watermarks.db"
     SqliteWatermarkStore(db).close()
     _set_version(db, 0)    # a file as v3.69 created it
@@ -169,14 +214,19 @@ def test_fresh_store_file_migrates_to_version_1(tmp_path, capsys):
     rc = main(["migrate", "--db", str(db)])
 
     assert rc == 0
-    assert _version(db) == 1
+    assert _version(db) == schema.SCHEMA_VERSION
     out = capsys.readouterr().out.splitlines()
-    assert out[0] == "watermarks.db: version 1"
+    assert out[0] == "watermarks.db: version 2"
     assert out[1:] == [
-        "  applied 1: record the schema version; changes no row and no table"]
+        "  applied 1: record the schema version; changes no row and no table",
+        "  applied 2: split the pskreporter send record by producer",
+        "  no pskreporter send record under sqlite:psk.spots; nothing to copy"]
 
 
-def test_migrate_keeps_every_row_of_a_v0_store(tmp_path):
+def test_migration_1_keeps_every_byte_of_a_v0_store(tmp_path, monkeypatch):
+    # The retry pass leaves the psk-pskreporter retry where it stands
+    # (no --keep-retry-for), so it writes nothing either.
+    _only_migration_1(monkeypatch)
     db = _v0_store(tmp_path)
     rows_before = _rows(db)
     bytes_before = db.read_bytes()
@@ -198,21 +248,23 @@ def test_migrate_keeps_every_row_of_a_v0_store(tmp_path):
 
 def test_second_run_changes_nothing(tmp_path, capsys):
     db = _v0_store(tmp_path)
-    assert main(["migrate", "--db", str(db)]) == 0
+    keep = ["--keep-retry-for", PSK_PIPE]     # as sigmond passes it
+    assert main(["migrate", "--db", str(db), *keep]) == 0
     capsys.readouterr()
     bytes_before = db.read_bytes()
     mtime_before = db.stat().st_mtime_ns
 
-    rc = main(["migrate", "--db", str(db)])
+    rc = main(["migrate", "--db", str(db), *keep])
 
     assert rc == 0
     assert db.read_bytes() == bytes_before
     assert db.stat().st_mtime_ns == mtime_before
     assert capsys.readouterr().out.splitlines() == [
-        "watermarks.db: version 1", "  nothing to do"]
+        "watermarks.db: version 2", "  nothing to do"]
     report = schema.migrate(str(db))
-    assert (report.from_version, report.to_version) == (1, 1)
+    assert (report.from_version, report.to_version) == (2, 2)
     assert report.applied == [] and report.pending == []
+    assert report.lines == []
 
 
 def test_check_writes_nothing(tmp_path, capsys):
@@ -228,6 +280,10 @@ def test_check_writes_nothing(tmp_path, capsys):
     assert capsys.readouterr().out.splitlines() == [
         "watermarks.db: version 0",
         "  pending 1: record the schema version; changes no row and no table",
+        "  pending 2: split the pskreporter send record by producer",
+        *[line.replace("  copied", "  would copy")
+          for line in _V0_STORE_LINES[2:]],
+        _RETRY_STAYS,
     ]
     assert db.read_bytes() == bytes_before
     assert db.stat().st_mtime_ns == mtime_before
@@ -235,7 +291,7 @@ def test_check_writes_nothing(tmp_path, capsys):
     report = schema.migrate(str(db), check=True)
     assert (report.from_version, report.to_version) == (0, 0)
     assert report.applied == []
-    assert report.pending == [schema.MIGRATIONS[0].name]
+    assert report.pending == [m.name for m in schema.MIGRATIONS]
 
 
 def test_a_crash_copy_migrates_and_keeps_every_row(tmp_path, capsys):
@@ -249,12 +305,10 @@ def test_a_crash_copy_migrates_and_keeps_every_row(tmp_path, capsys):
 
     assert rc == 0
     assert capsys.readouterr().out.splitlines() == [
-        "watermarks.db: version 1",
-        "  applied 1: record the schema version; changes no row and no table",
-    ]
+        "watermarks.db: version 2", *_V0_STORE_LINES, _RETRY_STAYS]
     assert not Path(f"{db}-journal").exists()
-    assert _version(db) == 1
-    assert _rows(db) == rows_before
+    assert _version(db) == 2
+    _assert_kept_and_split(rows_before, _rows(db))
 
 
 def test_check_on_a_crash_copy_says_so_and_writes_nothing(tmp_path, capsys):
@@ -299,8 +353,8 @@ def test_migrate_waits_for_a_concurrent_writer(tmp_path):
     waited = time.monotonic() - started
 
     assert waited >= 0.9           # it waited for the lock ...
-    assert report.to_version == 1  # ... and then finished, rather than failing
-    assert _version(db) == 1
+    assert report.to_version == 2  # ... and then finished, rather than failing
+    assert _version(db) == 2
     conn = sqlite3.connect(db)
     try:
         assert conn.execute(
@@ -354,17 +408,17 @@ def test_a_failing_migration_rolls_back_every_step(tmp_path, monkeypatch):
     db = _v0_store(tmp_path)
     rows_before = _rows(db)
 
-    def boom(conn):
+    def boom(conn, ctx):
         conn.execute("DELETE FROM watermarks")
         raise RuntimeError("boom")
 
     monkeypatch.setattr(schema, "MIGRATIONS", (
-        *schema.MIGRATIONS, schema.Migration(2, "fails", boom)))
+        *schema.MIGRATIONS, schema.Migration(3, "fails", boom)))
 
     with pytest.raises(RuntimeError, match="boom"):
         schema.migrate(str(db))
 
-    assert _version(db) == 0       # step 1 rolled back with step 2
+    assert _version(db) == 0       # steps 1 and 2 rolled back with step 3
     assert _rows(db) == rows_before
 
 
@@ -421,7 +475,8 @@ def test_a_newer_store_is_left_alone_and_exits_0(tmp_path, capsys):
     assert rc == 0
     out = capsys.readouterr().out.splitlines()
     assert out[0] == f"watermarks.db: version {schema.SCHEMA_VERSION + 1}"
-    assert "newer than this hs-uploader" in out[1]
+    assert out[1] == _RETRY_STAYS          # the retry pass still looks
+    assert "newer than this hs-uploader" in out[2]
     assert db.read_bytes() == bytes_before
 
 
@@ -431,7 +486,7 @@ def test_db_defaults_to_the_state_option(tmp_path, capsys):
     rc = main(["--state", str(db), "migrate"])
 
     assert rc == 0
-    assert _version(db) == 1
+    assert _version(db) == 2
 
 
 def test_usage_error_exits_2(tmp_path):
@@ -445,17 +500,17 @@ def test_exit_codes_from_a_real_process(tmp_path):
     junk = tmp_path / "junk.db"
     junk.write_bytes(b"not sqlite\n" * 10)
 
-    first = _cli("migrate", "--db", str(db))
+    first = _cli("migrate", "--db", str(db), "--keep-retry-for", PSK_PIPE)
     again = _cli("migrate", "--db", str(db))
     check = _cli("migrate", "--db", str(db), "--check")
     failed = _cli("migrate", "--db", str(junk))
     usage = _cli("migrate", "--bogus")
 
     assert first.returncode == 0, first.stderr
-    assert first.stdout.splitlines()[0] == "watermarks.db: version 1"
+    assert first.stdout.splitlines()[0] == "watermarks.db: version 2"
     assert again.returncode == 0 and "nothing to do" in again.stdout
     assert check.returncode == 0 and check.stdout.splitlines() == [
-        "watermarks.db: version 1", "  nothing to do"]
+        "watermarks.db: version 2", "  nothing to do"]
     assert failed.returncode == 1
     assert usage.returncode == 2 and "unrecognized arguments" in usage.stderr
 
@@ -467,7 +522,7 @@ def test_nothing_to_do_takes_no_write_lock(tmp_path, monkeypatch, capsys):
     # A store at the current version needs no write, so a writer that holds
     # the lock must not make migrate wait or fail.
     db = _v0_store(tmp_path)
-    assert main(["migrate", "--db", str(db)]) == 0
+    assert main(["migrate", "--db", str(db), "--keep-retry-for", PSK_PIPE]) == 0
     capsys.readouterr()
     monkeypatch.setattr(schema, "BUSY_TIMEOUT_S", 0.2)
     holder = sqlite3.connect(db, isolation_level=None)
@@ -480,7 +535,7 @@ def test_nothing_to_do_takes_no_write_lock(tmp_path, monkeypatch, capsys):
 
     assert rc == 0
     assert capsys.readouterr().out.splitlines() == [
-        "watermarks.db: version 1", "  nothing to do"]
+        "watermarks.db: version 2", "  nothing to do"]
 
 
 def test_check_on_a_locked_store_fails_and_does_not_blame_a_crash(
@@ -510,7 +565,7 @@ def test_a_migrator_that_loses_the_race_applies_nothing(tmp_path, monkeypatch):
     db = _v0_store(tmp_path)
     ran = []
     monkeypatch.setattr(schema, "MIGRATIONS", (
-        schema.Migration(1, "counting", lambda conn: ran.append(1)),))
+        schema.Migration(1, "counting", lambda conn, ctx: ran.append(1)),))
     real_inspect = schema._inspect
 
     def stale_inspect(conn, path):
@@ -530,12 +585,11 @@ def test_a_migrator_that_loses_the_race_applies_nothing(tmp_path, monkeypatch):
 def test_the_runner_applies_only_what_the_file_has_not_seen(
         tmp_path, monkeypatch):
     db = _v0_store(tmp_path)
-    schema.migrate(str(db))
-    assert _version(db) == 1
+    _set_version(db, 1)
     ran = []
-    second = schema.Migration(2, "second", lambda conn: ran.append(2))
+    second = schema.Migration(2, "second", lambda conn, ctx: ran.append(2))
     monkeypatch.setattr(schema, "MIGRATIONS", (
-        schema.Migration(1, "first", lambda conn: ran.append(1)), second))
+        schema.Migration(1, "first", lambda conn, ctx: ran.append(1)), second))
 
     report = schema.migrate(str(db))
 
@@ -580,14 +634,15 @@ def test_the_failure_line_names_path_type_and_message(tmp_path, capsys):
 
 def test_the_newer_store_line_is_exact(tmp_path, capsys):
     db = _v0_store(tmp_path)
-    _set_version(db, 2)
+    _set_version(db, 3)
 
     rc = main(["migrate", "--db", str(db)])
 
     assert rc == 0
     assert capsys.readouterr().out.splitlines() == [
-        "watermarks.db: version 2",
-        "  newer than this hs-uploader, which knows versions up to 1; "
+        "watermarks.db: version 3",
+        _RETRY_STAYS,
+        "  newer than this hs-uploader, which knows versions up to 2; "
         "left as it stands"]
 
 
@@ -621,7 +676,7 @@ def test_db_beats_state(tmp_path):
     rc = main(["--state", str(other), "migrate", "--db", str(db)])
 
     assert rc == 0
-    assert _version(db) == 1
+    assert _version(db) == 2
     assert _version(other) == 0
 
 
@@ -634,7 +689,7 @@ def test_without_db_or_state_migrate_uses_the_default_path(
     rc = main(["migrate"])
 
     assert rc == 0
-    assert _version(db) == 1
+    assert _version(db) == 2
 
 
 # ---- the store never migrates; old code reads a migrated file ----
@@ -660,15 +715,15 @@ def test_store_constructor_leaves_user_version_alone(tmp_path):
     assert _version(old) == 1      # and reopening never resets the number
 
 
-def test_current_store_opens_a_version_1_file(tmp_path):
-    # The store at head must carry on against a file that v3.70's migrate
-    # has stamped.  This covers the forward direction only: a later commit
+def test_current_store_opens_a_migrated_file(tmp_path):
+    # The store at head must carry on against a file that migrate has
+    # stamped, a psk-pskreporter retry left in place included.  This covers the forward direction only: a later commit
     # changed watermark/sqlite.py, so the store here no longer matches the
     # v3.69 code.  The rollback itself, v3.69's store on a version-1 file,
     # runs in PHASE G-bis of sigmond-appliance's test-update-v3.sh.
     db = _v0_store(tmp_path)
     schema.migrate(str(db))
-    assert _version(db) == 1
+    assert _version(db) == 2
 
     s = SqliteWatermarkStore(db)
     try:
@@ -688,10 +743,10 @@ def test_current_store_opens_a_version_1_file(tmp_path):
         assert s.get_cursor(*PSK_KEY) == b"1300"
         assert s.deliverable_count() == 2
         assert s.dead_letter_count() == 1
-        assert len(s.all_cursors()) == 3
+        assert len(s.all_cursors()) == 5     # 3, plus migration 2's copies
     finally:
         s.close()
-    assert _version(db) == 1
+    assert _version(db) == 2
 
 
 # -- the store's version, from birth (spec §4.3) --

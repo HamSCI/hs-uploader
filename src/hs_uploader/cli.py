@@ -10,10 +10,12 @@ Subcommands:
 * ``hs-uploader kick``   — bump every deliverable's
   ``next_attempt_at`` to now, so the next ``pump`` retries
   immediately instead of waiting out the backoff.
-* ``hs-uploader migrate [--db PATH] [--check]`` — bring watermarks.db
-  to this release's schema version (``PRAGMA user_version``).
-  ``--check`` reports the version and what would run, and writes
-  nothing.  Exit 0 done or nothing to do, 1 failure, 2 usage error.
+* ``hs-uploader migrate [--db PATH] [--check] [--sink PATH]
+  [--keep-retry-for NAME]`` — bring watermarks.db to this release's
+  schema version (``PRAGMA user_version``), then handle each retry still
+  queued under ``psk-pskreporter``.  ``--check`` reports the version and
+  what would run, and writes nothing.  Exit 0 done or nothing to do,
+  1 failure, 2 usage error.
 
 Phase 1 is read-mostly: ``pump`` is **not** wired up here because there
 are no transports yet.  It will land in Phase 2 once
@@ -99,6 +101,22 @@ def _build_parser() -> argparse.ArgumentParser:
         "--check",
         action="store_true",
         help="Report the version and the pending migrations; write nothing.",
+    )
+    sp_migrate.add_argument(
+        "--sink",
+        type=Path,
+        default=None,
+        metavar="PATH",
+        help="sink.db, read only: a psk-pskreporter retry whose rows it "
+             "still holds gets deleted, and each new pipeline re-reads them.",
+    )
+    sp_migrate.add_argument(
+        "--keep-retry-for",
+        default=None,
+        metavar="NAME",
+        help="The pipeline that inherits a psk-pskreporter retry the sink "
+             "cannot vouch for: psk-recorder-pskreporter or "
+             "meteor-scatter-pskreporter.  Without it such a retry stays.",
     )
     sp_migrate.set_defaults(func=None)
 
@@ -306,7 +324,9 @@ def _cmd_migrate(args) -> int:
             # run creates it, stamped current, when its directory exists.
             print(f"watermarks.db: not found at {path}; nothing to migrate")
             return 0
-        report = schema.migrate(str(path), check=args.check)
+        ctx = schema.MigrateContext(sink_path=args.sink,
+                                    keep_retry_for=args.keep_retry_for)
+        report = schema.migrate(str(path), check=args.check, ctx=ctx)
     except schema.JournalRecoveryNeeded:
         # Only --check meets this.  Its read-only open cannot roll back
         # what a crash left half written, and it leaves the file alone.
@@ -323,10 +343,12 @@ def _cmd_migrate(args) -> int:
         print(f"  applied {name}")
     for name in report.pending:
         print(f"  pending {name}")
+    for line in report.lines:
+        print(f"  {line}")
     if report.to_version > schema.SCHEMA_VERSION:
         print(f"  newer than this hs-uploader, which knows versions up to "
               f"{schema.SCHEMA_VERSION}; left as it stands")
-    elif not report.applied and not report.pending:
+    elif not report.applied and not report.pending and not report.lines:
         print("  nothing to do")
     return 0
 

@@ -24,9 +24,35 @@ it restarts the daemon, and a store still on an older version keeps
 working as it stands.
 
 Version 1 (v3.70) changes no row and no table.  It only records that the
-store now carries a version, so v3.71's key migration has a number to
-start from.  Never edit a migration that has shipped; append a new one
-and raise ``SCHEMA_VERSION`` to match.
+store now carries a version, so a key migration has a number to start
+from.  Never edit a migration that has shipped; append a new one and
+``SCHEMA_VERSION`` follows.
+
+Version 2 (v3.73) splits the shared pskreporter send record
+(sigmond/tasks/spec-key-split-v373.md §4.4).  Each record keyed
+``sqlite:psk.spots`` with a pskreporter destination gets copied to the
+two producer keys, ``sqlite:psk.spots@psk-recorder`` and
+``sqlite:psk.spots@meteor-scatter``, unless a record already exists
+there.  The old row stays, frozen, and ``superseded_keys`` records each
+old key beside each new one.
+
+The retry pass runs after the versioned migrations on every migrate that
+writes, at version 2 as at version 1, inside the same transaction (spec
+§4.4 item 4, §6).  It handles each deliverable still queued under
+``psk-pskreporter``:
+
+* the sink still holds its rows: delete it, and each new pipeline
+  re-reads its own rows;
+* otherwise, with ``keep_retry_for`` named: move it whole to that
+  pipeline, under that pipeline's source part;
+* otherwise: leave it where it stands, and say so.
+
+"The sink still holds its rows" means ``sink_path`` was given and its
+``pending_uploads`` still holds a ``psk.spots`` row at or before the old
+record's position.  The sink trims oldest first, so a surviving row at
+or before the old record means no row after it has gone.  The pass never
+deletes a retry it cannot prove that for, so repeating it cannot skip a
+row.  It leaves dead letters alone.
 """
 
 from __future__ import annotations
@@ -34,14 +60,16 @@ from __future__ import annotations
 import os
 import sqlite3
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
-from typing import Callable
+from typing import Callable, NamedTuple, Optional
 
 __all__ = [
     "BUSY_TIMEOUT_S",
     "MIGRATIONS",
     "SCHEMA_VERSION",
     "JournalRecoveryNeeded",
+    "MigrateContext",
     "MigrateError",
     "MigrateReport",
     "Migration",
@@ -64,10 +92,29 @@ class JournalRecoveryNeeded(RuntimeError):
 
 
 @dataclass(frozen=True)
+class MigrateContext:
+    """What a migration may need beyond the store itself.
+
+    ``sink_path``: the sink (``sink.db``) the pskreporter pipelines read,
+    opened read-only to learn whether it still holds a retry's rows.
+    ``keep_retry_for``: the pipeline that inherits a ``psk-pskreporter``
+    retry the pass cannot delete; one of ``NEW_PSKREPORTER_PIPELINES``.
+    """
+
+    sink_path: Optional[Path] = None
+    keep_retry_for: Optional[str] = None
+
+
+# A migration's apply(conn, ctx) runs inside migrate's transaction and
+# returns the lines it reports (or None).  preview(conn, ctx), when set,
+# reads only and returns the lines apply would report, for --check.
+@dataclass(frozen=True)
 class Migration:
     version: int
     summary: str
-    apply: Callable[[sqlite3.Connection], None]
+    apply: Callable[[sqlite3.Connection, MigrateContext], Optional[list[str]]]
+    preview: Optional[
+        Callable[[sqlite3.Connection, MigrateContext], list[str]]] = None
 
     @property
     def name(self) -> str:
@@ -80,16 +127,262 @@ class MigrateReport:
     to_version: int            # the file's version when migrate returned
     applied: list[str] = field(default_factory=list)
     pending: list[str] = field(default_factory=list)
+    # What the migrations and the retry pass copied, deleted, moved or
+    # left, one line each; with check=True, what they would do.
+    lines: list[str] = field(default_factory=list)
 
 
-def _record_version_only(conn: sqlite3.Connection) -> None:
+def _record_version_only(conn: sqlite3.Connection,
+                         ctx: MigrateContext) -> None:
     """Version 1 changes nothing; the runner records the number."""
+
+
+# ---- version 2: the pskreporter split (spec-key-split-v373 §4.4) ----------
+
+OLD_PSKREPORTER_PIPELINE = "psk-pskreporter"
+OLD_PSK_SOURCE = "sqlite:psk.spots"
+# Each new pipeline and its source part, psk-recorder's first.
+NEW_PSKREPORTER_PIPELINES: dict[str, str] = {
+    "psk-recorder-pskreporter": "sqlite:psk.spots@psk-recorder",
+    "meteor-scatter-pskreporter": "sqlite:psk.spots@meteor-scatter",
+}
+# The rows the old source part reads in the sink.
+_PSK_TARGET = ("psk", "spots")
+
+# Frozen with migration 2.  The store's own schema creates the same table
+# on a new file; this copy stays as shipped even if that one changes.
+_SUPERSEDED_KEYS_DDL = """
+CREATE TABLE IF NOT EXISTS superseded_keys (
+    old_source_id TEXT NOT NULL,
+    old_dest_id   TEXT NOT NULL,
+    old_table     TEXT NOT NULL,
+    new_source_id TEXT NOT NULL,
+    new_dest_id   TEXT NOT NULL,
+    new_table     TEXT NOT NULL,
+    migrated_at   TEXT NOT NULL,
+    PRIMARY KEY (old_source_id, old_dest_id, old_table, new_source_id)
+)
+"""
+
+
+def _show(blob: object) -> str:
+    """A cursor for a report line: ASCII as it reads, anything else repr."""
+    if isinstance(blob, (bytes, bytearray, memoryview)):
+        raw = bytes(blob)
+        try:
+            text = raw.decode("ascii")
+        except UnicodeDecodeError:
+            return repr(raw)
+        return text if text.isprintable() else repr(raw)
+    return repr(blob)
+
+
+def _key(source_id: str, dest_id: str, table: str) -> str:
+    return f"({source_id}, {dest_id}, {table})"
+
+
+def _split_pskreporter(conn: sqlite3.Connection, ctx: MigrateContext, *,
+                       write: bool = True) -> list[str]:
+    """Copy each shared pskreporter send record to both producer keys.
+
+    The old row stays.  A new key that already holds a record keeps it.
+    ``superseded_keys`` gets one row per old key and new key, copied or
+    kept, so a reader can name the old key's successors either way.  With
+    ``write=False`` it only reads and reports what it would do.
+    """
+    if write:
+        conn.execute(_SUPERSEDED_KEYS_DDL)
+    now = datetime.now(timezone.utc).isoformat()
+    lines: list[str] = []
+    olds = conn.execute(
+        "SELECT source_id, dest_id, table_name, cursor, last_ack "
+        "FROM watermarks WHERE source_id = ? AND dest_id LIKE 'pskreporter%' "
+        "ORDER BY dest_id, table_name", (OLD_PSK_SOURCE,)).fetchall()
+    for src, dest, table, cursor, last_ack in olds:
+        for new_src in NEW_PSKREPORTER_PIPELINES.values():
+            existing = conn.execute(
+                "SELECT cursor FROM watermarks "
+                "WHERE source_id = ? AND dest_id = ? AND table_name = ?",
+                (new_src, dest, table)).fetchone()
+            if existing is None:
+                if write:
+                    conn.execute(
+                        "INSERT INTO watermarks (source_id, dest_id, "
+                        "table_name, cursor, last_ack) VALUES (?,?,?,?,?)",
+                        (new_src, dest, table, cursor, last_ack))
+                lines.append(
+                    f"{'copied' if write else 'would copy'} send record "
+                    f"{_key(src, dest, table)} (cursor {_show(cursor)}, "
+                    f"last_ack {last_ack}) to {_key(new_src, dest, table)}")
+            else:
+                lines.append(
+                    f"{'kept' if write else 'would keep'} "
+                    f"{_key(new_src, dest, table)}: a record already exists "
+                    f"there (cursor {_show(existing[0])}); "
+                    f"{_key(src, dest, table)} not copied over it")
+            if write:
+                conn.execute(
+                    "INSERT OR IGNORE INTO superseded_keys (old_source_id, "
+                    "old_dest_id, old_table, new_source_id, new_dest_id, "
+                    "new_table, migrated_at) VALUES (?,?,?,?,?,?,?)",
+                    (src, dest, table, new_src, dest, table, now))
+    if not olds:
+        lines.append(f"no pskreporter send record under {OLD_PSK_SOURCE}; "
+                     "nothing to copy")
+    return lines
+
+
+def _preview_split(conn: sqlite3.Connection, ctx: MigrateContext) -> list[str]:
+    return _split_pskreporter(conn, ctx, write=False)
 
 
 MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "record the schema version; changes no row and no table",
               _record_version_only),
+    Migration(2, "split the pskreporter send record by producer",
+              _split_pskreporter, _preview_split),
 )
+
+
+# ---- the retry pass: every migrate, not once (spec §4.4 item 4, §6) -------
+
+
+class _RetryAction(NamedTuple):
+    id: int
+    cursor_after: bytes
+    action: str              # "delete", "move" or "stay"
+    to_pipeline: str         # for "move"
+    to_source: str           # for "move"
+    reason: str
+
+
+def _has_table(conn: sqlite3.Connection, name: str) -> bool:
+    return conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name=?",
+        (name,)).fetchone() is not None
+
+
+def _old_last_id(conn: sqlite3.Connection, source_id: str, dest_id: str,
+                 table: str) -> tuple[Optional[int], str]:
+    """The row id the old send record names for this retry, or None and why.
+
+    A keyless retry (queued before v3.70) names no destination; it counts
+    only when exactly one pskreporter record exists under the old source.
+    """
+    sql = ("SELECT cursor FROM watermarks WHERE source_id = ? "
+           "AND dest_id LIKE 'pskreporter%'")
+    params: list = [source_id or OLD_PSK_SOURCE]
+    if dest_id:
+        sql += " AND dest_id = ?"
+        params.append(dest_id)
+    if table:
+        sql += " AND table_name = ?"
+        params.append(table)
+    rows = conn.execute(sql, params).fetchall()
+    if len(rows) != 1:
+        return None, (f"{len(rows)} old pskreporter send records match it, "
+                      "so its position cannot be told")
+    raw = rows[0][0]
+    if not raw:
+        return None, "the old send record is empty, so its position cannot be told"
+    from ..sources.sqlite import _Cursor
+    try:
+        return _Cursor.from_bytes(bytes(raw)).last_id, ""
+    except (TypeError, ValueError):
+        return None, (f"the old send record's cursor {_show(raw)} is not a "
+                      "row id, so its position cannot be told")
+
+
+def _sink_holds(sink_path: Optional[Path], last_id: int) -> tuple[bool, str]:
+    """Whether the sink still holds a psk.spots row at or before
+    ``last_id``.  Opens it read-only; never creates it."""
+    if sink_path is None:
+        return False, "no --sink given"
+    try:
+        conn = _connect(Path(sink_path), "ro")
+    except sqlite3.Error as exc:
+        return False, f"cannot read the sink at {sink_path}: {exc}"
+    try:
+        found = conn.execute(
+            "SELECT 1 FROM pending_uploads WHERE target_db = ? AND "
+            "target_table = ? AND id <= ? LIMIT 1",
+            (*_PSK_TARGET, last_id)).fetchone()
+    except sqlite3.Error as exc:
+        return False, f"cannot read the sink at {sink_path}: {exc}"
+    finally:
+        conn.close()
+    if found is None:
+        return False, (f"the sink holds no psk.spots row at or before the old "
+                       f"record ({last_id}), so some of its rows may be gone")
+    return True, (f"the sink still holds psk.spots rows from the old record "
+                  f"({last_id}) on, so each new pipeline re-reads its own")
+
+
+def _plan_retries(conn: sqlite3.Connection,
+                  ctx: MigrateContext) -> list[_RetryAction]:
+    """Decide, reading only, what to do with each retry under the old name."""
+    if not _has_table(conn, "deliverables"):
+        return []
+    plan: list[_RetryAction] = []
+    for rid, src, dest, table, cursor_after in conn.execute(
+            "SELECT id, source_id, dest_id, table_name, cursor_after "
+            "FROM deliverables WHERE pipeline = ? ORDER BY id",
+            (OLD_PSKREPORTER_PIPELINE,)).fetchall():
+        last_id, why = _old_last_id(conn, src or "", dest or "", table or "")
+        holds = False
+        if last_id is not None:
+            holds, why = _sink_holds(ctx.sink_path, last_id)
+        after = bytes(cursor_after or b"")
+        if holds:
+            plan.append(_RetryAction(rid, after, "delete", "", "", why))
+        elif ctx.keep_retry_for:
+            plan.append(_RetryAction(
+                rid, after, "move", ctx.keep_retry_for,
+                NEW_PSKREPORTER_PIPELINES[ctx.keep_retry_for], why))
+        else:
+            plan.append(_RetryAction(rid, after, "stay", "", "", why))
+    return plan
+
+
+def _retry_lines(plan: list[_RetryAction], *, done: bool) -> list[str]:
+    out = []
+    for a in plan:
+        head = (f"retry {a.id} ({OLD_PSKREPORTER_PIPELINE}, cursor_after "
+                f"{_show(a.cursor_after)})")
+        if a.action == "delete":
+            verb = "deleted" if done else "would delete"
+            out.append(f"{head}: {verb}; {a.reason}")
+        elif a.action == "move":
+            verb = "moved" if done else "would move"
+            out.append(f"{head}: {verb} to {a.to_pipeline} under "
+                       f"{a.to_source}; {a.reason}")
+        else:
+            out.append(f"{head}: stays under {OLD_PSKREPORTER_PIPELINE}; "
+                       f"{a.reason}, and no --keep-retry-for names a "
+                       "pipeline to move it to")
+    return out
+
+
+def _apply_retries(conn: sqlite3.Connection, plan: list[_RetryAction]) -> None:
+    for a in plan:
+        if a.action == "delete":
+            conn.execute("DELETE FROM deliverables WHERE id = ?", (a.id,))
+        elif a.action == "move":
+            # The key's source part follows the pipeline; dest and table
+            # stay.  cursor_after and commit_token stay too: both hold a
+            # pending_uploads id, which the producer source reads the same
+            # way, and its commit deletes only its own producer's rows.
+            conn.execute(
+                "UPDATE deliverables SET pipeline = ?, source_id = ? "
+                "WHERE id = ?", (a.to_pipeline, a.to_source, a.id))
+
+
+def _validate(ctx: MigrateContext) -> None:
+    if (ctx.keep_retry_for is not None
+            and ctx.keep_retry_for not in NEW_PSKREPORTER_PIPELINES):
+        raise ValueError(
+            f"--keep-retry-for {ctx.keep_retry_for!r}: must name one of "
+            f"{', '.join(NEW_PSKREPORTER_PIPELINES)}")
 
 # The highest version above; append a Migration and this follows.
 SCHEMA_VERSION = max(m.version for m in MIGRATIONS)
@@ -132,34 +425,47 @@ def _hot_journal(exc: sqlite3.OperationalError, db: Path) -> bool:
     return "readonly" in str(exc) and Path(f"{db}-journal").exists()
 
 
-def _check(db: Path) -> MigrateReport:
+def _check(db: Path, ctx: MigrateContext) -> MigrateReport:
     conn = _connect(db, "ro")
     try:
-        current = _inspect(conn, db)
-    except sqlite3.OperationalError as exc:
-        if _hot_journal(exc, db):
-            raise JournalRecoveryNeeded(
-                f"a crash left {db}-journal to recover") from exc
-        raise
+        try:
+            current = _inspect(conn, db)
+        except sqlite3.OperationalError as exc:
+            if _hot_journal(exc, db):
+                raise JournalRecoveryNeeded(
+                    f"a crash left {db}-journal to recover") from exc
+            raise
+        pending = [m for m in MIGRATIONS if m.version > current]
+        lines: list[str] = []
+        for m in pending:
+            if m.preview is not None:
+                lines.extend(m.preview(conn, ctx))
+        lines.extend(_retry_lines(_plan_retries(conn, ctx), done=False))
     finally:
         conn.close()
     return MigrateReport(from_version=current, to_version=current,
-                         pending=[m.name for m in MIGRATIONS
-                                  if m.version > current])
+                         pending=[m.name for m in pending], lines=lines)
 
 
-def migrate(path: str, *, check: bool = False) -> MigrateReport:
-    """Bring the store at ``path`` to ``SCHEMA_VERSION``.
+def migrate(path: str, *, check: bool = False,
+            ctx: MigrateContext = MigrateContext()) -> MigrateReport:
+    """Bring the store at ``path`` to ``SCHEMA_VERSION``, then run the
+    retry pass.
 
-    ``check=True`` opens the file read-only and reports what would run.  A
-    store already at, or above, this code's version needs nothing and gets
-    no write: a station rolled back from a newer release keeps its newer
-    number.  Raises FileNotFoundError for a missing or empty file when run as
+    ``check=True`` opens the file read-only and reports what would run,
+    the retry pass included.  A store already at, or above, this code's
+    version, with no retry under ``psk-pskreporter`` to delete or move,
+    needs nothing and gets no write lock: a station rolled back from a
+    newer release keeps its newer number.  ``ctx`` names the sink and the
+    pipeline that keeps a retry (``MigrateContext``); a ``keep_retry_for``
+    outside ``NEW_PSKREPORTER_PIPELINES`` raises ValueError before any
+    read.  Raises FileNotFoundError for a missing or empty file when run as
     root or with ``check=True`` (otherwise migrate creates the store), MigrateError for a file that holds no store, and
     sqlite3.Error when SQLite refuses, for example a write lock held past
     ``BUSY_TIMEOUT_S``.  With ``check=True`` it raises
     JournalRecoveryNeeded on a hot journal and changes nothing.
     """
+    _validate(ctx)
     db = Path(path)
     empty = not db.exists() or (db.is_file() and db.stat().st_size == 0)
     if empty and not check and os.geteuid() != 0:
@@ -172,16 +478,20 @@ def migrate(path: str, *, check: bool = False) -> MigrateReport:
     if not db.is_file():
         raise FileNotFoundError(f"no store file at {db}")
     if check:
-        return _check(db)
+        return _check(db, ctx)
 
     # Read-write from the first read: a hot journal left by a crash rolls
     # back here, as it would when the daemon opens the store.
     conn = _connect(db, "rw")
     try:
         current = _inspect(conn, db)
-        if not any(m.version > current for m in MIGRATIONS):
-            # Nothing to do: no write lock taken, no byte written.
-            return MigrateReport(from_version=current, to_version=current)
+        plan = _plan_retries(conn, ctx)
+        if (not any(m.version > current for m in MIGRATIONS)
+                and all(a.action == "stay" for a in plan)):
+            # Nothing to do: no write lock taken, no byte written.  A
+            # retry that stays still gets its line.
+            return MigrateReport(from_version=current, to_version=current,
+                                 lines=_retry_lines(plan, done=True))
         # IMMEDIATE takes the write lock now, waiting out a concurrent
         # writer, so no other process slips a write between our read of
         # the version and our update of it.
@@ -190,13 +500,18 @@ def migrate(path: str, *, check: bool = False) -> MigrateReport:
             start = _user_version(conn)   # again, now under the lock
             version = start
             applied: list[str] = []
+            lines: list[str] = []
             for m in MIGRATIONS:
                 if m.version <= version:
                     continue
-                m.apply(conn)
+                lines.extend(m.apply(conn, ctx) or [])
                 conn.execute("PRAGMA user_version = %d" % m.version)
                 version = m.version
                 applied.append(m.name)
+            # The retry pass, decided again under the lock.
+            plan = _plan_retries(conn, ctx)
+            _apply_retries(conn, plan)
+            lines.extend(_retry_lines(plan, done=True))
             conn.execute("COMMIT")
         except BaseException:
             if conn.in_transaction:
@@ -204,4 +519,5 @@ def migrate(path: str, *, check: bool = False) -> MigrateReport:
             raise
     finally:
         conn.close()
-    return MigrateReport(from_version=start, to_version=version, applied=applied)
+    return MigrateReport(from_version=start, to_version=version,
+                         applied=applied, lines=lines)

@@ -17,6 +17,9 @@ Schema:
   failures; cursor was NOT advanced.
 * ``pipeline_state(name, client, refused_reason, updated_at)`` — what the
   daemon decided for each pipeline at its last start.
+* ``superseded_keys(old_source_id, old_dest_id, old_table, new_source_id,
+  new_dest_id, new_table, migrated_at)`` — each send record a key
+  migration copied, old key beside new (``schema.py``, migration 2).
 """
 
 from __future__ import annotations
@@ -79,6 +82,17 @@ CREATE TABLE IF NOT EXISTS dead_letter (
     pipeline    TEXT NOT NULL,
     payload_blob BLOB NOT NULL,
     final_error TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS superseded_keys (
+    old_source_id TEXT NOT NULL,
+    old_dest_id   TEXT NOT NULL,
+    old_table     TEXT NOT NULL,
+    new_source_id TEXT NOT NULL,
+    new_dest_id   TEXT NOT NULL,
+    new_table     TEXT NOT NULL,
+    migrated_at   TEXT NOT NULL,
+    PRIMARY KEY (old_source_id, old_dest_id, old_table, new_source_id)
 );
 
 CREATE TABLE IF NOT EXISTS pipeline_state (

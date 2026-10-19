@@ -183,7 +183,8 @@ explicit even when no third-party deps are required.
 
 `PRAGMA user_version` in `watermarks.db` holds the store's schema
 version.  `src/hs_uploader/watermark/schema.py` owns it: `SCHEMA_VERSION`,
-the ordered `MIGRATIONS`, and `migrate(path, *, check=False) -> MigrateReport`.
+the ordered `MIGRATIONS`, and `migrate(path, *, check=False, ctx=MigrateContext())
+-> MigrateReport`.
 
 - Only `hs-uploader migrate` migrates.  `SqliteWatermarkStore`'s
   constructor never reads or writes `user_version`, and the daemon never
@@ -214,8 +215,21 @@ the ordered `MIGRATIONS`, and `migrate(path, *, check=False) -> MigrateReport`.
   unchanged.
 - Version 1 (v3.70) changes no row and no table.  It records the number
   and nothing else.
-- To add a migration, append a `Migration` to `MIGRATIONS` and raise
-  `SCHEMA_VERSION` to match.  Never edit a migration that has shipped.
+- Version 2 (v3.73) copies each send record keyed `sqlite:psk.spots` with
+  a pskreporter destination to `sqlite:psk.spots@psk-recorder` and
+  `sqlite:psk.spots@meteor-scatter`, unless a record already sits there.
+  The old row stays, frozen, and `superseded_keys` pairs each old key
+  with each new one (spec-key-split-v373 §4.4).
+- The retry pass runs on every migrate, after the migrations and in the
+  same transaction.  For each retry still queued under `psk-pskreporter`:
+  when `--sink PATH` shows the sink still holds a `psk.spots` row at or
+  before the old record, it deletes the retry; otherwise it moves the
+  retry whole to `--keep-retry-for NAME` (one of the two new pipelines),
+  under that pipeline's source part; with no `--keep-retry-for` the retry
+  stays.  When nothing needs a write, migrate takes no write lock.
+  Dead letters stay.  `--check` reports all of it and writes nothing.
+- To add a migration, append a `Migration` to `MIGRATIONS`; `SCHEMA_VERSION`
+  follows.  Never edit a migration that has shipped.
 - Exit codes: 0 done or nothing to do, 1 failure, 2 usage error.  An
   hs-uploader that predates `migrate` also exits 2, and prints
   `invalid choice: 'migrate'` on stderr.

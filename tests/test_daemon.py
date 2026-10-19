@@ -151,7 +151,8 @@ def test_old_store_refuses_only_producer_pipelines(tmp_path, monkeypatch, caplog
     monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
     monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
     store = SqliteWatermarkStore(tmp_path / "watermarks.db")
-    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    store._conn.execute("PRAGMA user_version = 1")   # as v3.70-v3.72 left it
+    store._conn.commit()
     store.close()
     manifest = {"pipeline": [_producer_pipeline(), _plain_pipeline(tmp_path)]}
     monkeypatch.setattr(daemon, "load_manifest", lambda p: manifest)
