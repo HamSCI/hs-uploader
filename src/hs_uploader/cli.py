@@ -23,6 +23,7 @@ are no transports yet.  It will land in Phase 2 once
 from __future__ import annotations
 
 import argparse
+import os
 import sys
 from pathlib import Path
 
@@ -288,9 +289,11 @@ def _cmd_migrate(args) -> int:
 
     path = args.db or args.state or default_path()
     try:
-        if not path.exists():
+        if not path.exists() and (args.check or os.geteuid() == 0
+                                  or not path.parent.is_dir()):
             # The daemon creates the store on its first start, as hsupload.
-            # A migrate run as root must not create it first.
+            # A migrate run as root must not create it first.  A non-root
+            # run creates it, stamped current, when its directory exists.
             print(f"watermarks.db: not found at {path}; nothing to migrate")
             return 0
         report = schema.migrate(str(path), check=args.check)

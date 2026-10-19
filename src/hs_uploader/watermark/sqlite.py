@@ -142,7 +142,15 @@ class SqliteWatermarkStore:
 
     def _init_schema(self) -> None:
         with self._lock, self._conn:
+            fresh = self._conn.execute(
+                "SELECT count(*) FROM sqlite_master").fetchone()[0] == 0
             self._conn.executescript(_SCHEMA_SQL)
+            if fresh:
+                # A file that held no table has nothing to migrate: born
+                # current.  A file with tables keeps its number, so
+                # `hs-uploader migrate` still runs on it (spec §4.3).
+                from .schema import SCHEMA_VERSION
+                self._conn.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
 
     def _chmod_group_writable(self) -> None:
         """Add group-write bit to the watermark db + its WAL/SHM

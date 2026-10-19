@@ -15,8 +15,10 @@ at all.  Only ``check=True`` reads read-only; on a hot journal it raises
 ``JournalRecoveryNeeded`` and leaves both files as it found them.
 
 Only ``hs-uploader migrate`` calls ``migrate()``.  Neither
-``SqliteWatermarkStore``'s constructor nor the daemon at start reads or
-writes the version (D10 in sigmond/tasks/plan-sink-control.md): sigmond
+``SqliteWatermarkStore``'s constructor nor the daemon at start migrates
+a store (D10 in sigmond/tasks/plan-sink-control.md).  The constructor
+stamps ``SCHEMA_VERSION`` only on a file that held no table when it
+opened, which has nothing to migrate (spec §4.3).  Sigmond
 runs the migration once every component's code sits in place and before
 it restarts the daemon, and a store still on an older version keeps
 working as it stands.
@@ -29,6 +31,7 @@ and raise ``SCHEMA_VERSION`` to match.
 
 from __future__ import annotations
 
+import os
 import sqlite3
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -44,8 +47,6 @@ __all__ = [
     "Migration",
     "migrate",
 ]
-
-SCHEMA_VERSION = 1
 
 # How long migrate waits for another process's write lock.  The daemon and
 # the in-process senders each hold it for milliseconds; Python's default of
@@ -89,6 +90,9 @@ MIGRATIONS: tuple[Migration, ...] = (
     Migration(1, "record the schema version; changes no row and no table",
               _record_version_only),
 )
+
+# The highest version above; append a Migration and this follows.
+SCHEMA_VERSION = max(m.version for m in MIGRATIONS)
 
 
 def _connect(db: Path, mode: str) -> sqlite3.Connection:
@@ -150,13 +154,21 @@ def migrate(path: str, *, check: bool = False) -> MigrateReport:
     ``check=True`` opens the file read-only and reports what would run.  A
     store already at, or above, this code's version needs nothing and gets
     no write: a station rolled back from a newer release keeps its newer
-    number.  Raises FileNotFoundError for a missing file (migrate never
-    creates the store), MigrateError for a file that holds no store, and
+    number.  Raises FileNotFoundError for a missing or empty file when run as
+    root or with ``check=True`` (otherwise migrate creates the store), MigrateError for a file that holds no store, and
     sqlite3.Error when SQLite refuses, for example a write lock held past
     ``BUSY_TIMEOUT_S``.  With ``check=True`` it raises
     JournalRecoveryNeeded on a hot journal and changes nothing.
     """
     db = Path(path)
+    empty = not db.exists() or (db.is_file() and db.stat().st_size == 0)
+    if empty and not check and os.geteuid() != 0:
+        # A store that holds no table has no data for a migration to move.
+        # The store stamps SCHEMA_VERSION on what it creates.  Root never
+        # creates it: the file would belong to root, not to hsupload.
+        from .sqlite import SqliteWatermarkStore
+        SqliteWatermarkStore(db).close()
+        return MigrateReport(from_version=0, to_version=SCHEMA_VERSION)
     if not db.is_file():
         raise FileNotFoundError(f"no store file at {db}")
     if check:

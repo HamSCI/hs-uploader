@@ -75,6 +75,7 @@ def _v0_store(directory: Path, name: str = "watermarks.db") -> Path:
                           pipeline="mag-psws", payload_blob=b"PK\x03\x04zip",
                           final_error="550 permission denied")
     s.close()
+    _set_version(db, 0)   # the store now stamps what it creates; v3.69 never did
     return db
 
 
@@ -163,7 +164,7 @@ def test_busy_timeout_constant_is_at_least_30_s():
 def test_fresh_store_file_migrates_to_version_1(tmp_path, capsys):
     db = tmp_path / "watermarks.db"
     SqliteWatermarkStore(db).close()
-    assert _version(db) == 0
+    _set_version(db, 0)    # a file as v3.69 created it
 
     rc = main(["migrate", "--db", str(db)])
 
@@ -367,7 +368,9 @@ def test_a_failing_migration_rolls_back_every_step(tmp_path, monkeypatch):
     assert _rows(db) == rows_before
 
 
-def test_missing_file_exits_0_and_creates_nothing(tmp_path, capsys):
+def test_missing_file_exits_0_and_creates_nothing(tmp_path, capsys,
+                                                  monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
     db = tmp_path / "absent" / "watermarks.db"
 
     rc = main(["migrate", "--db", str(db)])
@@ -640,7 +643,7 @@ def test_without_db_or_state_migrate_uses_the_default_path(
 def test_store_constructor_leaves_user_version_alone(tmp_path):
     db = tmp_path / "watermarks.db"
     SqliteWatermarkStore(db).close()
-    assert _version(db) == 0       # a new store does not migrate itself
+    assert _version(db) == schema.SCHEMA_VERSION   # born current (spec 4.3)
 
     old = _v0_store(tmp_path / "old")
     s = SqliteWatermarkStore(old)
@@ -689,3 +692,71 @@ def test_current_store_opens_a_version_1_file(tmp_path):
     finally:
         s.close()
     assert _version(db) == 1
+
+
+# -- the store's version, from birth (spec §4.3) --
+
+def _user_version(db: Path) -> int:
+    return _version(db)
+
+
+def _store_at_version(directory: Path, n: int, with_rows: bool = False) -> Path:
+    db = _v0_store(directory) if with_rows else directory / "watermarks.db"
+    if not with_rows:
+        SqliteWatermarkStore(db).close()
+    _set_version(db, n)
+    return db
+
+
+def test_new_store_is_stamped(tmp_path):
+    p = tmp_path / "w.db"
+    SqliteWatermarkStore(p).close()
+    assert _user_version(p) == schema.SCHEMA_VERSION
+
+
+def test_zero_length_store_is_stamped(tmp_path):
+    p = tmp_path / "w.db"
+    p.write_bytes(b"")
+    SqliteWatermarkStore(p).close()
+    assert _user_version(p) == schema.SCHEMA_VERSION
+
+
+def test_old_store_with_tables_is_not_stamped(tmp_path):
+    p = _store_at_version(tmp_path, 0, with_rows=True)
+    SqliteWatermarkStore(p).close()
+    assert _user_version(p) == 0          # migrate must still run
+
+
+def test_migrate_creates_missing_store_when_not_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    rep = schema.migrate(str(tmp_path / "w.db"))
+    assert rep.to_version == schema.SCHEMA_VERSION
+    assert _user_version(tmp_path / "w.db") == schema.SCHEMA_VERSION
+
+
+def test_migrate_creates_zero_length_store_when_not_root(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    (tmp_path / "w.db").write_bytes(b"")
+    rep = schema.migrate(str(tmp_path / "w.db"))
+    assert rep.to_version == schema.SCHEMA_VERSION
+
+
+def test_migrate_as_root_still_refuses_missing_store(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 0)
+    with pytest.raises(FileNotFoundError):
+        schema.migrate(str(tmp_path / "w.db"))
+
+
+def test_created_store_is_group_writable(tmp_path, monkeypatch):
+    monkeypatch.setattr(os, "geteuid", lambda: 1000)
+    schema.migrate(str(tmp_path / "w.db"))
+    assert (tmp_path / "w.db").stat().st_mode & 0o060 == 0o060
+
+
+def test_cli_migrate_creates_missing_store_when_not_root(tmp_path):
+    if os.geteuid() == 0:
+        pytest.skip("root never creates the store")
+    db = tmp_path / "w.db"
+    r = _cli("migrate", "--db", str(db))
+    assert r.returncode == 0, r.stderr
+    assert _user_version(db) == schema.SCHEMA_VERSION
