@@ -638,3 +638,65 @@ def test_v2_born_shared_store_splits_without_a_skip(tmp_path):
         assert sorted(shipped) == expected, producer   # nothing skipped
         assert len(shipped) == len(set(shipped))
         assert replayed == 0
+
+
+# ---- end to end: a moved retry replays (spec test 2; final review I2) ---------------
+
+
+@pytest.mark.parametrize("keep", [PSK_PIPE, MS_PIPE])
+def test_a_moved_retry_replays_once_and_advances_the_keep_key(tmp_path, keep):
+    sink = tmp_path / "sink.db"
+    truth = _build(sink, with_column=True)
+    _tag_ids(sink)
+    ids = sorted(truth)
+    L, X = ids[len(ids) // 3], ids[2 * len(ids) // 3]
+    # Trim the rows up to the old record, so the pass must move the retry.
+    conn = sqlite3.connect(sink)
+    conn.execute("DELETE FROM pending_uploads WHERE id <= ?", (L,))
+    conn.commit()
+    conn.close()
+    db = _store_v1(tmp_path / "state", cursor=str(L).encode())
+    s = SqliteWatermarkStore(db)
+    s.enqueue_deliverable(
+        pipeline="psk-pskreporter", payload_blob=b"RETRY",
+        enqueued_at="2026-10-18T12:01:00+00:00",
+        next_attempt_at="2000-01-01T00:00:00+00:00",
+        cursor_after=str(X).encode(), commit_token=str(X).encode(),
+        source_id=OLD[0], dest_id=OLD[1], table=OLD[2])
+    s.close()
+
+    report = schema.migrate(str(db), ctx=MigrateContext(sink_path=sink,
+                                                        keep_retry_for=keep))
+    assert any("moved" in line and keep in line for line in report.lines)
+
+    store = SqliteWatermarkStore(db)
+    pipes, transports = [], {}
+    for name, producer in ((PSK_PIPE, PSK), (MS_PIPE, MS)):
+        transports[name] = _Pskreporter()
+        pipes.append(Pipeline(
+            name=name, source=_src(sink, producer=producer, delete_on_commit=False),
+            transport=transports[name], watermark=store, identity=_ident(),
+            batch_limit=2))
+    uploader = Uploader(pipes)
+    try:
+        uploader.pump_until_idle()
+    finally:
+        uploader.close()
+
+    other = MS_PIPE if keep == PSK_PIPE else PSK_PIPE
+    owner = {PSK_PIPE: PSK, MS_PIPE: MS}
+    assert transports[keep].replayed == [b"RETRY"]       # once, on the keeper
+    assert transports[other].replayed == []
+    keep_ids = sorted(r.columns["_id"] for b in transports[keep].shipped
+                      for r in b.records)
+    other_ids = sorted(r.columns["_id"] for b in transports[other].shipped
+                       for r in b.records)
+    # The keeper's replay covered (L, X], so its source ships only after X.
+    assert keep_ids == sorted(i for i, t in truth.items()
+                              if i > X and t["owner"] == owner[keep])
+    # The other pipeline re-reads its own rows from the old record.
+    assert other_ids == sorted(i for i, t in truth.items()
+                               if i > L and t["owner"] == owner[other])
+    # The replay ack advanced the keep key, not the frozen old one.
+    rows = _watermarks(db)
+    assert rows[OLD][0] == str(L).encode()
