@@ -27,7 +27,10 @@ from typing import (
     Sequence,
 )
 
+import threading
+
 from .watermark.base import Advance
+from .watermark.sqlite import BACKWARD_WARN_INTERVAL_S
 
 if TYPE_CHECKING:
     from .sources.base import Source
@@ -253,9 +256,16 @@ class Uploader:
         *,
         now_fn: _NowFn = time.time,
         on_batch_outcome: Optional[Callable[["Pipeline", "RecordBatch", "Outcome"], None]] = None,
+        clock: Callable[[], float] = time.monotonic,
     ):
         self.pipelines: list[Pipeline] = list(pipelines)
         self._now = now_fn
+        # "acked, record held" windows, one per send-record key:
+        # key -> [window start on `clock`, refusals since the last INFO].
+        # Pipelines pump on their own threads, hence the lock.
+        self._clock = clock
+        self._held_windows: dict[tuple[str, str, str], list] = {}
+        self._held_lock = threading.Lock()
         self._on_batch_outcome = on_batch_outcome or (lambda *_a, **_kw: None)
         # Per-pipeline dedicated executor (max_workers=1) so each
         # pipeline's pump always runs on the same worker thread.  This
@@ -464,8 +474,8 @@ class Uploader:
         ts = _iso(now)
         table = pipe.transport.primary_table()
         if outcome.kind == "acked":
-            _advance(pipe, pipe.source_id(), pipe.dest_id(), table,
-                     batch.cursor_after, ts)
+            self._advance(pipe, pipe.source_id(), pipe.dest_id(), table,
+                          batch.cursor_after, ts)
             pipe.source.commit(batch.commit_token)
             pipe.watermark.record_attempt(
                 ts=ts, source_id=pipe.source_id(), dest_id=pipe.dest_id(),
@@ -478,8 +488,8 @@ class Uploader:
             # whole token (sources that need finer-grained "which rejected
             # records did NOT get acked" can encode that into commit_token,
             # but the v1 file source either acks all or none).
-            _advance(pipe, pipe.source_id(), pipe.dest_id(), table,
-                     outcome.accepted_cursor or batch.cursor_after, ts)
+            self._advance(pipe, pipe.source_id(), pipe.dest_id(), table,
+                          outcome.accepted_cursor or batch.cursor_after, ts)
             pipe.source.commit(batch.commit_token)
             pipe.watermark.record_attempt(
                 ts=ts, source_id=pipe.source_id(), dest_id=pipe.dest_id(),
@@ -524,6 +534,69 @@ class Uploader:
             return
         raise RuntimeError(f"Unhandled outcome kind: {outcome.kind!r}")
 
+    def _advance(
+        self, pipe: Pipeline, source_id: str, dest_id: str, table: str,
+        cursor: bytes, last_ack: str,
+    ) -> Advance:
+        """Advance one send record after an ack, forward only (spec §4.6).
+
+        A refused write means the destination took the batch while the
+        stored record already lies further on; the record stays put.  That
+        gets logged as "acked, record held", never as a plain ack, through
+        ``_log_record_held``.
+        """
+        result = pipe.watermark.advance_cursor(
+            source_id, dest_id, table, cursor=cursor, last_ack=last_ack,
+            is_after=_is_after_for(pipe.source),
+        )
+        if result is Advance.REFUSED:
+            self._log_record_held(pipe, (source_id, dest_id, table), cursor)
+        return result
+
+    def _log_record_held(
+        self, pipe: Pipeline, key: tuple[str, str, str], cursor: bytes,
+    ) -> None:
+        """Log a refused advance without flooding the journal.
+
+        The first refusal on a key logs at INFO and opens a window of
+        ``BACKWARD_WARN_INTERVAL_S`` on ``self._clock``.  Inside the
+        window each further one adds to the key's count and logs at
+        DEBUG.  The first one after the window logs one INFO with the
+        count since the last INFO (itself included), then opens a new
+        window.  Every line says "acked, record held".  A logging
+        failure never reaches the pump.
+        """
+        try:
+            with self._held_lock:
+                now = self._clock()
+                window = self._held_windows.get(key)
+                if window is None:
+                    self._held_windows[key] = [now, 0]
+                    logger.info(
+                        "%s: acked, record held: send record (%s, %s, %s) "
+                        "stays ahead of %r (repeats on this key log at DEBUG "
+                        "for %d s, then one INFO counts them)",
+                        pipe.name, *key, cursor, BACKWARD_WARN_INTERVAL_S,
+                    )
+                    return
+                window[1] += 1
+                if now - window[0] < BACKWARD_WARN_INTERVAL_S:
+                    logger.debug(
+                        "%s: acked, record held again: send record "
+                        "(%s, %s, %s) stays ahead of %r (%d since the last "
+                        "INFO)", pipe.name, *key, cursor, window[1],
+                    )
+                    return
+                logger.info(
+                    "%s: acked, record held: send record (%s, %s, %s) "
+                    "refused %d %s since the last INFO, the latest new %r",
+                    pipe.name, *key, window[1],
+                    "time" if window[1] == 1 else "times", cursor,
+                )
+                self._held_windows[key] = [now, 0]
+        except Exception:  # noqa: BLE001 — logging must not stop the pump
+            pass
+
     def _handle_outcome(
         self,
         pipe: Pipeline,
@@ -539,7 +612,7 @@ class Uploader:
             # missing: without it, a source's cursor would never
             # advance for a batch that succeeded only on retry.
             if deliverable.cursor_after:
-                _advance(
+                self._advance(
                     pipe,
                     deliverable.source_id or pipe.source_id(),
                     deliverable.dest_id or pipe.dest_id(),
@@ -648,28 +721,6 @@ def _iso(epoch: float) -> str:
 
 def _always_after(new: bytes, stored: bytes) -> bool:
     return True
-
-
-def _advance(
-    pipe: "Pipeline", source_id: str, dest_id: str, table: str,
-    cursor: bytes, last_ack: str,
-) -> Advance:
-    """Advance one send record after an ack, forward only (spec §4.6).
-
-    A refused write means the destination took the batch while the
-    stored record already lies further on; the record stays put.  That
-    gets logged as "acked, record held", never as a plain ack.
-    """
-    result = pipe.watermark.advance_cursor(
-        source_id, dest_id, table, cursor=cursor, last_ack=last_ack,
-        is_after=_is_after_for(pipe.source),
-    )
-    if result is Advance.REFUSED:
-        logger.info(
-            "%s: acked, record held: send record (%s, %s, %s) stays ahead "
-            "of %r", pipe.name, source_id, dest_id, table, cursor,
-        )
-    return result
 
 
 def _is_after_for(source: "Source") -> Callable[[bytes, bytes], bool]:

@@ -433,7 +433,8 @@ def test_core_logs_acked_record_held(tmp_path, memory_transport, caplog):
     held = [r.getMessage() for r in caplog.records
             if r.name == _CORE_LOG and "acked, record held" in r.getMessage()]
     assert len(held) == 1, held
-    assert "test" in held[0] and "b'3'" in held[0]
+    assert held[0].startswith("test: acked, record held"), held[0]
+    assert "b'3'" in held[0]
     # The destination took the batch, so the attempt still records an ack.
     (attempt,) = wm.recent_attempts(limit=1)
     assert attempt["outcome"] == "acked"
@@ -455,6 +456,41 @@ def test_core_logs_a_refused_replay_ack_as_record_held(tmp_path, memory_transpor
     assert wm.get_cursor(*_KEY) == b"50"
     assert any("acked, record held" in r.getMessage()
                for r in caplog.records if r.name == _CORE_LOG)
+
+
+def _core_held(caplog) -> list[tuple[str, str]]:
+    return [(r.levelname, r.getMessage()) for r in caplog.records
+            if r.name == _CORE_LOG and "acked, record held" in r.getMessage()]
+
+
+def test_core_logs_record_held_once_per_key_per_window(tmp_path, memory_transport, caplog):
+    # The stored record reads b"10" and every pump re-ships b"2", b"3": each
+    # ack gets refused.  One INFO per key per window; DEBUG between; the
+    # first INFO after the window counts the refusals since the last one.
+    clock = _Clock()
+    src = _IntOrderSource(records=_records(3))
+    pipe, wm = _pipe(tmp_path, memory_transport, src)
+    wm._write_cursor(*_KEY, cursor=b"10", last_ack="t0")
+    up = Uploader([pipe], clock=clock)
+    with caplog.at_level(logging.DEBUG, logger=_CORE_LOG):
+        for _ in range(3):                       # inside one window
+            up.pump()
+            clock.t += 60.0
+        clock.t = 1000.0 + BACKWARD_WARN_INTERVAL_S
+        up.pump()                                # the window has passed
+        clock.t += 1.0
+        up.pump()                                # a new window: DEBUG again
+    assert wm.results == [Advance.REFUSED] * 5
+    got = _core_held(caplog)
+    assert [lvl for lvl, _ in got] == ["INFO", "DEBUG", "DEBUG", "INFO", "DEBUG"], got
+    assert got[0][1].startswith("test: acked, record held: send record (%s, %s, %s)" % _KEY)
+    assert "3 times since the last INFO" in got[3][1], got[3][1]
+    assert "(1 since the last INFO)" in got[4][1], got[4][1]
+
+
+def test_the_core_window_is_per_key_and_on_the_monotonic_clock():
+    default = inspect.signature(Uploader.__init__).parameters["clock"].default
+    assert default is time.monotonic
 
 
 def test_a_written_advance_never_says_record_held(tmp_path, memory_transport, caplog):
@@ -613,6 +649,34 @@ def test_a_database_error_rolls_back_and_raises(tmp_path):
     with pytest.raises(sqlite3.OperationalError):
         _write(store, _KEY, b"2", "t1")
     assert store._conn.in_transaction is False
+
+
+class _RollbackFails:
+    """The store's connection, except that rollback() raises."""
+
+    def __init__(self, conn):
+        self._c = conn
+
+    def rollback(self):
+        raise RuntimeError("rollback bug")
+
+    def __getattr__(self, name):
+        return getattr(self._c, name)
+
+
+def test_a_failed_rollback_keeps_the_original_error(tmp_path):
+    store = SqliteWatermarkStore(tmp_path / "wm.db")
+    store._write_cursor(*_KEY, cursor=b"1", last_ack="t0")
+    store._conn.execute("DROP TABLE watermarks")
+    store._conn.commit()
+    real = store._conn
+    store._conn = _RollbackFails(real)
+    try:
+        with pytest.raises(sqlite3.OperationalError):
+            _write(store, _KEY, b"2", "t1")
+    finally:
+        store._conn = real
+        real.rollback()
 
 
 # ---- the warning windows count from zero, and the texts stay exact -------------

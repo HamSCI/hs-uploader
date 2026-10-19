@@ -266,7 +266,11 @@ class SqliteWatermarkStore:
                 result = self._advance_in_txn(key, cursor, last_ack, is_after)
                 self._conn.commit()
             except BaseException:
-                self._conn.rollback()
+                try:
+                    self._conn.rollback()
+                except Exception:  # noqa: BLE001 — keep the original error
+                    logger.debug("send record (%s, %s, %s): rollback failed",
+                                 *key, exc_info=True)
                 raise
             return result
 
