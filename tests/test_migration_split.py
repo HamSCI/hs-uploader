@@ -700,3 +700,21 @@ def test_a_moved_retry_replays_once_and_advances_the_keep_key(tmp_path, keep):
     # The replay ack advanced the keep key, not the frozen old one.
     rows = _watermarks(db)
     assert rows[OLD][0] == str(L).encode()
+
+
+def test_a_moved_retry_without_cursor_after_says_both_producers_resend(tmp_path):
+    # A retry queued before v3.70 may carry no cursor_after.  Its ack then
+    # advances no send record, so each producer re-reads and re-sends its
+    # rows of that batch (final review M2).
+    db = _store_v1(tmp_path)
+    _retry(db, keyed=False, cursor_after=b"")
+
+    report = schema.migrate(str(db), ctx=MigrateContext(keep_retry_for=PSK_PIPE))
+
+    (line,) = [l for l in report.lines if "moved" in l]
+    assert "no cursor_after" in line and "both producers re-send" in line
+    # A retry that carries one says nothing of the kind.
+    db = _store_v1(tmp_path / "b")
+    _retry(db)
+    report = schema.migrate(str(db), ctx=MigrateContext(keep_retry_for=PSK_PIPE))
+    assert not any("re-send" in l for l in report.lines)

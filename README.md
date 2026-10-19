@@ -174,7 +174,11 @@ starts the daemon again.
   re-reads those rows.  It deletes one only when both producer keys hold a
   record.
   Otherwise the retry moves to the pipeline named by `--keep-retry-for`
-  (`psk-recorder-pskreporter` or `meteor-scatter-pskreporter`).  Without
+  (`psk-recorder-pskreporter` or `meteor-scatter-pskreporter`).  It replays
+  once there and its ack advances that pipeline's key, so only the other
+  producer re-sends its own rows of that batch.  A retry queued before
+  v3.70 may carry no `cursor_after`.  Its ack then advances no key, and both
+  producers re-send their rows of its batch; the report line says so.  Without
   that flag the retry stays.  Dead letters stay.
 - `--check` exits 3 when a migrate would write: a pending migration, a
   producer key to fill, a retry the pass would delete or move, or a hot

@@ -51,7 +51,11 @@ It handles each deliverable still queued under ``psk-pskreporter``:
 * the sink still holds its rows and both producer keys hold a record:
   delete it, and each new pipeline re-reads its own rows;
 * otherwise, with ``keep_retry_for`` named: move it whole to that
-  pipeline, under that pipeline's source part;
+  pipeline, under that pipeline's source part.  It replays once there,
+  and its ack advances that pipeline's key, so only the other producer
+  re-sends its own rows of the batch.  A retry queued before v3.70 may
+  carry no ``cursor_after``; its ack then advances nothing, and both
+  producers re-send their rows of its batch;
 * otherwise: leave it where it stands, and say so.
 
 "The sink still holds its rows" means ``sink_path`` was given and its
@@ -458,8 +462,15 @@ def _retry_lines(plan: list[_RetryAction], *, done: bool) -> list[str]:
             out.append(f"{head}: {verb}; {a.reason}")
         elif a.action == "move":
             verb = "moved" if done else "would move"
-            out.append(f"{head}: {verb} to {a.to_pipeline} under "
-                       f"{a.to_source}; {a.reason}")
+            line = (f"{head}: {verb} to {a.to_pipeline} under "
+                    f"{a.to_source}; {a.reason}")
+            if not a.cursor_after:
+                # Queued before v3.70: its ack advances no send record, so
+                # the keeper re-reads its rows too (final review M2).
+                line += ("; it carries no cursor_after, so its ack advances "
+                         "no send record and both producers re-send their "
+                         "rows of its batch")
+            out.append(line)
         else:
             out.append(f"{head}: stays under {OLD_PSKREPORTER_PIPELINE}; "
                        f"{a.reason}, and no --keep-retry-for names a "
