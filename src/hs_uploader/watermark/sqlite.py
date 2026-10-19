@@ -183,11 +183,21 @@ class SqliteWatermarkStore:
             return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
 
     def record_pipeline_states(
-        self, states: "list[tuple[str, str, str]]"
+        self, states: "list[tuple[str, str, str]]", replace: bool = False
     ) -> None:
-        """Upsert (name, client, refused_reason) rows in one transaction."""
+        """Upsert (name, client, refused_reason) rows in one transaction.
+
+        ``replace`` makes the table hold exactly ``states``: rows for names
+        not in it go in the same transaction (ruling 4; the table reflects
+        the current manifest only).
+        """
         now = datetime.now(timezone.utc).isoformat()
         with self._lock, self._conn:
+            if replace:
+                keep = [n for n, _, _ in states]
+                self._conn.execute(
+                    "DELETE FROM pipeline_state WHERE name NOT IN (%s)"
+                    % ",".join("?" * len(keep)), keep)
             self._conn.executemany(
                 "INSERT INTO pipeline_state (name, client, refused_reason, updated_at)"
                 " VALUES (?, ?, ?, ?)"
@@ -639,6 +649,16 @@ class SqliteWatermarkStore:
                     (pipeline,),
                 ).fetchone()
             return int(row["n"])
+
+    def superseded_by(
+        self, source_id: str, dest_id: str, table: str
+    ) -> list[str]:
+        """New source ids that replaced this key (spec 4.5); [] when live."""
+        with self._lock:
+            return [r[0] for r in self._conn.execute(
+                "SELECT DISTINCT new_source_id FROM superseded_keys "
+                "WHERE old_source_id=? AND old_dest_id=? AND old_table=? "
+                "ORDER BY new_source_id", (source_id, dest_id, table))]
 
     def reset_cursor(
         self, source_id: str, dest_id: str, table: str

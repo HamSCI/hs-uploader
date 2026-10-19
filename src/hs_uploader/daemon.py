@@ -190,7 +190,8 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     built = pipelines
     pipelines, refused = split_refused(built, watermark.schema_version())
     watermark.record_pipeline_states(
-        [(p.name, p.client, refused.get(p.name, "")) for p in built])
+        [(p.name, p.client, refused.get(p.name, "")) for p in built],
+        replace=True)
     if not pipelines:
         logger.error("daemon: every pipeline refused — nothing to do")
         return 1

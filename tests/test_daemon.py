@@ -180,3 +180,25 @@ def test_old_store_refuses_only_producer_pipelines(tmp_path, monkeypatch, caplog
     assert "version 1" in reason and "2" in reason
     # a table, not a migration: the number is untouched
     assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+
+
+def test_pipeline_state_reflects_current_manifest_only(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    store = SqliteWatermarkStore(tmp_path / "watermarks.db")
+    store.record_pipeline_state("psk-pskreporter", "psk-recorder")
+    store.close()
+    manifest = {"pipeline": [_plain_pipeline(tmp_path)]}
+    monkeypatch.setattr(daemon, "load_manifest", lambda p: manifest)
+
+    class _Spy:
+        def __init__(self, pipelines, **kw):
+            pass
+
+        def pump_until_idle(self):
+            return 1
+
+    monkeypatch.setattr(daemon, "Uploader", _Spy)
+    assert daemon.run("ignored.toml", once=True) == 0
+    store = SqliteWatermarkStore(tmp_path / "watermarks.db")
+    assert [r["name"] for r in store.pipeline_states()] == ["grape-generic"]

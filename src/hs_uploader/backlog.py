@@ -57,6 +57,16 @@ def _is_recent(ts: str, cutoff: datetime) -> bool:
     return t >= cutoff
 
 
+def _optional_rows(conn: sqlite3.Connection, sql: str) -> list:
+    """Rows of ``sql``, or [] when its table does not exist yet."""
+    try:
+        return list(conn.execute(sql))
+    except sqlite3.OperationalError as exc:
+        if "no such table" in str(exc):
+            return []
+        raise
+
+
 def summarize(watermark_db_path: Union[str, Path],
               now: Optional[datetime] = None) -> dict:
     """Summarize deliverable/dead-letter backlog + cursors, read-only.
@@ -67,9 +77,20 @@ def summarize(watermark_db_path: Union[str, Path],
          "pipelines": [{"name": <pipeline>, "deliverable_count": int,
                          "dead_letter_count": int,
                          "dead_letter_recent_count": int,
-                         "dead_letter_newest": str | None}, ...],
+                         "dead_letter_newest": str | None,
+                         "client": str, "refused_reason": str}, ...],
          "cursors": [{"source_id": ..., "dest_id": ..., "table_name": ...,
-                       "last_ack": ..., "cursor_len": int}, ...]}
+                       "last_ack": ..., "cursor_len": int,
+                       "superseded_by": [new source ids; [] when live]}, ...],
+         "orphaned_dead_letters": int}
+
+    ``client`` and ``refused_reason`` come from ``pipeline_state`` (what the
+    daemon knew at its last start; "" when the table is absent or has no row
+    for the name).  Every pipeline in ``pipeline_state`` appears, idle or not.
+    ``orphaned_dead_letters`` counts dead letters whose pipeline the current
+    manifest no longer builds (no ``pipeline_state`` row); it is 0 when
+    ``pipeline_state`` holds no rows, since orphans cannot then be told.
+    ``superseded_by`` reads ``superseded_keys`` (spec 4.5).
 
     ``pipelines`` is derived from the distinct pipeline names present
     in the store's own ``deliverables`` and ``dead_letter`` tables (a
@@ -124,6 +145,14 @@ def summarize(watermark_db_path: Union[str, Path],
             }
             dead_rows = list(conn.execute(
                 "SELECT pipeline, ts FROM dead_letter"))
+            # The two tables of spec 4.5 are absent on a version-1 store;
+            # that is a normal state, not an unreadable one.
+            superseded = _optional_rows(
+                conn, "SELECT old_source_id, old_dest_id, old_table, "
+                      "new_source_id FROM superseded_keys")
+            states = _optional_rows(
+                conn, "SELECT name, client, refused_reason "
+                      "FROM pipeline_state ORDER BY name")
         finally:
             conn.close()
     except Exception as exc:  # noqa: BLE001 — deliberately catch-all
@@ -141,10 +170,27 @@ def summarize(watermark_db_path: Union[str, Path],
         if name not in dead_letter_newest or ts > dead_letter_newest[name]:
             dead_letter_newest[name] = ts
 
-    pipeline_names = sorted(set(deliverable_counts) | set(dead_letter_counts))
+    successors: dict = {}
+    for row in superseded:
+        key = (row["old_source_id"], row["old_dest_id"], row["old_table"])
+        successors.setdefault(key, set()).add(row["new_source_id"])
+    for cur in cursors:
+        key = (cur["source_id"], cur["dest_id"], cur["table_name"])
+        cur["superseded_by"] = sorted(successors.get(key, ()))
+
+    known = {row["name"]: row for row in states}
+    pipeline_names = sorted(
+        set(deliverable_counts) | set(dead_letter_counts) | set(known))
+    # With no pipeline_state rows (a version-1 store, or a daemon that has
+    # not started since the upgrade) "orphaned" cannot be told; count none.
+    orphaned = sum(n for name, n in dead_letter_counts.items()
+                   if name not in known) if known else 0
     pipelines = [
         {
             "name": name,
+            "client": known[name]["client"] if name in known else "",
+            "refused_reason": (known[name]["refused_reason"]
+                               if name in known else ""),
             "deliverable_count": deliverable_counts.get(name, 0),
             "dead_letter_count": dead_letter_counts.get(name, 0),
             "dead_letter_recent_count": dead_letter_recent.get(name, 0),
@@ -152,7 +198,8 @@ def summarize(watermark_db_path: Union[str, Path],
         }
         for name in pipeline_names
     ]
-    return {"readable": True, "pipelines": pipelines, "cursors": cursors}
+    return {"readable": True, "pipelines": pipelines, "cursors": cursors,
+            "orphaned_dead_letters": orphaned}
 
 
 def _main(argv: "list[str] | None" = None) -> int:

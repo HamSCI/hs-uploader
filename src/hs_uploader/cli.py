@@ -180,19 +180,32 @@ def main(argv: list[str] | None = None) -> int:
 
 
 def _cmd_status(args, store: SqliteWatermarkStore) -> int:
+    from . import backlog
     cursors = store.all_cursors()
     print(f"hs-uploader status — {store.path}")
     print(f"  {len(cursors)} cursor(s)")
     if cursors:
         for row in cursors:
+            new = store.superseded_by(
+                row["source_id"], row["dest_id"], row["table_name"])
+            mark = f" [SUPERSEDED by {', '.join(new)}]" if new else ""
             print(
                 f"    {row['source_id']} → {row['dest_id']} "
                 f"({row['table_name']}): last_ack={row['last_ack']} "
-                f"cursor_len={row['cursor_len']} bytes"
+                f"cursor_len={row['cursor_len']} bytes{mark}"
             )
     pending = store.deliverable_count()
     dl = store.dead_letter_count()
     print(f"  {pending} deliverable(s) pending retry, {dl} in dead-letter")
+    summary = backlog.summarize(store.path)
+    orphans = summary.get("orphaned_dead_letters", 0)
+    if orphans:
+        print(f"  {orphans} of those dead letter(s) belong to a pipeline the "
+              f"manifest no longer builds (orphaned)")
+    for p in summary.get("pipelines", []):
+        if p.get("refused_reason"):
+            print(f"  pipeline {p['name']} ({p.get('client') or '?'}) "
+                  f"REFUSED: {p['refused_reason']}")
     return 0
 
 
@@ -214,6 +227,14 @@ def _cmd_peek(args, store: SqliteWatermarkStore) -> int:
 
 
 def _cmd_reset_cursor(args, store: SqliteWatermarkStore) -> int:
+    new = store.superseded_by(args.source, args.dest, args.table)
+    if new:
+        print(
+            f"refusing: {args.source} → {args.dest} ({args.table}) is "
+            f"superseded by {', '.join(new)}; reset one of those instead",
+            file=sys.stderr,
+        )
+        return 2
     removed = store.reset_cursor(args.source, args.dest, args.table)
     if removed:
         print(

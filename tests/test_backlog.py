@@ -96,12 +96,14 @@ def test_populated_store_cursors_mirror_all_cursors(tmp_path):
     result = summarize(db)
 
     assert result["readable"] is True
-    assert result["cursors"] == expected
+    # all_cursors() columns, plus the spec 4.5 marker (empty: nothing superseded)
+    assert result["cursors"] == [dict(c, superseded_by=[]) for c in expected]
     # Field names are exactly what all_cursors() returns — no
     # invented "table" key, etc.
     for row in result["cursors"]:
         assert set(row) == {
             "source_id", "dest_id", "table_name", "last_ack", "cursor_len",
+            "superseded_by",
         }
 
 
@@ -114,7 +116,8 @@ def test_empty_store_is_readable_with_empty_lists(tmp_path):
 
     result = summarize(db)
 
-    assert result == {"readable": True, "pipelines": [], "cursors": []}
+    assert result == {"readable": True, "pipelines": [], "cursors": [],
+                      "orphaned_dead_letters": 0}
 
 
 # ---- failure modes ---------------------------------------------------------
@@ -329,3 +332,122 @@ def test_pipeline_without_dead_letters_reports_zero_recent(tmp_path):
 
     assert p["dead_letter_recent_count"] == 0
     assert p["dead_letter_newest"] is None
+
+
+# ---- Task 6: superseded keys, pipeline clients and refusals (spec 4.5) ----
+
+import sqlite3
+
+from hs_uploader.cli import main as cli_main
+
+
+def _supersede(store, old, new_ids):
+    for n in new_ids:
+        store._conn.execute(
+            "INSERT INTO superseded_keys VALUES (?,?,?,?,?,?,?)",
+            (old, "pskreporter", "psk.spots", n, "pskreporter", "psk.spots",
+             "2026-10-19T00:00:00+00:00"))
+    store._conn.commit()
+
+
+def test_summarize_marks_superseded_cursor(tmp_path):
+    db = tmp_path / "wm.db"
+    s = SqliteWatermarkStore(db)
+    s._write_cursor("sqlite:psk.spots", "pskreporter", "psk.spots",
+                    cursor=b"c", last_ack="2026-10-01T00:00:00+00:00")
+    s._write_cursor("sqlite:psk.spots@psk-recorder", "pskreporter", "psk.spots",
+                    cursor=b"c", last_ack="2026-10-01T00:00:00+00:00")
+    _supersede(s, "sqlite:psk.spots",
+               ["sqlite:psk.spots@psk-recorder", "sqlite:psk.spots@meteor-scatter"])
+    s.close()
+    cur = {c["source_id"]: c for c in summarize(db)["cursors"]}
+    assert cur["sqlite:psk.spots"]["superseded_by"] == [
+        "sqlite:psk.spots@meteor-scatter", "sqlite:psk.spots@psk-recorder"]
+    assert cur["sqlite:psk.spots@psk-recorder"]["superseded_by"] == []
+
+
+def test_summarize_reports_pipeline_client_and_refusal(tmp_path):
+    db = tmp_path / "wm.db"
+    s = SqliteWatermarkStore(db)
+    s.record_pipeline_states([("grape", "grape", ""),
+                              ("psk-recorder-pskreporter", "psk-recorder",
+                               "store is version 1; needs 2")])
+    s.close()
+    out = summarize(db)
+    by = {p["name"]: p for p in out["pipelines"]}
+    assert by["grape"]["client"] == "grape" and by["grape"]["refused_reason"] == ""
+    assert by["psk-recorder-pskreporter"]["client"] == "psk-recorder"
+    assert "version 1" in by["psk-recorder-pskreporter"]["refused_reason"]
+    assert by["grape"]["dead_letter_count"] == 0
+
+
+def test_summarize_counts_orphaned_dead_letters(tmp_path):
+    db = tmp_path / "wm.db"
+    s = SqliteWatermarkStore(db)
+    s.record_pipeline_states([("live", "grape", "")])
+    for name in ("live", "psk-pskreporter", "psk-pskreporter"):
+        s.send_to_dead_letter(ts="2026-05-08T13:00:00+00:00", pipeline=name,
+                              payload_blob=b"x", final_error="e")
+    s.close()
+    assert summarize(db)["orphaned_dead_letters"] == 2
+
+
+def test_summarize_version1_store_without_new_tables(tmp_path):
+    db = tmp_path / "wm.db"
+    s = SqliteWatermarkStore(db)
+    s._write_cursor("a", "b", "t", cursor=b"c", last_ack="x")
+    s.send_to_dead_letter(ts="2026-05-08T13:00:00+00:00", pipeline="p",
+                          payload_blob=b"x", final_error="e")
+    s._conn.execute("DROP TABLE superseded_keys")
+    s._conn.execute("DROP TABLE pipeline_state")
+    s._conn.commit()
+    s.close()
+    os.chmod(db, 0o444)
+    out = summarize(db)
+    assert out["readable"] is True
+    assert out["cursors"][0]["superseded_by"] == []
+    assert out["orphaned_dead_letters"] == 0
+    assert out["pipelines"][0]["client"] == ""
+    conn = sqlite3.connect(db)
+    tables = {r[0] for r in conn.execute("SELECT name FROM sqlite_master")}
+    conn.close()
+    assert "pipeline_state" not in tables and "superseded_keys" not in tables
+
+
+def test_status_marks_superseded_and_orphans(tmp_path, capsys):
+    db = tmp_path / "wm.db"
+    s = SqliteWatermarkStore(db)
+    s._write_cursor("sqlite:psk.spots", "pskreporter", "psk.spots",
+                    cursor=b"c", last_ack="2026-10-01T00:00:00+00:00")
+    _supersede(s, "sqlite:psk.spots", ["sqlite:psk.spots@psk-recorder"])
+    s.record_pipeline_states([("live", "grape", ""),
+                              ("psk-recorder-pskreporter", "psk-recorder",
+                               "needs store version 2")])
+    s.send_to_dead_letter(ts="2026-05-08T13:00:00+00:00",
+                          pipeline="psk-pskreporter", payload_blob=b"x",
+                          final_error="e")
+    s.close()
+    assert cli_main(["--state", str(db), "status"]) == 0
+    out = capsys.readouterr().out
+    assert "SUPERSEDED by sqlite:psk.spots@psk-recorder" in out
+    assert "1 of those dead letter(s)" in out and "orphaned" in out
+    assert "psk-recorder-pskreporter" in out and "REFUSED" in out
+
+
+def test_reset_cursor_refuses_superseded_key(tmp_path, capsys):
+    db = tmp_path / "wm.db"
+    s = SqliteWatermarkStore(db)
+    s._write_cursor("sqlite:psk.spots", "pskreporter", "psk.spots",
+                    cursor=b"c", last_ack="2026-10-01T00:00:00+00:00")
+    _supersede(s, "sqlite:psk.spots",
+               ["sqlite:psk.spots@psk-recorder", "sqlite:psk.spots@meteor-scatter"])
+    s.close()
+    rc = cli_main(["--state", str(db), "reset-cursor", "--source", "sqlite:psk.spots", "--dest",
+                   "pskreporter", "--table", "psk.spots"])
+    assert rc == 2
+    err = capsys.readouterr().err
+    assert "sqlite:psk.spots@psk-recorder" in err
+    assert "sqlite:psk.spots@meteor-scatter" in err
+    s = SqliteWatermarkStore(db)
+    assert len(s.all_cursors()) == 1   # nothing was removed
+    s.close()
