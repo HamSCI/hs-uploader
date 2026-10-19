@@ -280,6 +280,7 @@ def build_pipelines(
             retry=_retry(entry.get("retry")),
             batch_limit=int(entry.get("batch_limit", 1000)),
             max_records_per_pump=None if mrpp is None else int(mrpp),
+            client=str(entry.get("client") or ""),
         ))
         logger.info("pipeline-factory: built %s (%s → %s)",
                     name, type(source).__name__, transport.name)

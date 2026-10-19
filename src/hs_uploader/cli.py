@@ -102,6 +102,12 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_migrate.set_defaults(func=None)
 
+    sp_caps = sub.add_parser(
+        "capabilities",
+        help="Print the store schema version this release supports.",
+    )
+    sp_caps.set_defaults(func=None)
+
     sp_serve = sub.add_parser(
         "serve",
         help="Run the host uploader daemon — every outbound pipeline in the "
@@ -131,6 +137,10 @@ def main(argv: list[str] | None = None) -> int:
         )
         from . import daemon
         return daemon.run(args.manifest, dry_run=args.dry_run, once=args.once)
+    if args.cmd == "capabilities":
+        from .watermark import schema
+        print(schema.SCHEMA_VERSION)
+        return 0
     # `migrate` opens the file itself.  Constructing the store would create
     # a missing file and change its mode, and `--check` writes nothing.
     if args.cmd == "migrate":

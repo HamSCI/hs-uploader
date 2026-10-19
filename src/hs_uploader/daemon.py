@@ -135,10 +135,35 @@ def build_all_pipelines(
         if isinstance(built, Pipeline):
             built = [built]
         for p in built:
+            p.client = str(entry.get("client") or "")
             p.transport = wrap_if_discard(entry, p.transport)
         pipelines.extend(built)
         logger.info("daemon: builder %s contributed %d pipeline(s)", name, len(built))
     return pipelines
+
+
+# A pipeline whose source has a ``producer`` reads one client's rows and
+# keeps one send record per producer; it needs store version 2 (spec §4.7).
+_PRODUCER_STORE_VERSION = 2
+
+
+def split_refused(
+    pipelines: list[Pipeline], store_version: int
+) -> tuple[list[Pipeline], dict[str, str]]:
+    """Return (pipelines that may run, {name: reason} for the refused)."""
+    runnable: list[Pipeline] = []
+    refused: dict[str, str] = {}
+    for p in pipelines:
+        if (getattr(p.source, "producer", None)
+                and store_version < _PRODUCER_STORE_VERSION):
+            reason = (f"store is at schema version {store_version}; "
+                      f"producer pipelines need version "
+                      f"{_PRODUCER_STORE_VERSION} (run `hs-uploader migrate`)")
+            logger.error("daemon: refusing pipeline %s: %s", p.name, reason)
+            refused[p.name] = reason
+        else:
+            runnable.append(p)
+    return runnable, refused
 
 
 # ---- daemon -----------------------------------------------------------------
@@ -160,6 +185,14 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     pipelines = build_all_pipelines(manifest, watermark=watermark)
     if not pipelines:
         logger.error("daemon: no pipelines built from %s — nothing to do", manifest_path)
+        return 1
+
+    built = pipelines
+    pipelines, refused = split_refused(built, watermark.schema_version())
+    watermark.record_pipeline_states(
+        [(p.name, p.client, refused.get(p.name, "")) for p in built])
+    if not pipelines:
+        logger.error("daemon: every pipeline refused — nothing to do")
         return 1
 
     logger.info("daemon: %d pipeline(s): %s",

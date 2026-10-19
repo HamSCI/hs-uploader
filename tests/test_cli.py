@@ -240,3 +240,9 @@ def test_purge_before_keeps_rows_whose_time_cannot_be_read(tmp_path):
           "--before", "2026-10-10T00:00:00+00:00"])
 
     assert _dead(db) == [("not-a-time", "heartbeat")]
+
+
+def test_capabilities_prints_store_version(capsys):
+    from hs_uploader.watermark import schema
+    assert main(["capabilities"]) == 0
+    assert capsys.readouterr().out == f"{schema.SCHEMA_VERSION}\n"

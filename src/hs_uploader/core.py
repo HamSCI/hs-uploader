@@ -211,6 +211,9 @@ class Pipeline:
     # records have shipped or the source is exhausted, instead of
     # stopping after one batch.
     max_records_per_pump: Optional[int] = None
+    # The client package that owns this pipeline (manifest ``client``).
+    # The daemon records it in ``pipeline_state``; "" means unnamed.
+    client: str = ""
 
     def source_id(self) -> str:
         return self.source.source_id()

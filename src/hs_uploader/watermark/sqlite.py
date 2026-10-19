@@ -15,6 +15,8 @@ Schema:
   next_attempt_at)`` — retry queue persisted across restarts.
 * ``dead_letter(ts, pipeline, payload_blob, final_error)`` — terminal
   failures; cursor was NOT advanced.
+* ``pipeline_state(name, client, refused_reason, updated_at)`` — what the
+  daemon decided for each pipeline at its last start.
 """
 
 from __future__ import annotations
@@ -24,6 +26,7 @@ import logging
 import sqlite3
 import threading
 import time
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Optional
 
@@ -76,6 +79,13 @@ CREATE TABLE IF NOT EXISTS dead_letter (
     pipeline    TEXT NOT NULL,
     payload_blob BLOB NOT NULL,
     final_error TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS pipeline_state (
+    name           TEXT PRIMARY KEY,
+    client         TEXT NOT NULL,
+    refused_reason TEXT NOT NULL DEFAULT '',
+    updated_at     TEXT NOT NULL
 );
 """
 
@@ -152,6 +162,37 @@ class SqliteWatermarkStore:
                 # `hs-uploader migrate` still runs on it (spec §4.3).
                 from .schema import SCHEMA_VERSION
                 self._conn.execute("PRAGMA user_version = %d" % SCHEMA_VERSION)
+
+    def schema_version(self) -> int:
+        """The store's ``PRAGMA user_version``."""
+        with self._lock:
+            return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+
+    def record_pipeline_states(
+        self, states: "list[tuple[str, str, str]]"
+    ) -> None:
+        """Upsert (name, client, refused_reason) rows in one transaction."""
+        now = datetime.now(timezone.utc).isoformat()
+        with self._lock, self._conn:
+            self._conn.executemany(
+                "INSERT INTO pipeline_state (name, client, refused_reason, updated_at)"
+                " VALUES (?, ?, ?, ?)"
+                " ON CONFLICT(name) DO UPDATE SET client=excluded.client,"
+                " refused_reason=excluded.refused_reason,"
+                " updated_at=excluded.updated_at",
+                [(n, c, r, now) for n, c, r in states],
+            )
+
+    def record_pipeline_state(
+        self, name: str, client: str, refused_reason: str = ""
+    ) -> None:
+        self.record_pipeline_states([(name, client, refused_reason)])
+
+    def pipeline_states(self) -> list[sqlite3.Row]:
+        with self._lock:
+            return list(self._conn.execute(
+                "SELECT name, client, refused_reason, updated_at"
+                " FROM pipeline_state ORDER BY name"))
 
     def _chmod_group_writable(self) -> None:
         """Add group-write bit to the watermark db + its WAL/SHM

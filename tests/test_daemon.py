@@ -101,3 +101,81 @@ def test_load_manifest_and_dry_run(tmp_path, monkeypatch):
 
 def test_run_missing_manifest_returns_error():
     assert daemon.run("/nonexistent/pipelines.toml") == 1
+
+
+# ---- pipelines know their client; the daemon checks the store (spec 4.2, 4.7, 4.8)
+
+
+def _producer_pipeline(name="psk-recorder-pskreporter", client="psk-recorder"):
+    return {
+        "name": name, "client": client,
+        "source": {"type": "sqlite", "database": "psk", "table": "spots",
+                   "accepted_schema_versions": [2], "producer": "psk-recorder",
+                   "start_at": "now", "delete_on_commit": False},
+        "transport": {"type": "pskreporter",
+                      "decoding_software": "psk-recorder/0.1"},
+    }
+
+
+def _plain_pipeline(tmp_path):
+    return {
+        "name": "grape-generic", "client": "grape",
+        "source": {"type": "filetree", "root": str(tmp_path),
+                   "patterns": ["OBS*"], "retention": "keep",
+                   "match_dirs": True, "table": "grape.dataset"},
+        "transport": {"type": "psws_dataset", "instrument_id": "367",
+                      "table": "grape.dataset"},
+    }
+
+
+def test_client_from_manifest_generic_and_builder(tmp_path, monkeypatch):
+    monkeypatch.setattr(daemon, "resolve_builder", lambda spec: _fake_builder)
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    manifest = {
+        "pipeline": [
+            _plain_pipeline(tmp_path),
+            {"name": "via-builder", "builder": "pkg:fn", "client": "wsprdaemon-client",
+             "config": {"root": str(tmp_path)}},
+            {"name": "no-client", "builder": "pkg:fn",
+             "config": {"root": str(tmp_path)}},
+        ],
+    }
+    pipes = {p.name: p for p in daemon.build_all_pipelines(
+        manifest, watermark=SqliteWatermarkStore(":memory:"))}
+    assert pipes["grape-generic"].client == "grape"
+    assert pipes["via-builder"].client == "wsprdaemon-client"
+    assert pipes["no-client"].client == ""
+
+
+def test_old_store_refuses_only_producer_pipelines(tmp_path, monkeypatch, caplog):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    store = SqliteWatermarkStore(tmp_path / "watermarks.db")
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 1
+    store.close()
+    manifest = {"pipeline": [_producer_pipeline(), _plain_pipeline(tmp_path)]}
+    monkeypatch.setattr(daemon, "load_manifest", lambda p: manifest)
+    seen = {}
+
+    class _Spy:
+        def __init__(self, pipelines, **kw):
+            seen["names"] = [p.name for p in pipelines]
+
+        def pump_until_idle(self):
+            return 1
+
+    monkeypatch.setattr(daemon, "Uploader", _Spy)
+    with caplog.at_level("ERROR"):
+        assert daemon.run("ignored.toml", once=True) == 0
+    assert seen["names"] == ["grape-generic"]
+    assert sum(r.levelname == "ERROR" for r in caplog.records) == 1
+
+    store = SqliteWatermarkStore(tmp_path / "watermarks.db")
+    rows = {r["name"]: r for r in store.pipeline_states()}
+    assert rows["grape-generic"]["refused_reason"] == ""
+    assert rows["grape-generic"]["client"] == "grape"
+    reason = rows["psk-recorder-pskreporter"]["refused_reason"]
+    assert rows["psk-recorder-pskreporter"]["client"] == "psk-recorder"
+    assert "version 1" in reason and "2" in reason
+    # a table, not a migration: the number is untouched
+    assert store._conn.execute("PRAGMA user_version").fetchone()[0] == 1
