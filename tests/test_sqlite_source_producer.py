@@ -402,3 +402,24 @@ def test_factory_passes_producer_and_radiod_id(tmp_path, monkeypatch) -> None:
     assert got["plain"].producer is None and got["plain"].radiod_id is None
     assert got["by-producer"].source_id() == "sqlite:psk.spots@meteor-scatter"
     assert got["by-instance"].source_id() == "sqlite:psk.spots@psk-recorder/rx-a"
+
+
+# ---- key parts stay unambiguous (final review M7) --------------------------
+
+
+@pytest.mark.parametrize("kw", [
+    {"producer": "psk/recorder"},
+    {"producer": "psk@recorder"},
+    {"producer": PSK, "radiod_id": "rx/a"},
+    {"producer": PSK, "radiod_id": "rx@a"},
+])
+def test_a_slash_or_at_in_producer_or_radiod_id_is_refused(tmp_path, kw):
+    # source_id() reads `sqlite:<db>.<table>@<producer>/<radiod_id>`; either
+    # character inside a part would make that form ambiguous.
+    with pytest.raises(ValueError, match="'/' or '@'"):
+        _src(tmp_path / "sink.db", **kw)
+
+
+def test_plain_producer_and_radiod_id_still_accepted(tmp_path):
+    src = _src(tmp_path / "sink.db", producer=PSK, radiod_id="rx-a.1_b")
+    assert src.source_id() == "sqlite:psk.spots@psk-recorder/rx-a.1_b"

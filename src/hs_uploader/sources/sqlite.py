@@ -239,6 +239,13 @@ class SqliteSource:
         self.radiod_id = radiod_id or None
         if self.radiod_id is not None and self.producer is None:
             raise ValueError("radiod_id needs a producer")
+        # source_id() joins them as `@<producer>/<radiod_id>`; a '/' or '@'
+        # inside either would make that key ambiguous.
+        for name, value in (("producer", self.producer),
+                            ("radiod_id", self.radiod_id)):
+            if value is not None and ("/" in value or "@" in value):
+                raise ValueError(
+                    f"{name} {value!r} must not contain '/' or '@'")
         # Whether pending_uploads has the `producer` column; probed once
         # per connection (an old sink.db lacks it).
         self._has_producer_column: Optional[bool] = None
