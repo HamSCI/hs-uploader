@@ -557,10 +557,13 @@ def _check(db: Path, ctx: MigrateContext) -> MigrateReport:
             if m.preview is not None:
                 lines.extend(m.preview(conn, ctx))
         final = max([current] + [m.version for m in pending])
-        # A pending migration 2 copies every missing key itself, so the
-        # fill would find nothing left to copy after it.
+        # Only a pending migration 2 copies every missing key itself, so
+        # only it makes the fill redundant: the fill would find nothing left
+        # to copy after it.  A later migration does not copy keys, and
+        # migrate() still runs the fill after it, so --check must preview it.
         fill = (_fill_missing_producer_keys(conn, write=False)
-                if _fills(final) and not pending else [])
+                if _fills(final) and not any(m.version == 2 for m in pending)
+                else [])
         lines.extend(fill)
         plan = _plan_retries(conn, ctx, assume_filled=_fills(final))
         lines.extend(_retry_lines(plan, done=False))

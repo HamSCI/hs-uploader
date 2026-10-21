@@ -819,3 +819,39 @@ def test_cli_migrate_creates_missing_store_when_not_root(tmp_path):
     r = _cli("migrate", "--db", str(db))
     assert r.returncode == 0, r.stderr
     assert _user_version(db) == schema.SCHEMA_VERSION
+
+
+# ---- migrate --check previews the fill unless migration 2 itself waits -------------
+
+def _store_v2_missing_meteor_key(directory: Path) -> Path:
+    """A version-2 store: the shared pskreporter record, the psk-recorder
+    producer key, and no meteor-scatter key."""
+    directory.mkdir(parents=True, exist_ok=True)
+    db = directory / "watermarks.db"
+    s = SqliteWatermarkStore(db)
+    assert s.schema_version() == 2
+    s._write_cursor(*PSK_KEY, cursor=b"5", last_ack="2026-10-07T12:00:00+00:00")
+    s._write_cursor(*NEW_PSK_KEYS[1], cursor=b"9",
+                    last_ack="2026-10-18T12:30:00+00:00")
+    s.close()
+    return db
+
+
+def test_check_previews_fill_when_a_later_migration_waits(tmp_path, monkeypatch):
+    p = _store_v2_missing_meteor_key(tmp_path)
+    later = schema.Migration(
+        version=max(m.version for m in schema.MIGRATIONS) + 1,
+        summary="stand-in", apply=lambda conn, ctx: [], preview=None)
+    monkeypatch.setattr(schema, "MIGRATIONS", schema.MIGRATIONS + (later,))
+    rep = schema.migrate(str(p), check=True)
+    assert any("would copy" in ln and "meteor-scatter" in ln
+               for ln in rep.lines)                      # the fill line
+    assert rep.would_write
+    assert _user_version(p) == 2                         # nothing written
+
+
+def test_check_with_migration_2_pending_shows_its_own_preview_only(tmp_path):
+    db = _v0_store(tmp_path)
+    rep = schema.migrate(str(db), check=True)
+    copies = [ln for ln in rep.lines if "would copy" in ln]
+    assert len(copies) == 2        # migration 2's preview; no second fill pass
