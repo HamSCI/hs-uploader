@@ -26,6 +26,7 @@ from __future__ import annotations
 
 import logging
 import os
+import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -136,6 +137,26 @@ def _read_toml(path: Path) -> Mapping[str, Any]:
         return tomllib.load(fh)
 
 
+def _start_at_problem(source: Mapping[str, Any]) -> str:
+    """Why a file entry's ``start_at`` cannot stand, or "" (spec §3.2).
+
+    ``start_at = "now"`` never may.  A ``wspr_cycle`` source reads every value
+    except ``"beginning"`` as now (``WsprCycleSource._effective_cursor``; it
+    parses no datetime), so in a file it may name only ``"beginning"``, or
+    nothing, which defaults to it.
+    """
+    if "start_at" not in source:
+        return ""
+    value = source["start_at"]
+    if value == "now":
+        return 'start_at = "now" is not allowed in a pipeline file'
+    if (str(source.get("type", "")).strip().lower() == "wspr_cycle"
+            and value != "beginning"):
+        return (f"start_at = {value!r}: a wspr_cycle source reads it as now; "
+                f'a pipeline file may name only "beginning"')
+    return ""
+
+
 def _check_file(filename: str, data: Mapping[str, Any]) -> tuple[list[Mapping[str, Any]], str]:
     """Return (entries with ``client`` set, "") or ([], reason)."""
     client = filename[: -len(".toml")]
@@ -166,9 +187,10 @@ def _check_file(filename: str, data: Mapping[str, Any]) -> tuple[list[Mapping[st
         if not isinstance(governed, bool):
             return [], f"pipeline {label!r}: governed must be true or false"
         source = entry.get("source")
-        if isinstance(source, Mapping) and source.get("start_at") == "now":
-            return [], (f"pipeline {label!r}: start_at = \"now\" is not allowed "
-                        f"in a pipeline file")
+        if isinstance(source, Mapping):
+            reason = _start_at_problem(source)
+            if reason:
+                return [], f"pipeline {label!r}: {reason}"
         entries.append({**entry, "client": client})
     return entries, ""
 
@@ -198,7 +220,7 @@ def load_layout(manifest_path: str | Path, *,
 
     present = {n[: -len(".toml")] for n in names}   # "exists": parsed or not
     legacy = [(e, LEGACY) for e in (manifest.get("pipeline", []) or [])
-              if not (e.get("client") and e.get("client") in present)]
+              if str(e.get("client") or "") not in present]
 
     files: list[tuple[Mapping[str, Any], str]] = []
     refused: list[Refusal] = []
@@ -210,6 +232,9 @@ def load_layout(manifest_path: str | Path, *,
                                    f"([a-z0-9][a-z0-9-]*, not 'site')"))
             continue
         try:
+            if not stat.S_ISREG(os.stat(pdir / name).st_mode):
+                refused.append(Refusal(name, client, "not a regular file"))
+                continue
             data = _read_toml(pdir / name)
         except Exception as exc:  # parse error, unreadable, a directory ...
             refused.append(Refusal(name, client, f"cannot read: {exc}"))

@@ -320,10 +320,9 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     layout = load_layout(manifest_path, manifest=manifest)
     watermark = SqliteWatermarkStore(default_path())
     pipelines, file_refused = build_layout(layout, watermark=watermark)
-    if not pipelines:
-        logger.error("daemon: no pipelines built from %s — nothing to do", manifest_path)
-        return 1
 
+    # pipeline_state records every pipeline and every refused file before any
+    # early return, so a refusal always leaves its reason (ruling C15).
     built = pipelines
     pipelines, refused = split_refused(built, watermark.refresh_schema_version())
     watermark.record_pipeline_states(
@@ -331,8 +330,21 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
         + [(r.row_name, r.client, r.reason) for r in file_refused],
         replace=True)
     if not pipelines:
-        logger.error("daemon: every pipeline refused — nothing to do")
-        return 1
+        if file_refused:
+            # A refused file must not stop the daemon (spec §3.2, §13): exit
+            # here and systemd restarts it in a loop.  Run idle instead, so a
+            # rebuild can pick up the corrected file.
+            logger.error("daemon: no pipeline can run (%d pipelines.d file(s) "
+                         "refused: %s); running idle until a file changes",
+                         len(file_refused),
+                         ", ".join(r.row_name for r in file_refused))
+        elif not built:
+            logger.error("daemon: no pipelines built from %s — nothing to do",
+                         manifest_path)
+            return 1
+        else:
+            logger.error("daemon: every pipeline refused — nothing to do")
+            return 1
 
     logger.info("daemon: %d pipeline(s): %s",
                 len(pipelines), ", ".join(p.name for p in pipelines))

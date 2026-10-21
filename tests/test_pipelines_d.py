@@ -471,3 +471,91 @@ def test_load_layout_takes_signature_before_reading(station, monkeypatch):
     layout = pipelines_d.load_layout(station.manifest)
     assert order[0] == "sig" and "read" in order
     assert layout.signature == real_sig(station.pdir)
+
+
+# ---- fix round 1 (rulings C15, FIFO, unhashable client, wspr_cycle start_at) ------
+
+
+def test_broken_file_of_the_sole_client_runs_idle_and_records_why(
+        station, monkeypatch, caplog):
+    # C15: the only client's file breaks, so nothing builds.  The daemon must
+    # neither exit (systemd would loop on it) nor skip the refusal row.
+    station.legacy(_ft("psk-a", station.root / "psk1", client="psk-recorder"))
+    station.file("psk-recorder.toml", "[[pipeline]\nname = ")
+    monkeypatch.setattr(daemon, "Uploader", _Spy)
+    _Spy.seen = None
+    with caplog.at_level(logging.ERROR):
+        assert daemon.run(station.manifest, once=True) == 0
+    assert _Spy.seen == []
+    rows = {r["name"]: r for r in
+            SqliteWatermarkStore(station.root.parent / "watermarks.db")
+            .pipeline_states()}
+    assert set(rows) == {"pipelines.d/psk-recorder.toml"}
+    assert rows["pipelines.d/psk-recorder.toml"]["refused_reason"]
+    assert any("running idle" in r.getMessage() for r in caplog.records)
+
+
+def test_empty_build_without_refusals_still_exits_1(station, monkeypatch):
+    station.legacy()
+    monkeypatch.setattr(daemon, "Uploader", _Spy)
+    assert daemon.run(station.manifest, once=True) == 1
+
+
+def test_fifo_named_toml_is_refused_not_opened(station):
+    import os
+    import threading
+    station.legacy(_ft("grape-psws", station.root / "grape", client="grape"))
+    station.pdir.mkdir()
+    fifo = station.pdir / "psk.toml"
+    os.mkfifo(fifo)
+    out = {}
+    t = threading.Thread(
+        target=lambda: out.setdefault(
+            "layout", pipelines_d.load_layout(station.manifest)),
+        daemon=True)
+    t.start()
+    t.join(5)
+    blocked = t.is_alive()
+    if blocked:   # unblock the reader so the test run can end
+        fd = os.open(fifo, os.O_WRONLY | os.O_NONBLOCK)
+        os.close(fd)
+        t.join(5)
+    assert not blocked, "load_layout blocked on a FIFO"
+    r = _refusal(out["layout"].refused, "psk.toml")
+    assert "regular file" in r.reason
+
+
+def test_unhashable_legacy_client_does_not_raise(station):
+    station.legacy(_ft("odd", station.root / "grape",
+                       extra='client = ["a", "b"]\n'))
+    station.file("grape.toml", _ft("g", station.root / "x", instrument="2"))
+    layout = pipelines_d.load_layout(station.manifest)
+    assert [e["name"] for e, _ in layout.entries] == ["odd", "g"]
+
+
+@pytest.mark.parametrize("value", ['"NOW"', '""', '"later"',
+                                   "1979-05-27T07:32:00Z"])
+def test_wspr_cycle_in_a_file_takes_only_beginning(station, value):
+    station.legacy()
+    station.file("wspr.toml",
+                 _wspr("w", station.root / "sink.db")
+                 .replace("[pipeline.source]",
+                          f"[pipeline.source]\nstart_at = {value}"))
+    _, pipes, refused = station.build()
+    assert pipes == []
+    assert "start_at" in _refusal(refused, "wspr.toml").reason
+
+
+def test_wspr_cycle_beginning_accepted_in_a_file(station):
+    station.legacy()
+    station.file("wspr.toml", _wspr("w", station.root / "sink.db",
+                                    start_at="beginning"))
+    _, pipes, refused = station.build()
+    assert refused == [] and pipes[0].source.start_at == "beginning"
+
+
+def test_legacy_wspr_cycle_start_at_unchanged(station):
+    station.legacy(_wspr("w", station.root / "sink.db", client="wspr-recorder",
+                         start_at="later"))
+    _, pipes, refused = station.build()
+    assert refused == [] and pipes[0].source.start_at == "later"
