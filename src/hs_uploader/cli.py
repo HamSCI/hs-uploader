@@ -33,6 +33,10 @@ from pathlib import Path
 from .watermark.sqlite import SqliteWatermarkStore, default_path
 
 
+# A word appears only in the release that ships its code complete (spec 7.1).
+FEATURES = ("pipelines.d", "send-log-v3", "switch-files")
+
+
 def _build_parser() -> argparse.ArgumentParser:
     p = argparse.ArgumentParser(
         prog="hs-uploader",
@@ -126,6 +130,9 @@ def _build_parser() -> argparse.ArgumentParser:
         "capabilities",
         help="Print the store schema version this release supports.",
     )
+    sp_caps.add_argument(
+        "--features", action="store_true",
+        help="Print one feature word per line instead of the schema version.")
     sp_caps.set_defaults(func=None)
 
     sp_sink = sub.add_parser("sink", help="Sink switches (reported, not enforced).")
@@ -171,6 +178,12 @@ def main(argv: list[str] | None = None) -> int:
     if args.cmd == "sink":
         return _cmd_sink_status(args)
     if args.cmd == "capabilities":
+        if args.features:
+            for word in sorted(FEATURES):
+                print(word)
+            return 0
+        # Bare output stays one integer: sigmond v3.73-v3.76 reads it as
+        # int(stdout.strip()).
         from .watermark import schema
         print(schema.SCHEMA_VERSION)
         return 0

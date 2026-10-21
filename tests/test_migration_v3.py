@@ -138,11 +138,3 @@ def test_new_store_stamped_3_with_new_schema(tmp_path):
     assert "pipeline" in _cols(db) and "client" in _cols(db)
     assert _cols(db, "last_send") == ["client", "pipeline", "outcome", "ts",
                                       "records"]
-
-
-def test_capabilities_bare_prints_3():
-    out = subprocess.run(
-        [sys.executable, "-m", "hs_uploader.cli", "capabilities"],
-        capture_output=True, text=True, env={"PYTHONPATH": str(SRC)})
-    assert out.stdout == "3\n"
-    assert int(out.stdout.strip()) == 3

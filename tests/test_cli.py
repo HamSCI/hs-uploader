@@ -248,6 +248,27 @@ def test_capabilities_prints_store_version(capsys):
     assert capsys.readouterr().out == f"{schema.SCHEMA_VERSION}\n"
 
 
+def _run_caps(*extra):
+    import subprocess, sys, pathlib
+    src = pathlib.Path(__file__).resolve().parent.parent / "src"
+    return subprocess.run(
+        [sys.executable, "-m", "hs_uploader.cli", "capabilities", *extra],
+        capture_output=True, text=True, env={"PYTHONPATH": str(src)})
+
+
+def test_capabilities_bare_prints_3():
+    # spec test 20: a v3.73-v3.76 sigmond reads this as int(stdout.strip()).
+    out = _run_caps()
+    assert out.stdout == "3\n"
+    assert int(out.stdout.strip()) == 3
+
+
+def test_capabilities_features_names_what_this_release_does():
+    out = _run_caps("--features")
+    assert out.returncode == 0
+    assert out.stdout == "pipelines.d\nsend-log-v3\nswitch-files\n"
+
+
 # ---- sink status (spec 6.2) ----------------------------------------------------------
 
 import json as _json
