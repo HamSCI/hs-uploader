@@ -41,6 +41,7 @@ from pathlib import Path
 from typing import Iterator, Optional
 
 from ..core import Record, RecordBatch
+from ._local_rows import LocalRowFilter
 
 logger = logging.getLogger(__name__)
 
@@ -120,6 +121,8 @@ class WsprCycleSource:
         # Cached at-first-pump anchor so the "now" mode is stable across
         # multiple iter_batches calls before the first cycle ships.
         self._start_at_anchor: Optional[str] = None
+        # `local` column probe, once per connection (spec §5.2).
+        self._local_rows = LocalRowFilter()
 
     # -- Source protocol ----------------------------------------------------
 
@@ -167,11 +170,15 @@ class WsprCycleSource:
         # WANT to include, so `<=`.  When ungated, ceiling_iso is the
         # in-progress floor, exclusive, so `<`.
         op = "<=" if self.expected_reporters else "<"
+        local_sql = "".join(
+            f"  AND {c} " for c in self._local_rows.clause(conn)
+        )
         sql = (
             "SELECT DISTINCT json_extract(payload_json, '$.time') AS cycle "
             "FROM pending_uploads "
             "WHERE target_db = 'wspr' "
             "  AND target_table IN ('spots', 'noise') "
+            + local_sql +
             "  AND json_extract(payload_json, '$.time') > ? "
             f"  AND json_extract(payload_json, '$.time') {op} ? "
             "ORDER BY cycle ASC"
@@ -307,11 +314,15 @@ class WsprCycleSource:
         records: list[Record] = []
         n_spots = 0
         n_noise = 0
+        local_sql = "".join(
+            f"  AND {c} " for c in self._local_rows.clause(conn)
+        )
         for target_table, payload_json in conn.execute(
             "SELECT target_table, payload_json "
             "FROM pending_uploads "
             "WHERE target_db = 'wspr' "
             "  AND target_table IN ('spots', 'noise') "
+            + local_sql +
             "  AND json_extract(payload_json, '$.time') = ? "
             "ORDER BY id ASC",
             (cycle_iso,),
@@ -360,6 +371,7 @@ class WsprCycleSource:
             for (payload_json,) in conn.execute(
                 "SELECT payload_json FROM pending_uploads "
                 "WHERE target_db = 'psk' AND target_table = 'spots' "
+                + local_sql +
                 "  AND json_extract(payload_json, '$.time') >= ? "
                 "  AND json_extract(payload_json, '$.time') < ? "
                 "ORDER BY id ASC",

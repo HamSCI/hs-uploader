@@ -91,6 +91,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, Sequence, Union
 
 from ..core import Record, RecordBatch
+from ._local_rows import LocalRowFilter
 
 logger = logging.getLogger(__name__)
 
@@ -249,6 +250,9 @@ class SqliteSource:
         # Whether pending_uploads has the `producer` column; probed once
         # per connection (an old sink.db lacks it).
         self._has_producer_column: Optional[bool] = None
+        # Whether pending_uploads has the `local` column (spec §5.2);
+        # probed once per connection by the shared helper.
+        self._local_rows = LocalRowFilter()
         self.accepted_schema_versions = list(accepted_schema_versions)
         self.select_columns = list(select_columns) if select_columns else None
         self.start_at = start_at
@@ -463,6 +467,7 @@ class SqliteSource:
         try:
             conn = self._connect()
             scope_sql, scope_params = self._scope_clauses(conn)
+            scope_sql = scope_sql + self._local_rows.clause(conn)
             with conn:
                 conn.execute(
                     "DELETE FROM pending_uploads "
@@ -623,6 +628,10 @@ class SqliteSource:
         scope_sql, scope_params = self._scope_clauses(conn)
         clauses.extend(scope_sql)
         params.extend(scope_params)
+        # A local row never ships (spec §5.2).  Applies with or without
+        # a producer, and lands in the dedup CTE too, so a local row
+        # never wins a partition.
+        clauses.extend(self._local_rows.clause(conn or self._connect()))
 
         if self.accepted_schema_versions:
             placeholders = ",".join("?" for _ in self.accepted_schema_versions)
@@ -828,6 +837,7 @@ class SqliteSource:
             return self._start_at_cursor
         conn = self._connect()
         scope_sql, scope_params = self._scope_clauses(conn)
+        scope_sql = scope_sql + self._local_rows.clause(conn)
         row = conn.execute(
             "SELECT COALESCE(MAX(id), 0) FROM pending_uploads "
             "WHERE target_db = ? AND target_table = ?"
