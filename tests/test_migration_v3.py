@@ -96,12 +96,24 @@ def test_migration_3_adds_only_missing_columns(tmp_path):
     assert "attempts.client" in text and "attempts.pipeline" not in text
 
 
+def _v3_store_with_no_producer_keys(directory: Path) -> Path:
+    """Version 3, the shared pskreporter record only: neither producer key."""
+    from tests.test_watermark_schema import PSK_KEY
+    directory.mkdir(parents=True, exist_ok=True)
+    db = directory / "watermarks.db"
+    s = SqliteWatermarkStore(db)
+    s._write_cursor(*PSK_KEY, cursor=b"5", last_ack="2026-10-07T12:00:00+00:00")
+    s.close()
+    return db
+
+
 def test_fill_runs_at_version_3(tmp_path):
-    db = _store_v2_missing_meteor_key(tmp_path)
-    _set_version(db, 3)
+    db = _v3_store_with_no_producer_keys(tmp_path)
     SqliteWatermarkStore(db).close()      # opening adds nothing the fill needs
     rep = schema.migrate(str(db))
-    assert any("copied" in ln and "meteor-scatter" in ln for ln in rep.lines)
+    for name in ("@psk-recorder,", "@meteor-scatter,"):
+        assert any("copied" in ln and name in ln for ln in rep.lines), name
+    assert _user_version(db) == 3
     rep = schema.migrate(str(db), check=True)
     assert not rep.would_write
 

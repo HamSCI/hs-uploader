@@ -241,6 +241,11 @@ def test_write_rejects_unknown_state(tmp_path):
         ss.write_switch(tmp_path / "c.toml", {"state": "burst"})
 
 
+def test_dumps_toml_round_trips_an_empty_array():
+    data = {"state": "off", "hold": [], "t": {"xs": []}}
+    assert tomllib.loads(ss.dumps_toml(data)) == data
+
+
 def test_dumps_toml_round_trips():
     data = {
         "s": 'a "q" \\ b\nc\té', "b": True, "n": -3, "f": 1.5,
@@ -250,7 +255,7 @@ def test_dumps_toml_round_trips():
     assert tomllib.loads(ss.dumps_toml(data)) == data
 
 
-@pytest.mark.parametrize("bad", [{"a": None}, {"a": [1, 2]}, {"a": (1,)}, {"a": b"x"}, {1: 2}, {"a": []}])
+@pytest.mark.parametrize("bad", [{"a": None}, {"a": [1, 2]}, {"a": (1,)}, {"a": b"x"}, {1: 2}])
 def test_dumps_toml_rejects_other_types(bad):
     with pytest.raises(TypeError):
         ss.dumps_toml(bad)

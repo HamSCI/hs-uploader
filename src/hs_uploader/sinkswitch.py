@@ -179,7 +179,9 @@ def _is_table_array(v) -> bool:
 def _emit(table: Mapping, path: list[str], out: list[str]) -> None:
     subs = []
     for k, v in table.items():
-        if isinstance(v, Mapping) or isinstance(v, list):
+        if isinstance(v, list) and not v:
+            out.append(f"{_key(k)} = []")
+        elif isinstance(v, Mapping) or isinstance(v, list):
             subs.append((k, v))
         else:
             out.append(f"{_key(k)} = {_scalar(v)}")
@@ -200,7 +202,7 @@ def _emit(table: Mapping, path: list[str], out: list[str]) -> None:
 
 
 def dumps_toml(data: Mapping) -> str:
-    """Emit strings, booleans, integers, floats, tables and arrays of tables.
+    """Emit strings, booleans, integers, floats, tables, empty arrays and arrays of tables.
 
     Anything else raises TypeError.  (sigmond's `_set_toml_field` quotes every
     value, so `pinned = false` would read back as a string.)

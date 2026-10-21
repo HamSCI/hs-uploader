@@ -262,7 +262,10 @@ def _cmd_sink_status(args) -> int:
         print(f"  {_NO_FILES}")
     for name, d in [("site", site), *clients.items()]:
         err = f"  error: {d['error']}" if d["error"] else ""
-        print(f"  {name}: file {d['file']}, effective {d['effective']}{err}")
+        if has_dir:
+            print(f"  {name}: file {d['file']}, effective {d['effective']}{err}")
+        else:
+            print(f"  {name}: (no switch files; not enforced){err}")
     if no_client:
         print(f"  {no_client} pipeline(s) carry no client; "
               "no switch applies to them")

@@ -290,6 +290,8 @@ def test_sink_status_without_sinks_dir_says_so(tmp_path, capsys):
     out = capsys.readouterr().out
     assert "no switch files; the manifest's policy governs" in out
     assert "not enforced: the manifest's policy decides what ships" in out
+    assert "effective" not in out        # no verdict where nothing enforces
+    assert "c1: (no switch files; not enforced)" in out
 
 
 def test_sink_status_lists_site_and_each_client(tmp_path, capsys):

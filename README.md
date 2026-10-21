@@ -194,7 +194,9 @@ The daemon records each pipeline, and each refused file, in the store's
 **Rebuild.**  The daemon starts with the legacy manifest as it reads it and
 never re-reads it; an edit there waits for a restart.  Before each pump it
 stats `pipelines.d/`.  When the directory changed, or when the process
-receives SIGHUP, the daemon rebuilds between two pumps.  It keeps every
+receives SIGHUP, the daemon rebuilds between two pumps.  SIGHUP rebuilds
+from `pipelines.d/` without a restart, and `smd admin log hs-uploader
+--level` sends SIGHUP.  It keeps every
 pipeline whose entry did not change, running on its own thread with its
 own open source.  It closes the sources and transports of a pipeline that
 leaves, starts new ones, and runs the store-version check again.  A file
@@ -287,8 +289,8 @@ starts the daemon again.
   lets a v3.76 daemon, which names neither column, keep inserting.
 - Every migrate also copies the old record to a producer key that holds no
   record yet, and records it in `superseded_keys`.  It never touches a key
-  that exists.  A store the daemon created stands at version 2 with no
-  producer keys, and without this copy each producer pipeline would start
+  that exists.  A new store starts at version 3.  A store the v3.76 daemon
+  created sits at version 2 with no producer keys, and without this copy each producer pipeline would start
   at "now" and skip the rows the shared pipeline had not sent.
 - The retry pass runs on every migrate, after that copy.  It handles a
   retry still queued under `psk-pskreporter`.  With `--sink PATH`, a retry

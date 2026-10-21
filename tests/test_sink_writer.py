@@ -969,7 +969,14 @@ def test_from_env_and_init_both_take_local(tmp_path):
     w = Writer("psk", "spots", config=None, local=True)
     assert w.local is True
     assert Writer("psk", "spots").local is False
-    assert _writer(db, local=True).local is True
+    w = Writer.from_env(table="spots", mode="psk", local=True,
+                        env={"SIGMOND_SQLITE_PATH": str(db)},
+                        batch_rows=1000, auto_flush_seconds=0)
+    assert w.local is True
+    w.insert([{"mode": "ft8"}])
+    w.close()
+    with sqlite3.connect(db) as c:
+        assert c.execute("SELECT local FROM pending_uploads").fetchall() == [(1,)]
 
 
 def test_an_old_sink_gains_both_columns_and_then_the_index(tmp_path):

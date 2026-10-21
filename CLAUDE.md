@@ -210,7 +210,9 @@ explicit even when no third-party deps are required.
   (`pipeline_factory.default_start_at`); legacy keeps `"now"`.
 - `daemon.Rebuilder` holds the running set.  Before each pump the loop
   compares `pipelines_signature` (mtime, size, inode of the directory and
-  each entry) with the last build's; SIGHUP also triggers it.  The rebuild
+  each entry) with the last build's; SIGHUP also triggers it.  SIGHUP rebuilds from
+  `pipelines.d/` without a restart, and `smd admin log hs-uploader --level`
+  sends SIGHUP.  The rebuild
   runs between pumps, reuses each entry that did not change, passes the
   start's copy of the legacy manifest (the daemon never re-reads it), runs
   the store check against a freshly read version, and rewrites
