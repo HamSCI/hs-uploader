@@ -122,6 +122,9 @@ class WatermarkStore(Protocol):
         records: Optional[int],
         bytes_: Optional[int],
         error: Optional[str],
+        pipeline: str = "",
+        client: str = "",
+        last_send: bool = True,
     ) -> None:
         ...
 

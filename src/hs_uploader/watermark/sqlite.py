@@ -161,7 +161,9 @@ class SqliteWatermarkStore:
         # key -> `clock` reading at the last WARNING that a failed check
         # produced (the stored value or the comparator raised).
         self._check_failed_at: dict[tuple[str, str, str], float] = {}
+        self._v3 = False
         self._init_schema()
+        self.refresh_schema_version()
         # Make the db + its WAL/SHM sidecars group-writable so OTHER
         # users in the same supplementary group (sigmond) can write
         # to the same watermark store.  Multiple HamSCI clients
@@ -193,6 +195,15 @@ class SqliteWatermarkStore:
         """The store's ``PRAGMA user_version``."""
         with self._lock:
             return int(self._conn.execute("PRAGMA user_version").fetchone()[0])
+
+    def refresh_schema_version(self) -> int:
+        """Read ``PRAGMA user_version`` and cache whether the store stands at
+        3 or above.  ``record_attempt`` writes the version-3 columns and
+        ``last_send`` only then (spec §4.3).  Opening the store, the daemon's
+        start and each rebuild call it."""
+        version = self.schema_version()
+        self._v3 = version >= 3
+        return version
 
     def record_pipeline_states(
         self, states: "list[tuple[str, str, str]]", replace: bool = False
@@ -478,13 +489,36 @@ class SqliteWatermarkStore:
         records: Optional[int],
         bytes_: Optional[int],
         error: Optional[str],
+        pipeline: str = "",
+        client: str = "",
+        last_send: bool = True,
     ) -> None:
         with self._lock, self._conn:
-            self._conn.execute(
-                "INSERT INTO attempts(ts, source_id, dest_id, table_name, "
-                "outcome, records, bytes, error) VALUES(?,?,?,?,?,?,?,?)",
-                (ts, source_id, dest_id, table, outcome, records, bytes_, error),
-            )
+            if self._v3:
+                self._conn.execute(
+                    "INSERT INTO attempts(ts, source_id, dest_id, table_name, "
+                    "outcome, records, bytes, error, pipeline, client) "
+                    "VALUES(?,?,?,?,?,?,?,?,?,?)",
+                    (ts, source_id, dest_id, table, outcome, records, bytes_,
+                     error, pipeline, client),
+                )
+                if last_send and outcome in ("acked", "partial_ack"):
+                    # Same transaction as the attempt row (spec §4.3).
+                    self._conn.execute(
+                        "INSERT INTO last_send(client, pipeline, outcome, ts, "
+                        "records) VALUES(?,?,?,?,?) "
+                        "ON CONFLICT(client, pipeline) DO UPDATE SET "
+                        "outcome=excluded.outcome, ts=excluded.ts, "
+                        "records=excluded.records",
+                        (client, pipeline, outcome, ts, records),
+                    )
+            else:
+                self._conn.execute(
+                    "INSERT INTO attempts(ts, source_id, dest_id, table_name, "
+                    "outcome, records, bytes, error) VALUES(?,?,?,?,?,?,?,?)",
+                    (ts, source_id, dest_id, table, outcome, records, bytes_,
+                     error),
+                )
             # Trim to last N entries to keep the file small.  Cheap because
             # rowid is the autoincrement key.
             self._conn.execute(

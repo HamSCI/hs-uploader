@@ -188,7 +188,7 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
         return 1
 
     built = pipelines
-    pipelines, refused = split_refused(built, watermark.schema_version())
+    pipelines, refused = split_refused(built, watermark.refresh_schema_version())
     watermark.record_pipeline_states(
         [(p.name, p.client, refused.get(p.name, "")) for p in built],
         replace=True)

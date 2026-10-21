@@ -28,6 +28,9 @@ logger = logging.getLogger(__name__)
 
 
 class DiscardTransport:
+    # Ships nothing: the send log keeps its attempt row but no last_send row.
+    ships = False
+
     def __init__(self, inner):
         self.inner = inner
         self.name: str = inner.name

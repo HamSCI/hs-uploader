@@ -481,6 +481,8 @@ class Uploader:
                           batch.cursor_after, ts)
             pipe.source.commit(batch.commit_token)
             pipe.watermark.record_attempt(
+                pipeline=pipe.name, client=pipe.client,
+                last_send=getattr(pipe.transport, "ships", True),
                 ts=ts, source_id=pipe.source_id(), dest_id=pipe.dest_id(),
                 table=table, outcome="acked",
                 records=len(batch), bytes_=None, error=None,
@@ -495,6 +497,8 @@ class Uploader:
                           outcome.accepted_cursor or batch.cursor_after, ts)
             pipe.source.commit(batch.commit_token)
             pipe.watermark.record_attempt(
+                pipeline=pipe.name, client=pipe.client,
+                last_send=getattr(pipe.transport, "ships", True),
                 ts=ts, source_id=pipe.source_id(), dest_id=pipe.dest_id(),
                 table=table, outcome="partial_ack",
                 records=len(batch) - len(outcome.rejected),
@@ -515,6 +519,8 @@ class Uploader:
                 commit_token=batch.commit_token,
             )
             pipe.watermark.record_attempt(
+                pipeline=pipe.name, client=pipe.client,
+                last_send=getattr(pipe.transport, "ships", True),
                 ts=ts, source_id=pipe.source_id(), dest_id=pipe.dest_id(),
                 table=table, outcome="retry_later",
                 records=len(batch), bytes_=len(payload),
@@ -529,6 +535,8 @@ class Uploader:
                 final_error=outcome.reason or "permanent_failure",
             )
             pipe.watermark.record_attempt(
+                pipeline=pipe.name, client=pipe.client,
+                last_send=getattr(pipe.transport, "ships", True),
                 ts=ts, source_id=pipe.source_id(), dest_id=pipe.dest_id(),
                 table=table, outcome="permanent",
                 records=len(batch), bytes_=None,
@@ -624,6 +632,8 @@ class Uploader:
                 )
             pipe.source.commit(deliverable.commit_token)
             pipe.watermark.record_attempt(
+                pipeline=pipe.name, client=pipe.client,
+                last_send=getattr(pipe.transport, "ships", True),
                 ts=ts,
                 source_id=pipe.source_id(),
                 dest_id=pipe.dest_id(),
@@ -644,6 +654,8 @@ class Uploader:
                     final_error=outcome.reason or "max_attempts",
                 )
                 pipe.watermark.record_attempt(
+                    pipeline=pipe.name, client=pipe.client,
+                    last_send=getattr(pipe.transport, "ships", True),
                     ts=ts,
                     source_id=pipe.source_id(),
                     dest_id=pipe.dest_id(),
@@ -667,6 +679,8 @@ class Uploader:
                 )
             )
             pipe.watermark.record_attempt(
+                pipeline=pipe.name, client=pipe.client,
+                last_send=getattr(pipe.transport, "ships", True),
                 ts=ts,
                 source_id=pipe.source_id(),
                 dest_id=pipe.dest_id(),
@@ -685,6 +699,8 @@ class Uploader:
                 final_error=outcome.reason or "permanent_failure",
             )
             pipe.watermark.record_attempt(
+                pipeline=pipe.name, client=pipe.client,
+                last_send=getattr(pipe.transport, "ships", True),
                 ts=ts,
                 source_id=pipe.source_id(),
                 dest_id=pipe.dest_id(),
@@ -705,6 +721,8 @@ class Uploader:
             outcome.kind, pipe.name,
         )
         pipe.watermark.record_attempt(
+            pipeline=pipe.name, client=pipe.client,
+            last_send=getattr(pipe.transport, "ships", True),
             ts=ts,
             source_id=pipe.source_id(),
             dest_id=pipe.dest_id(),
