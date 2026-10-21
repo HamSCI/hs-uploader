@@ -262,6 +262,9 @@ class Build:
     refused: list[Refusal] = field(default_factory=list)
     slots: list[_Slot] = field(default_factory=list)
     good: dict[str, list[Mapping[str, Any]]] = field(default_factory=dict)
+    # Pipelines this build made new (not reused): the ones to close if the
+    # rebuild fails after building them.
+    fresh: list[Pipeline] = field(default_factory=list)
 
 
 class _Pool:
@@ -502,7 +505,8 @@ def _assemble(layout: Layout, *, watermark: SqliteWatermarkStore,
         if id(p) in fresh_ids:
             logger.info("daemon: pipeline %s (client %s, origin %s)",
                         p.name, p.client or "(none)", p.origin)
-    return Build(pipelines=pipelines, refused=refused, slots=slots, good=good)
+    return Build(pipelines=pipelines, refused=refused, slots=slots, good=good,
+                 fresh=[p for p in pipelines if id(p) in fresh_ids])
 
 
 def build_layout(
@@ -584,52 +588,74 @@ class Rebuilder:
         return pipelines_signature(self.pdir) != self.signature
 
     def _make(self, previous: Optional[Build], *, strict: bool):
+        """Build; return (signature, build, running, rows).
+
+        Commits nothing: the caller records the signature only once the
+        whole rebuild has succeeded, so a failure leaves ``due()`` true and
+        the next pump tries again (§3.4: "differs from the one it last
+        built").  On a failure after the build, the pipelines it made new
+        are closed here (none of them ever pumped).
+        """
         self._once.begin()
+        build: Optional[Build] = None
         try:
             layout = load_layout(self.manifest_path, manifest=self.manifest,
                                  note=self._once)
-            self.signature = layout.signature
             build = _assemble(layout, watermark=self.watermark,
                               previous=previous, strict=strict,
                               note=self._once)
             running, store_refused = split_refused(
                 build.pipelines, self.watermark.refresh_schema_version(),
                 note=self._once)
+        except BaseException:
+            if build is not None:
+                _close_quietly(build.fresh)
+            raise
         finally:
             self._once.end()
         rows = ([(p.name, p.client, store_refused.get(p.name, ""))
                  for p in build.pipelines]
                 + [(r.row_name, r.client, r.reason) for r in build.refused])
-        return build, running, rows
+        return layout.signature, build, running, rows
 
     def start(self) -> tuple[list[Pipeline], list[Pipeline], list[Refusal]]:
         """The start's build: (running, every pipeline built, refused files)."""
-        build, running, rows = self._make(None, strict=True)
+        signature, build, running, rows = self._make(None, strict=True)
         self.watermark.record_pipeline_states(rows, replace=True)
         self.build, self.running, self._rows = build, running, rows
+        self.signature = signature
         return running, build.pipelines, build.refused
 
     def rebuild(self, uploader: Uploader) -> bool:
         """Rebuild between pumps; return whether the running set changed.
 
         Never call it during a pump: ``Uploader.pump()`` joins every
-        pipeline's future before it returns.
+        pipeline's future before it returns.  When it raises, the running
+        set, the build and the signature all stay as they were.
         """
         previous = self.build
-        build, running, rows = self._make(previous, strict=False)
+        signature, build, running, rows = self._make(previous, strict=False)
+        before = [id(p) for p in self.running]
+        changed = not (rows == self._rows
+                       and [id(p) for p in running] == before)
+        if changed:
+            try:
+                self.watermark.record_pipeline_states(rows, replace=True)
+            except BaseException:
+                _close_quietly(build.fresh)
+                raise
         self.build = build
+        self.signature = signature
         pumped = {id(p) for p in uploader.pipelines}
         kept = {id(p) for p in build.pipelines}
         # A previous pipeline the store check held back never pumped: close
         # it here.  One that pumped closes on its own thread, below.
         _close_quietly([p for p in previous.pipelines
                         if id(p) not in kept and id(p) not in pumped])
-        before = [id(p) for p in self.running]
-        if rows == self._rows and [id(p) for p in running] == before:
+        if not changed:
             logger.debug("daemon: rebuild of %s changed nothing "
                          "(%d pipeline(s) running)", self.pdir, len(running))
             return False
-        self.watermark.record_pipeline_states(rows, replace=True)
         self._rows = rows
         uploader.replace_pipelines(running)
         now = {id(p) for p in running}
@@ -674,6 +700,20 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
         logger.exception("daemon: cannot parse manifest %s", manifest_path)
         return 1
 
+    # SIGHUP asks for a rebuild.  The handler only sets flags (logging
+    # inside a signal handler can raise a reentrant-call error and lose the
+    # signal), and it goes in before the start's build, so a SIGHUP during
+    # the build no longer kills the daemon; the loop rebuilds once it runs.
+    stop = threading.Event()
+    wake = threading.Event()
+    hangup = threading.Event()
+    if not (dry_run or once):
+        def _hangup(_sig, _frame):
+            hangup.set()
+            wake.set()
+
+        signal.signal(signal.SIGHUP, _hangup)
+
     # pipelines.d/ never stops the daemon: a bad file becomes a refusal.
     # start() writes pipeline_state, refusal rows included, before any early
     # return, so a refusal always leaves its reason (ruling C15).
@@ -716,9 +756,6 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     wake_sock = dcfg.get("wake_socket")  # None → default path
     wake_cfg = dcfg.get("wake")
 
-    stop = threading.Event()
-    wake = threading.Event()
-    hangup = threading.Event()
     listener: Optional[WakeListener] = None
 
     def bind_wake_if_needed(pipes: list[Pipeline]) -> None:
@@ -747,15 +784,8 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
         stop.set()
         wake.set()
 
-    def _hangup(_sig, _frame):
-        logger.info("daemon: SIGHUP — rebuilding from %s before the next pump",
-                    rebuilder.pdir)
-        hangup.set()
-        wake.set()
-
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
-    signal.signal(signal.SIGHUP, _hangup)
 
     wd = threading.Thread(target=_watchdog_loop, args=(stop,),
                           name="hs-uploader-watchdog", daemon=True)
@@ -765,19 +795,34 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     logger.info("daemon: active (pump interval %.0fs, wake %s)",
                 interval, listener.path if listener else "disabled")
 
+    hup_pending = False
+    last_failure: Optional[tuple[str, str]] = None
     while not stop.is_set():
         wake.wait(interval)
         wake.clear()
         if stop.is_set():
             break
-        # Between pumps only (§3.4): pump() has joined every future.
+        # Between pumps only (§3.4): pump() has joined every future.  A
+        # failed rebuild leaves due() true, so it retries every pump; its
+        # ERROR logs once while the same failure recurs.
         try:
-            if hangup.is_set() or rebuilder.due():
+            if hangup.is_set():
                 hangup.clear()
-                if rebuilder.rebuild(uploader):
+                logger.info("daemon: SIGHUP — rebuilding from %s",
+                            rebuilder.pdir)
+                hup_pending = True
+            if hup_pending or rebuilder.due():
+                changed = rebuilder.rebuild(uploader)
+                hup_pending = False
+                last_failure = None
+                if changed:
                     bind_wake_if_needed(rebuilder.running)
-        except Exception:
-            logger.exception("daemon: rebuild failed; the running set stays")
+        except Exception as exc:
+            failure = (type(exc).__name__, str(exc))
+            if failure != last_failure:
+                logger.exception("daemon: rebuild failed; the running set "
+                                 "stays, and the next pump tries again")
+            last_failure = failure
         try:
             uploader.pump()
         except Exception:

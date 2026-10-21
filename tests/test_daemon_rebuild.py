@@ -633,3 +633,199 @@ def test_generic_legacy_entries_silenced_and_revived_at_rebuild(
     r.rebuild(up)
     assert _names(up.pipelines) == ["g1", "g2"] and _by_name(up, "g2") is g2
     assert station.rows()["g1"]["client"] == "a"
+
+
+# ---- fix round 1 ---------------------------------------------------------------------
+
+
+class _Flaky(Exception):
+    pass
+
+
+def _fail_refresh(monkeypatch, times):
+    """Make the store's version read fail ``times`` times, then work."""
+    real = SqliteWatermarkStore.refresh_schema_version
+    left = [times]
+
+    def flaky(self):
+        if left[0] > 0:
+            left[0] -= 1
+            raise _Flaky("database is locked")
+        return real(self)
+
+    monkeypatch.setattr(SqliteWatermarkStore, "refresh_schema_version", flaky)
+
+
+def test_failed_rebuild_keeps_the_signature_and_closes_what_it_built(
+        station, monkeypatch):
+    # I1: a rebuild that raises must leave due() true, the running set and
+    # the build untouched, and close the pipelines it made new.
+    station.legacy(_entry("leg", client="legacy-x"))
+    r, up, _ = station.runner()
+    before = list(up.pipelines)
+    _fail_refresh(monkeypatch, 1)
+    station.file("n.toml", _entry("n1"))
+    with pytest.raises(_Flaky):
+        r.rebuild(up)
+    assert r.due()
+    assert up.pipelines == before and "n1" not in station.rows()
+    assert SOURCES["n1"][0].closed_on == threading.main_thread().name
+    assert r.rebuild(up) is True
+    assert _names(up.pipelines) == ["leg", "n1"]
+    assert not r.due()
+
+
+def test_failed_rebuild_retries_every_pump_and_logs_once(
+        station, monkeypatch, signals, caplog):
+    station.legacy(_entry("leg", client="legacy-x"))
+
+    def break_then_add():
+        _fail_refresh(monkeypatch, 2)
+        station.file("n.toml", _entry("n1"))
+
+    with caplog.at_level(logging.ERROR):
+        seen = _run_scripted(monkeypatch, station,
+                             [break_then_add, None, None, None])
+    assert [_names(s) for s in seen] == [
+        ["leg"], ["leg"], ["leg"], ["leg", "n1"]]
+    failed = [rec for rec in caplog.records
+              if "rebuild failed" in rec.getMessage()]
+    assert len(failed) == 1
+
+
+def test_failed_sighup_rebuild_retries_without_a_file_change(
+        station, monkeypatch, signals):
+    # A SIGHUP whose rebuild fails is not lost: the next pump tries again.
+    station.legacy(_entry("leg", client="legacy-x"))
+    calls = []
+    real = daemon.Rebuilder.rebuild
+
+    def counted(self, uploader):
+        calls.append(1)
+        return real(self, uploader)
+
+    monkeypatch.setattr(daemon.Rebuilder, "rebuild", counted)
+
+    def hup_while_broken():
+        _fail_refresh(monkeypatch, 1)
+        os.kill(os.getpid(), signal.SIGHUP)
+
+    _run_scripted(monkeypatch, station, [hup_while_broken, None, None])
+    assert len(calls) == 2            # failed once, retried once, then quiet
+
+
+_HUP_DURING_START = textwrap.dedent('''
+    import os, signal, sys
+    sys.path.insert(0, sys.argv[1])
+    from hs_uploader import daemon
+    from hs_uploader.core import Uploader
+
+    real_start = daemon.Rebuilder.start
+
+    def start(self):
+        os.kill(os.getpid(), signal.SIGHUP)     # arrives during the build
+        return real_start(self)
+
+    daemon.Rebuilder.start = start
+    rebuilds = []
+    real_rebuild = daemon.Rebuilder.rebuild
+
+    def rebuild(self, up):
+        rebuilds.append(1)
+        return real_rebuild(self, up)
+
+    daemon.Rebuilder.rebuild = rebuild
+
+    class Once(Uploader):
+        def pump(self):
+            os.kill(os.getpid(), signal.SIGTERM)
+            return False
+
+    daemon.Uploader = Once
+    rc = daemon.run(sys.argv[2])
+    print("rc", rc, "rebuilds", len(rebuilds))
+''')
+
+
+def test_sighup_during_start_does_not_kill_the_daemon(station, tmp_path):
+    import subprocess
+    import sys
+    from pathlib import Path
+    (tmp_path / "g1").mkdir()
+    station.legacy(_ft("g1", tmp_path / "g1", client="a"))
+    script = tmp_path / "hup.py"
+    script.write_text(_HUP_DURING_START)
+    src = Path(daemon.__file__).resolve().parents[1]
+    proc = subprocess.run(
+        [sys.executable, "-I", str(script), str(src), str(station.manifest)],
+        capture_output=True, text=True, timeout=60,
+        env={**os.environ, "HS_UPLOADER_STATE_DIR": str(tmp_path)})
+    assert proc.returncode == 0, (proc.returncode, proc.stderr[-2000:])
+    assert "rc 0 rebuilds 1" in proc.stdout
+
+
+def _fd_count():
+    return len(os.listdir("/proc/self/fd"))
+
+
+def test_sqlite_source_closes_on_its_worker_thread_and_leaks_no_fd(
+        station, tmp_path, monkeypatch):
+    # M2: a real SqliteSource on a temporary sink, removed by a rebuild.
+    import sqlite3
+    from hs_uploader.sink.writer import PENDING_UPLOADS_DDL
+    from hs_uploader.sources.sqlite import SqliteSource
+
+    sink = tmp_path / "sink.db"
+    with sqlite3.connect(sink) as c:
+        c.executescript(PENDING_UPLOADS_DDL)
+
+    opened_on: dict[str, list] = {}
+
+    def sqlite_builder(*, identity, watermark, config, name):
+        src = SqliteSource.from_env(
+            database="sigmond", table="psk.spots",
+            accepted_schema_versions=[1],
+            env={"SIGMOND_SQLITE_PATH": str(sink)})
+        real_connect = src._connect
+
+        def connect():
+            if src._conn is None:
+                opened_on.setdefault(name, []).append(
+                    threading.current_thread().name)
+            return real_connect()
+
+        src._connect = connect
+        real_close = src.close
+
+        def close():
+            src.closed_on = threading.current_thread().name
+            src.closed_conn = src._conn
+            real_close()
+
+        src.close = close
+        SOURCES.setdefault(name, []).append(src)
+        return [Pipeline(name=name, source=src,
+                         transport=TrackTransport(name),
+                         watermark=watermark, identity=identity)]
+
+    monkeypatch.setattr(daemon, "resolve_builder", lambda spec: sqlite_builder)
+    station.legacy()
+    station.file("keep.toml", _entry("keep"))
+    r, up, _ = station.runner()
+
+    counts = []
+    for i in range(20):
+        station.file("s.toml", _entry("sq", v=i))
+        r.rebuild(up)
+        up.pump()
+        src = _by_name(up, "sq").source
+        assert src._conn is not None                    # it really connected
+        station.drop("s.toml")
+        r.rebuild(up)
+        assert src.closed_on == opened_on["sq"][-1]
+        assert src.closed_on.startswith("hs-uploader-sq")
+        assert src._conn is None
+        with pytest.raises(sqlite3.ProgrammingError):   # closed, not leaked
+            src.closed_conn.execute("SELECT 1")
+        counts.append(_fd_count())
+    assert counts[-1] <= counts[2], counts
