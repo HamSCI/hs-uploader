@@ -305,3 +305,20 @@ def test_sink_status_sinks_flag_overrides_the_derived_directory(tmp_path, capsys
                  "--sinks", str(other)]) == 0
     d = _json.loads(capsys.readouterr().out)
     assert d["clients"]["c1"]["effective"] == "upload"
+
+
+def test_sink_status_counts_pipelines_without_a_client(tmp_path, capsys):
+    m = _station_dir(tmp_path)
+    m.write_text(m.read_text() + '[[pipeline]]\nname = "nc"\nbuilder = "x:y"\n')
+    assert main(["sink", "status", "--manifest", str(m)]) == 0
+    assert ("1 pipeline(s) carry no client; no switch applies to them"
+            in capsys.readouterr().out)
+    assert main(["sink", "status", "--json", "--manifest", str(m)]) == 0
+    assert _json.loads(capsys.readouterr().out)["no_client_pipelines"] == 1
+
+
+def test_sink_status_manifest_read_failure_exits_2(tmp_path, capsys):
+    m = tmp_path / "missing.toml"
+    assert main(["sink", "status", "--json", "--manifest", str(m)]) == 2
+    assert _json.loads(capsys.readouterr().out)["manifest_read_failed"] is True
+    assert main(["sink", "status", "--manifest", str(m)]) == 2

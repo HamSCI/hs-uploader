@@ -904,3 +904,13 @@ def test_no_sinks_directory_logs_one_info_line(
     assert msgs.count(
         "no switch files; the manifest's policy governs") == 1
     assert _would(caplog) == []
+
+
+def test_ungoverned_only_client_gets_no_would_read_line(
+        station, caplog, fresh_switch_state):
+    station.legacy(_entry("leg", client="c1").replace(
+        'builder = "fake:fn"', 'builder = "fake:fn"\ngoverned = false'))
+    _sw(station, "c1", "off")
+    with caplog.at_level(logging.INFO, logger="hs_uploader"):
+        station.runner()
+    assert _would(caplog) == []

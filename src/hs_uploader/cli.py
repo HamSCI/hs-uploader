@@ -203,12 +203,17 @@ def _cmd_sink_status(args) -> int:
     from .pipelines_d import sinks_dir_for
     sinks = Path(args.sinks) if args.sinks else sinks_dir_for(args.manifest)
     owners: set[str] = set()
+    no_client = 0
+    read_failed = False
     try:
         from .pipelines_d import load_layout
         for entry, _origin in load_layout(args.manifest).entries:
             if entry.get("client"):
                 owners.add(str(entry["client"]))
+            else:
+                no_client += 1
     except Exception as exc:
+        read_failed = True
         print(f"hs-uploader: cannot read {args.manifest}: {exc}", file=sys.stderr)
     has_dir = sinks.is_dir()
     names = set(owners)
@@ -235,16 +240,21 @@ def _cmd_sink_status(args) -> int:
     if args.json:
         print(json.dumps({"sinks_dir": str(sinks), "has_sinks_dir": has_dir,
                           "enforced": False, "note": _NOT_ENFORCED,
+                          "no_client_pipelines": no_client,
+                          "manifest_read_failed": read_failed,
                           "site": site, "clients": clients}, indent=2))
-        return 0
+        return 2 if read_failed else 0
     print(f"hs-uploader sink status - {sinks}")
     if not has_dir:
         print(f"  {_NO_FILES}")
     for name, d in [("site", site), *clients.items()]:
         err = f"  error: {d['error']}" if d["error"] else ""
         print(f"  {name}: file {d['file']}, effective {d['effective']}{err}")
+    if no_client:
+        print(f"  {no_client} pipeline(s) carry no client; "
+              "no switch applies to them")
     print(f"  {_NOT_ENFORCED}")
-    return 0
+    return 2 if read_failed else 0
 
 
 

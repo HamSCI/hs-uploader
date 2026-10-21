@@ -637,7 +637,8 @@ class Rebuilder:
             self._said.clear()
             return
         self._said_no_files = False
-        clients = sorted({p.client for p in self.build.pipelines if p.client})
+        clients = sorted({p.client for p in self.build.pipelines
+                          if p.client and p.governed})
         for client in clients:
             state = effective_state(client, sinks_dir=self.sdir).state
             if self._said.get(client) != state:
