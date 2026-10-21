@@ -830,8 +830,10 @@ def test_the_writer_updates_no_existing_row(tmp_path):
     ]
     run = [s.lstrip().upper() for s in statements]
     assert not [s for s in run if s.startswith(("UPDATE", "VACUUM", "DELETE"))]
-    assert not [s for s in run if "INDEX" in s and "PRODUCER" in s]
-    assert len([s for s in run if s.startswith("ALTER TABLE")]) == 2
+    # The producer index is built (v3.77), and only after both ALTERs.
+    alters = [i for i, s in enumerate(run) if s.startswith("ALTER TABLE")]
+    index = [i for i, s in enumerate(run) if "INDEX" in s and "PRODUCER" in s]
+    assert len(alters) == 2 and len(index) == 1 and index[0] > max(alters)
 
 
 def test_a_v369_insert_still_works_after_the_columns_arrive(tmp_path):
@@ -936,3 +938,93 @@ def test_large_old_file_gains_columns_without_rewrite(tmp_path):
     # 200k rows measures about 0.08 s and a CREATE INDEX about 0.04 s, so
     # neither would trip it.
     assert elapsed < 1.0, f"ensure_columns took {elapsed:.3f} s"
+
+
+# ---- local= and the producer index (spec 5.1, 5.3, test 15) ----
+
+def _index_names(path: Path) -> set:
+    with sqlite3.connect(path) as c:
+        return {r[0] for r in c.execute(
+            "SELECT name FROM sqlite_master WHERE type='index'")}
+
+
+def _index_columns(path: Path, name: str) -> list:
+    with sqlite3.connect(path) as c:
+        return [r[2] for r in c.execute(f"PRAGMA index_info({name})")]
+
+
+def test_a_local_writer_stores_one_and_the_default_stores_zero(tmp_path):
+    db = tmp_path / "sink.db"
+    plain = _writer(db)
+    plain.insert([{"mode": "ft8"}])
+    plain.close()
+    local = _writer(db, local=True)
+    local.insert([{"mode": "ft8"}])
+    local.close()
+    assert [r[3] for r in _stored(db)] == [0, 1]
+
+
+def test_from_env_and_init_both_take_local(tmp_path):
+    db = tmp_path / "sink.db"
+    w = Writer("psk", "spots", config=None, local=True)
+    assert w.local is True
+    assert Writer("psk", "spots").local is False
+    assert _writer(db, local=True).local is True
+
+
+def test_an_old_sink_gains_both_columns_and_then_the_index(tmp_path):
+    db = tmp_path / "sink.db"
+    _old_sink(db, [("psk", "spots", {"mode": "ft8"})])
+    assert "idx_pending_uploads_producer" not in _index_names(db)
+    w = _writer(db)
+    w.insert([{"mode": "ft8"}])
+    w.close()
+    assert _columns(db)[-2:] == ["producer", "local"]
+    assert _index_columns(db, "idx_pending_uploads_producer") == [
+        "target_db", "target_table", "producer", "id"]
+
+
+def test_the_ddl_script_on_an_empty_file_builds_the_producer_index(tmp_path):
+    db = tmp_path / "fresh.db"
+    with sqlite3.connect(db) as c:
+        c.executescript(PENDING_UPLOADS_DDL)
+    assert _index_columns(db, "idx_pending_uploads_producer") == [
+        "target_db", "target_table", "producer", "id"]
+
+
+def test_the_index_build_waits_for_a_connection_holding_the_sink(tmp_path):
+    db = tmp_path / "sink.db"
+    # A current-schema sink that lacks only the producer index, so the
+    # index build is the first statement that needs the write lock.
+    with sqlite3.connect(db) as c:
+        c.execute("PRAGMA journal_mode=WAL")
+        c.executescript(PENDING_UPLOADS_DDL)
+        c.execute("DROP INDEX IF EXISTS idx_pending_uploads_producer")
+    holder = sqlite3.connect(db, isolation_level=None, check_same_thread=False)
+    holder.execute("BEGIN IMMEDIATE")
+    holder.execute("SELECT count(*) FROM pending_uploads").fetchone()
+    hold_seconds = 1.0
+    released = {}
+
+    def release():
+        time.sleep(hold_seconds)
+        released["at"] = time.monotonic()
+        holder.execute("COMMIT")
+
+    t = threading.Thread(target=release)
+    w = _writer(db)
+    w.insert([{"mode": "ft8"}])
+    started = time.monotonic()
+    t.start()
+    w.flush()
+    finished = time.monotonic()
+    t.join()
+    holder.close()
+    # The writer blocked (not vacuous), and the holder let go first.
+    assert finished - started >= hold_seconds * 0.8
+    assert released["at"] <= finished
+    # And it succeeded: row stored, index built, nothing left buffered.
+    assert w._buffer == []
+    assert [r[1] for r in _stored(db)] == ["ft8"]
+    assert "idx_pending_uploads_producer" in _index_names(db)
+    w.close()

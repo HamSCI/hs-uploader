@@ -168,6 +168,14 @@ CREATE INDEX IF NOT EXISTS idx_pending_uploads_target
     ON pending_uploads (target_db, target_table, id)
 """
 
+# The producer-scoped selection (SqliteSource with a producer) walks this
+# index.  It needs the `producer` column, so the writer creates it only
+# after `ensure_columns` has run.
+_QUEUE_PRODUCER_INDEX_DDL = """
+CREATE INDEX IF NOT EXISTS idx_pending_uploads_producer
+    ON pending_uploads (target_db, target_table, producer, id)
+"""
+
 # Expression index for hs-uploader's WsprCycleSource, whose cycle
 # discovery and per-cycle batch queries filter on
 # json_extract(payload_json, '$.time').  Without it every 30 s pump
@@ -183,7 +191,8 @@ CREATE INDEX IF NOT EXISTS idx_pending_uploads_cycle_time
 # The whole queue schema as one script, for `conn.executescript()`:
 # tests, fixtures and tools that build a sink.db the way the writer does.
 PENDING_UPLOADS_DDL = ";\n".join(
-    s.strip() for s in (_QUEUE_DDL, _QUEUE_INDEX_DDL, _QUEUE_CYCLE_INDEX_DDL)
+    s.strip() for s in (_QUEUE_DDL, _QUEUE_INDEX_DDL, _QUEUE_CYCLE_INDEX_DDL,
+              _QUEUE_PRODUCER_INDEX_DDL)
 ) + ";\n"
 
 # The columns v3.70 added, in the order `ensure_columns` adds them.
@@ -299,6 +308,7 @@ class Writer:
         *,
         schema_version: int = 0,
         producer: Optional[str] = None,
+        local: bool = False,
         batch_rows: int = DEFAULT_SQLITE_BATCH_ROWS,
         auto_flush_seconds: float = DEFAULT_SQLITE_AUTO_FLUSH_SECONDS,
         config: Optional[SqliteConfig] = None,
@@ -308,6 +318,7 @@ class Writer:
         self.table = table
         self.schema_version = schema_version
         self.producer = producer or ""
+        self.local = bool(local)
         self.batch_rows = batch_rows
         self.auto_flush_seconds = auto_flush_seconds
         self._buffer_max = batch_rows * 2
@@ -332,6 +343,7 @@ class Writer:
         database: Optional[str] = None,
         schema_version: int = 0,
         producer: Optional[str] = None,
+        local: bool = False,
         batch_rows: int = DEFAULT_SQLITE_BATCH_ROWS,
         auto_flush_seconds: float = DEFAULT_SQLITE_AUTO_FLUSH_SECONDS,
         env: Optional[dict] = None,
@@ -368,6 +380,7 @@ class Writer:
             table=table,
             schema_version=schema_version,
             producer=producer,
+            local=local,
             batch_rows=batch_rows,
             auto_flush_seconds=auto_flush_seconds,
             config=cfg,
@@ -440,7 +453,7 @@ class Writer:
                         now_iso,
                         self.producer
                         or infer_producer(self.database, self.table, row),
-                        0,
+                        1 if self.local else 0,
                     )
                     for row in self._buffer
                 ]
@@ -502,6 +515,8 @@ class Writer:
         conn.execute(_QUEUE_CYCLE_INDEX_DDL)
         # An older sink.db gains producer and local here (v3.70).
         added = ensure_columns(conn)
+        # The producer index needs the column, so it comes after.
+        conn.execute(_QUEUE_PRODUCER_INDEX_DDL)
         conn.commit()
         if added:
             logger.info(
