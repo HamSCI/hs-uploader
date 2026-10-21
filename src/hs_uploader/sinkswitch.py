@@ -6,10 +6,13 @@ Nothing here enforces a switch; it is a library.
 """
 from __future__ import annotations
 
+import fcntl
 import logging
+import math
 import os
 import re
 import tomllib
+import datetime as _dt
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Mapping, Optional
@@ -119,3 +122,163 @@ def effective_state(client: str, *, sinks_dir: Path = DEFAULT_SINKS_DIR) -> Effe
     else:
         state = STATES[min(STATES.index(c.state), STATES.index(s.state))]
     return Effective(state, c.state, s.state, errors)
+
+
+# ---- writing ---------------------------------------------------------------
+
+_BARE_KEY = re.compile(r"^[A-Za-z0-9_-]+$")
+_ESC = {"\\": "\\\\", '"': '\\"', "\b": "\\b", "\t": "\\t", "\n": "\\n", "\f": "\\f", "\r": "\\r"}
+
+
+def _key(k) -> str:
+    if not isinstance(k, str) or not k:
+        raise TypeError(f"TOML key must be a non-empty string, not {k!r}")
+    return k if _BARE_KEY.match(k) else _str(k)
+
+
+def _str(v: str) -> str:
+    out = []
+    for ch in v:
+        if ch in _ESC:
+            out.append(_ESC[ch])
+        elif ord(ch) < 0x20 or ord(ch) == 0x7F:
+            out.append("\\u%04x" % ord(ch))
+        else:
+            out.append(ch)
+    return '"' + "".join(out) + '"'
+
+
+def _scalar(v) -> str:
+    if isinstance(v, bool):  # before int: bool is an int
+        return "true" if v else "false"
+    if isinstance(v, int):
+        return str(v)
+    if isinstance(v, float):
+        if math.isnan(v):
+            return "nan"
+        if math.isinf(v):
+            return "inf" if v > 0 else "-inf"
+        return repr(v)
+    if isinstance(v, str):
+        return _str(v)
+    raise TypeError(f"cannot write {type(v).__name__} as a TOML value")
+
+
+def _is_table_array(v) -> bool:
+    return isinstance(v, list) and len(v) > 0 and all(isinstance(i, Mapping) for i in v)
+
+
+def _emit(table: Mapping, path: list[str], out: list[str]) -> None:
+    subs = []
+    for k, v in table.items():
+        if isinstance(v, Mapping) or isinstance(v, list):
+            subs.append((k, v))
+        else:
+            out.append(f"{_key(k)} = {_scalar(v)}")
+    for k, v in subs:
+        here = path + [_key(k)]
+        name = ".".join(here)
+        if isinstance(v, Mapping):
+            out.append("")
+            out.append(f"[{name}]")
+            _emit(v, here, out)
+        elif _is_table_array(v):
+            for item in v:
+                out.append("")
+                out.append(f"[[{name}]]")
+                _emit(item, here, out)
+        else:
+            raise TypeError(f"{k!r}: only arrays of tables are supported")
+
+
+def dumps_toml(data: Mapping) -> str:
+    """Emit strings, booleans, integers, floats, tables and arrays of tables.
+
+    Anything else raises TypeError.  (sigmond's `_set_toml_field` quotes every
+    value, so `pinned = false` would read back as a string.)
+    """
+    out: list[str] = []
+    _emit(data, [], out)
+    return "\n".join(out).lstrip("\n") + "\n"
+
+
+def _check_path(path: Path) -> str:
+    """Return the file's name (`site` or a client) or raise ValueError."""
+    path = Path(path)
+    if ".." in path.parts or path.suffix != ".toml":
+        raise ValueError(f"not a switch file path: {path}")
+    name = path.name[: -len(".toml")]
+    if name != SITE and not valid_client_name(name):
+        raise ValueError(f"not a switch file path: {path}")
+    return name
+
+
+def _now() -> str:
+    return _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+
+def _fsync_dir(d: Path) -> None:
+    fd = os.open(d, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
+def write_switch(path: Path, change: Mapping) -> None:
+    """Change one switch file under an exclusive lock, atomically (design §3.4).
+
+    `change`: `state` (required), and optionally `reason`, `set_by`, `set_at`,
+    `grant` (merged into the file's grant table), `identity` (tables written
+    into this history entry).  Appends one `[[history]]` entry.  A file that
+    fails to parse raises ValueError and nothing is written.
+    """
+    path = Path(path)
+    name = _check_path(path)
+    state = change.get("state")
+    if state not in STATES:
+        raise ValueError(f"state {state!r} is not one of {'/'.join(STATES)}")
+    d = path.parent
+    d.mkdir(parents=True, exist_ok=True)
+    lockfd = os.open(d / ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+    try:
+        fcntl.flock(lockfd, fcntl.LOCK_EX)
+        cur = read_switch(path, cache=False)
+        if cur.error and not cur.data:
+            raise ValueError(f"refusing to rewrite a broken switch file: {cur.error}")
+        data = dict(cur.data)
+        old = cur.state or "off"
+        at = change.get("set_at") or _now()
+        by = change.get("set_by", "")
+        reason = change.get("reason", "")
+        if name != SITE:
+            data["client"] = name
+        data["state"] = state
+        data["reason"] = reason
+        data["set_by"] = by
+        data["set_at"] = at
+        if change.get("grant"):
+            data["grant"] = {**data.get("grant", {}), **change["grant"]}
+        entry = {"at": at, "from": old, "to": state, "by": by, "reason": reason}
+        if name != SITE and change.get("identity"):
+            entry["identity"] = dict(change["identity"])
+        data["history"] = list(data.get("history", [])) + [entry]
+        text = dumps_toml(data)
+        tmp = d / f".{path.name}.{os.getpid()}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
+        try:
+            os.fchmod(fd, 0o644)
+            with os.fdopen(fd, "w", encoding="utf-8") as f:
+                f.write(text)
+                f.flush()
+                os.fsync(f.fileno())
+            os.replace(tmp, path)
+        except BaseException:
+            try:
+                os.unlink(tmp)
+            except FileNotFoundError:
+                pass
+            raise
+        _fsync_dir(d)
+    finally:
+        os.close(lockfd)  # closing drops the flock

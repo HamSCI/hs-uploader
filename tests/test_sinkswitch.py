@@ -122,3 +122,133 @@ def test_valid_client_names(n):
 def test_effective_state_refuses_bad_client_name(tmp_path):
     with pytest.raises(ValueError):
         ss.effective_state("../x", sinks_dir=tmp_path)
+
+
+# ---- writing (spec §6.1, test 18) ------------------------------------------
+
+import multiprocessing
+import time
+
+
+def _writer(path, reason):
+    ss.write_switch(
+        path,
+        {"state": "fill", "reason": reason, "set_by": reason, "set_at": "2026-10-06T21:30:00Z"},
+    )
+
+
+def test_race_keeps_both_history_entries(tmp_path):
+    """Hold the lock, start both writers, release: forces the interleaving
+    in which a writer that read before locking would lose the other's entry."""
+    import fcntl
+
+    path = tmp_path / "c.toml"
+    lockf = open(tmp_path / ".lock", "a+")
+    fcntl.flock(lockf, fcntl.LOCK_EX)
+    ctx = multiprocessing.get_context("fork")
+    procs = [ctx.Process(target=_writer, args=(path, r)) for r in ("one", "two")]
+    for p in procs:
+        p.start()
+    time.sleep(0.7)  # both writers now sit at (or before) the lock
+    fcntl.flock(lockf, fcntl.LOCK_UN)
+    for p in procs:
+        p.join(10)
+        assert p.exitcode == 0
+    hist = tomllib.loads(path.read_text())["history"]
+    assert sorted(h["reason"] for h in hist) == ["one", "two"]
+
+
+def test_reader_never_sees_half_a_file(tmp_path):
+    path = tmp_path / "c.toml"
+    ss.write_switch(path, {"state": "off", "reason": "x", "set_by": "t", "set_at": "t"})
+    ctx = multiprocessing.get_context("fork")
+
+    def burst():
+        for i in range(150):
+            ss.write_switch(
+                path, {"state": ("fill", "upload")[i % 2], "reason": "r" * 200, "set_by": "t", "set_at": "t"}
+            )
+
+    p = ctx.Process(target=burst)
+    p.start()
+    reads = 0
+    while p.is_alive():
+        tomllib.loads(path.read_text())  # raises on a torn file
+        reads += 1
+    p.join()
+    assert p.exitcode == 0 and reads > 0
+
+
+def test_pinned_false_round_trips_as_bool(tmp_path):
+    path = tmp_path / "c.toml"
+    ss.write_switch(
+        path,
+        {"state": "fill", "reason": "r", "set_by": "t", "set_at": "t",
+         "grant": {"working_bytes": 0, "pinned": False, "granted_by": "sigmond"}},
+    )
+    g = tomllib.loads(path.read_text())["grant"]
+    assert g["pinned"] is False and g["working_bytes"] == 0
+
+
+@pytest.mark.parametrize("bad", ["../site", "A.toml", "site.toml.bak", "x/../c.toml", "a.b.toml"])
+def test_bad_path_raises(tmp_path, bad):
+    with pytest.raises(ValueError):
+        ss.write_switch(tmp_path / bad, {"state": "off"})
+    assert not list(tmp_path.glob("*.toml"))
+
+
+def test_site_file_is_writable_without_identity(tmp_path):
+    ss.write_switch(tmp_path / "site.toml", {"state": "fill", "reason": "r", "set_by": "t", "set_at": "t"})
+    assert ss.effective_state("c", sinks_dir=tmp_path).site_state == "fill"
+
+
+def test_new_file_mode_is_0644(tmp_path):
+    old = os.umask(0o077)
+    try:
+        ss.write_switch(tmp_path / "c.toml", {"state": "off"})
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((tmp_path / "c.toml").stat().st_mode) == 0o644
+
+
+def test_history_appends_with_from_to_and_identity(tmp_path):
+    path = tmp_path / "c.toml"
+    ident = {"AC0G=S": {"callsign": "AC0G/S", "lat": 38.92, "psws": {"station": "S1", "instrument": "1"}}}
+    ss.write_switch(path, {"state": "fill", "reason": "a", "set_by": "x", "set_at": "t1", "identity": ident})
+    ss.write_switch(path, {"state": "upload", "reason": "b", "set_by": "y", "set_at": "t2"})
+    d = tomllib.loads(path.read_text())
+    assert d["client"] == "c" and d["state"] == "upload"
+    h = d["history"]
+    assert [(e["from"], e["to"], e["by"]) for e in h] == [("off", "fill", "x"), ("fill", "upload", "y")]
+    assert h[0]["identity"] == ident and "identity" not in h[1]
+    assert ss.effective_state("c", sinks_dir=tmp_path).client_state == "upload"
+
+
+def test_write_refuses_broken_file_and_writes_nothing(tmp_path):
+    path = put(tmp_path, "c", "state = [\n")
+    before = path.read_text()
+    with pytest.raises(ValueError):
+        ss.write_switch(path, {"state": "fill"})
+    assert path.read_text() == before
+    assert sorted(x.name for x in tmp_path.iterdir()) == ["c.toml", ".lock"] or \
+        sorted(x.name for x in tmp_path.iterdir()) == [".lock", "c.toml"]
+
+
+def test_write_rejects_unknown_state(tmp_path):
+    with pytest.raises(ValueError):
+        ss.write_switch(tmp_path / "c.toml", {"state": "burst"})
+
+
+def test_dumps_toml_round_trips():
+    data = {
+        "s": 'a "q" \\ b\nc\té', "b": True, "n": -3, "f": 1.5,
+        "t": {"k": "v", "odd key": 2},
+        "arr": [{"x": 1, "sub": {"y": "z"}}, {"x": 2, "ident": {"A=B": {"lat": 0.25}}}],
+    }
+    assert tomllib.loads(ss.dumps_toml(data)) == data
+
+
+@pytest.mark.parametrize("bad", [{"a": None}, {"a": [1, 2]}, {"a": (1,)}, {"a": b"x"}, {1: 2}, {"a": []}])
+def test_dumps_toml_rejects_other_types(bad):
+    with pytest.raises(TypeError):
+        ss.dumps_toml(bad)
