@@ -683,9 +683,11 @@ def test_a_tree_that_builds_one_pipeline_fewer_disagrees(tmp_path, capsys):
     manifest, sink, watermarks, _ = _station(tmp_path)
     # NEW's daemon drops the heartbeat pipeline after building it.
     tree = _changed_tree(
-        tmp_path, "daemon.py", "base_identity = _base_identity(manifest)",
-        'pipelines = [p for p in pipelines if p.name != "heartbeat"]\n'
-        "    base_identity = _base_identity(manifest)")
+        tmp_path, "daemon.py",
+        '    """Build one entry, generic or builder; raise on failure."""',
+        '    """Build one entry, generic or builder; raise on failure."""\n'
+        '    if entry.get("name") == "heartbeat":\n'
+        "        return []")
     code, out, _ = _run(capsys, manifest, sink, watermarks, new=tree)
     assert code == 1
     assert _section(out, "heartbeat").startswith("heartbeat: DISAGREE")
@@ -795,7 +797,10 @@ def test_each_tree_opens_its_own_copies_and_nothing_given(tmp_path):
     manifest, sink, watermarks, _ = _station(tmp_path)
     scratch = tmp_path / "scratch"
     scratch.mkdir()
-    args = argparse.Namespace(manifest=manifest, sink=sink, watermarks=watermarks)
+    args = argparse.Namespace(
+        manifest=manifest, sink=sink, watermarks=watermarks,
+        old_manifest=None, new_manifest=None,
+        old_pipelines_d=None, new_pipelines_d=None)
     old = nc._run_tree("OLD", SRC, args, NOW, scratch)
     new = nc._run_tree("NEW", SRC, args, NOW, scratch)
     given = {os.path.realpath(p) for p in (sink, watermarks)}
@@ -816,8 +821,9 @@ def test_a_tree_that_writes_its_copy_leaves_the_other_tree_and_the_given_files(
     # three psk rows: it reads a copy of its own.  The given sink.db is
     # read-only, so a tree that wrote to it would fail outright.
     tree = _changed_tree(
-        tmp_path, "daemon.py", "base_identity = _base_identity(manifest)",
-        "base_identity = _base_identity(manifest)\n"
+        tmp_path, "daemon.py",
+        '    """Build one entry, generic or builder; raise on failure."""',
+        '    """Build one entry, generic or builder; raise on failure."""\n'
         "    import os as _os, sqlite3 as _sq\n"
         '    _c = _sq.connect(_os.environ["SIGMOND_SQLITE_PATH"])\n'
         '    _c.execute("DELETE FROM pending_uploads WHERE id = 3")\n'
@@ -1038,3 +1044,123 @@ def test_the_report_agrees_only_when_nothing_is_in_doubt(capsys):
     both = {"a": _entry(), "b": _entry()}
     assert nc._report(_result(both), _result(dict(both))) == 0
     assert capsys.readouterr().out.rstrip().endswith("RESULT: AGREE")
+
+
+# ---- sink control step 2b: the tool reads pipelines.d (spec §8.3, test 22) ----
+
+PSK_FILE = """\
+[[pipeline]]
+name = "psk-pskreporter"
+batch_limit = {limit}
+[pipeline.source]
+type = "sqlite"
+database = "psk"
+table = "spots"
+accepted_schema_versions = [2]
+delete_on_commit = false
+extra_where = [["tx_call", "!=", ""], ["mode", "IN", ["ft8", "ft4", "msk144"]], ["forward_to_pskreporter", "=", 0]]
+[pipeline.transport]
+type = "pskreporter"
+decoding_software = "psk-recorder/0.1"
+"""
+
+
+def _split_station(tmp_path: Path, *, legacy_limit=500, file_limit=500):
+    """The synthetic station, with psk-pskreporter also in
+    pipelines.d/psk-recorder.toml.  The legacy manifest keeps its own copy of
+    the entry (X7), so a tool that ignores the directory reads the stale one."""
+    manifest, sink, watermarks, _ = _station(tmp_path)
+    text = MANIFEST.replace(
+        'name = "psk-pskreporter"\nbatch_limit = 500',
+        f'name = "psk-pskreporter"\nclient = "psk-recorder"\nbatch_limit = {legacy_limit}')
+    assert text != MANIFEST
+    split = tmp_path / "split"
+    (split / "pipelines.d").mkdir(parents=True)
+    legacy = split / "pipelines.toml"
+    legacy.write_text(text.format(heartbeat=tmp_path / "heartbeat"))
+    (split / "pipelines.d" / "psk-recorder.toml").write_text(
+        PSK_FILE.format(limit=file_limit))
+    return manifest, legacy, split / "pipelines.d", sink, watermarks
+
+
+def _split_args(manifest, legacy, pdir, sink, watermarks):
+    """OLD reads the original manifest; NEW reads the split layout (X6)."""
+    return ["--old-manifest", str(manifest), "--new-manifest", str(legacy),
+            "--new-pipelines-d", str(pdir), "--sink", str(sink),
+            "--watermarks", str(watermarks), "--old", str(SRC),
+            "--new", str(SRC), "--now", NOW]
+
+
+def test_the_same_pipelines_from_pipelines_d_agree(tmp_path, capsys):
+    manifest, legacy, pdir, sink, watermarks = _split_station(tmp_path)
+    assert nc.main(_split_args(manifest, legacy, pdir, sink, watermarks)) == 0
+    out = capsys.readouterr().out
+    assert "4 pipelines: 4 agree, 0 disagree" in out
+    assert out.rstrip().endswith("RESULT: AGREE")
+
+
+def test_a_planted_difference_in_pipelines_d_disagrees(tmp_path, capsys):
+    # Mutation (spec test 22): ignore --new-pipelines-d.  NEW then reads the
+    # stale legacy copy, batch_limit 500, and ends AGREE.
+    manifest, legacy, pdir, sink, watermarks = _split_station(
+        tmp_path, file_limit=2)
+    code = nc.main(_split_args(manifest, legacy, pdir, sink, watermarks))
+    out = capsys.readouterr().out
+    assert code == 1
+    assert _section(out, "psk-pskreporter").startswith("psk-pskreporter: DISAGREE")
+    assert out.rstrip().endswith("RESULT: DISAGREE")
+
+
+def test_a_stale_legacy_copy_loses_to_the_file(tmp_path, capsys):
+    manifest, legacy, pdir, sink, watermarks = _split_station(
+        tmp_path, legacy_limit=2)
+    assert nc.main(_split_args(manifest, legacy, pdir, sink, watermarks)) == 0
+    assert capsys.readouterr().out.rstrip().endswith("RESULT: AGREE")
+
+
+def test_a_refused_file_never_ends_agree_and_the_report_lists_it(tmp_path, capsys):
+    manifest, legacy, pdir, sink, watermarks = _split_station(tmp_path)
+    (pdir / "broken.toml").write_text("this is [not toml")
+    (pdir / "Bad_Name.toml").write_text("")
+    code = nc.main(_split_args(manifest, legacy, pdir, sink, watermarks))
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "NEW refused pipelines.d/broken.toml" in out
+    assert "NEW refused pipelines.d/Bad_Name.toml" in out
+    assert "RESULT: AGREE" not in out
+    assert out.rstrip().endswith("RESULT: INCONCLUSIVE (2 refused files; see above)")
+
+
+def test_the_default_for_each_side_is_manifest_and_no_directory(tmp_path, capsys):
+    manifest, legacy, pdir, sink, watermarks = _split_station(tmp_path)
+    # A directory beside the given manifest is not read unless a flag names it.
+    code, out, _ = _run(capsys, legacy, sink, watermarks)
+    assert code == 0
+    assert out.rstrip().endswith("RESULT: AGREE")
+
+
+def test_the_given_pipelines_d_is_left_alone(tmp_path, capsys):
+    manifest, legacy, pdir, sink, watermarks = _split_station(tmp_path)
+    before = (pdir / "psk-recorder.toml").read_bytes()
+    nc.main(_split_args(manifest, legacy, pdir, sink, watermarks))
+    assert (pdir / "psk-recorder.toml").read_bytes() == before
+    assert sorted(p.name for p in pdir.iterdir()) == ["psk-recorder.toml"]
+
+
+def test_a_pipelines_d_that_is_no_directory_is_a_usage_error(tmp_path, capsys):
+    manifest, legacy, pdir, sink, watermarks = _split_station(tmp_path)
+    args = _split_args(manifest, legacy, tmp_path / "nowhere", sink, watermarks)
+    with pytest.raises(SystemExit) as exc:
+        nc.main(args)
+    assert exc.value.code == 2
+    assert "--new-pipelines-d" in capsys.readouterr().err
+
+
+def test_the_report_lists_refused_files_and_never_agrees_beside_one(capsys):
+    refusal = {"file": "x.toml", "client": "x", "reason": "no good"}
+    old = _result({"a": _entry()})
+    new = dict(_result({"a": _entry()}), refused=[refusal])
+    assert nc._report(old, new) == 1
+    out = capsys.readouterr().out
+    assert "NEW refused pipelines.d/x.toml: no good" in out
+    assert out.rstrip().endswith("RESULT: INCONCLUSIVE (1 refused file; see above)")

@@ -305,6 +305,17 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
     from hs_uploader.daemon import build_all_pipelines, load_manifest
     from hs_uploader.watermark.sqlite import SqliteWatermarkStore
 
+    # A tree from before pipelines.d has no loader; it reads the legacy
+    # manifest alone, as it always did.
+    try:
+        from hs_uploader.pipelines_d import load_layout
+    except ModuleNotFoundError as exc:
+        if exc.name != "hs_uploader.pipelines_d":
+            raise
+        load_layout = None
+    if load_layout is not None:
+        from hs_uploader.daemon import build_layout
+
     class _TapStore(SqliteWatermarkStore):
         """The tree's own store, opened on the copy.  It records each key the
         tree's core reads.  It hides queued retries from the pump, so the
@@ -328,8 +339,15 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
         def queued(self, pipeline):
             return super().deliverable_count(pipeline)
 
-    manifest = load_manifest(manifest_path)
-    entries = manifest.get("pipeline", []) or []
+    layout = None
+    if load_layout is not None:
+        # pipelines.d sits beside the manifest copy, where the loader looks.
+        layout = load_layout(manifest_path)
+        manifest = layout.manifest
+        entries = [e for e, _origin in layout.entries]
+    else:
+        manifest = load_manifest(manifest_path)
+        entries = manifest.get("pipeline", []) or []
     for entry in entries:
         source = entry.get("source") or {}
         if str(source.get("type", "")).strip().lower() == "wspr_cycle":
@@ -337,7 +355,8 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
     named = [str(e["name"]) for e in entries if e.get("name")]
 
     store = _TapStore(watermarks)
-    result: dict = {"tree": str(pkg), "pipelines": {}, "unbuilt": []}
+    result: dict = {"tree": str(pkg), "pipelines": {}, "unbuilt": [],
+                    "refused": []}
 
     def finish() -> int:
         result["opened"] = sorted(opened)
@@ -345,7 +364,13 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
         return 0
 
     try:
-        pipelines = build_all_pipelines(manifest, watermark=store)
+        if layout is not None:
+            pipelines, refused = build_layout(layout, watermark=store)
+            result["refused"] = [
+                {"file": r.file, "client": r.client, "reason": r.reason}
+                for r in refused]
+        else:
+            pipelines = build_all_pipelines(manifest, watermark=store)
     except Exception as exc:  # noqa: BLE001 - reported, never hidden
         result["build_error"] = f"{type(exc).__name__}: {exc}"
         return finish()
@@ -407,7 +432,22 @@ def _with_wal(path: Path) -> list:
 def _given_files(args) -> list:
     """The files the check must leave alone: the manifest, sink.db and
     watermarks.db, each with the -wal beside it when there is one."""
-    return [args.manifest, *_with_wal(args.sink), *_with_wal(args.watermarks)]
+    files = [*_manifests(args)]
+    for pdir in _pipelines_dirs(args):
+        for root, _dirs, names in os.walk(pdir):
+            files.extend(Path(root) / n for n in sorted(names))
+    return [*dict.fromkeys(files),
+            *_with_wal(args.sink), *_with_wal(args.watermarks)]
+
+
+def _manifests(args) -> list:
+    """The manifest each side reads (X6): --old-manifest and --new-manifest,
+    each defaulting to --manifest."""
+    return [args.old_manifest or args.manifest, args.new_manifest or args.manifest]
+
+
+def _pipelines_dirs(args) -> list:
+    return [d for d in (args.old_pipelines_d, args.new_pipelines_d) if d]
 
 
 def _fingerprint(paths) -> dict:
@@ -470,13 +510,23 @@ def _run_tree(label: str, tree: Path, args, now_iso: str, scratch: Path) -> dict
     _copy_db(args.watermarks, watermarks)
     _check_copy(sink, "sink.db", "pending_uploads")
     _check_copy(watermarks, "watermarks.db", "watermarks")
+    # The manifest and its pipelines.d go side by side, so the tree's loader
+    # finds the directory where it finds it on a station.
+    etc = work / "etc"
+    etc.mkdir()
+    side_manifest = getattr(args, f"{label.lower()}_manifest") or args.manifest
+    side_pdir = getattr(args, f"{label.lower()}_pipelines_d")
+    manifest = etc / "pipelines.toml"
+    shutil.copyfile(side_manifest, manifest)
+    if side_pdir is not None:
+        shutil.copytree(side_pdir, etc / "pipelines.d")
     out = work / "result.json"
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
     env["HS_UPLOADER_STATE_DIR"] = str(work)
     env["SIGMOND_SQLITE_PATH"] = str(sink)
     cmd = [sys.executable, "-B", str(Path(__file__).resolve()),
-           "--worker", str(tree), "--manifest", str(args.manifest),
+           "--worker", str(tree), "--manifest", str(manifest),
            "--sink", str(sink), "--watermarks", str(watermarks),
            "--now", now_iso, "--out", str(out)]
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
@@ -557,6 +607,11 @@ def _report(old: dict, new: dict) -> int:
         if not same:
             print(f"[compare] {name}: OLD and NEW differ in: "
                   f"{', '.join(_differing(o, n))}", file=sys.stderr)
+    refused = 0
+    for label, res in (("OLD", old), ("NEW", new)):
+        for r in res.get("refused", []):
+            refused += 1
+            print(f"{label} refused pipelines.d/{r['file']}: {r['reason']}")
     for label, res in (("OLD", old), ("NEW", new)):
         if res["unbuilt"]:
             print(f"{label} built no pipeline for: {', '.join(res['unbuilt'])}")
@@ -581,6 +636,11 @@ def _report(old: dict, new: dict) -> int:
         reasons.append(f"{len(unbuilt)} not built; see above")
     if raised:
         reasons.append(f"{len(raised)} raised an error; see above")
+    if refused:
+        # A refused file sends nothing, so the pipelines in it were never
+        # compared (Ruling 2).
+        reasons.append(f"{refused} refused file{'' if refused == 1 else 's'}; "
+                       f"see above")
     if reasons:
         print(f"RESULT: INCONCLUSIVE ({'; '.join(reasons)})")
         return 1
@@ -596,8 +656,17 @@ def main(argv=None) -> int:
                     "copies of a station's pipelines.toml, sink.db and "
                     "watermarks.db.")
     p.add_argument("--manifest", "--pipelines", dest="manifest", type=Path,
-                   required=True,
-                   help="the station's /etc/hs-uploader/pipelines.toml (a copy)")
+                   help="the station's /etc/hs-uploader/pipelines.toml (a copy); "
+                        "required unless --old-manifest and --new-manifest "
+                        "both name one")
+    p.add_argument("--old-manifest", type=Path,
+                   help="the manifest OLD reads (default: --manifest)")
+    p.add_argument("--new-manifest", type=Path,
+                   help="the manifest NEW reads (default: --manifest)")
+    p.add_argument("--old-pipelines-d", type=Path,
+                   help="a copy of pipelines.d for OLD (default: none)")
+    p.add_argument("--new-pipelines-d", type=Path,
+                   help="a copy of pipelines.d for NEW (default: none)")
     p.add_argument("--sink", type=Path, required=True,
                    help="a snapshot of /var/lib/sigmond/sink.db")
     p.add_argument("--watermarks", type=Path, required=True,
@@ -620,9 +689,22 @@ def main(argv=None) -> int:
             p.error(f"--{flag} is required")
         if not (tree / "hs_uploader" / "__init__.py").is_file():
             p.error(f"--{flag} {tree} holds no hs_uploader package")
+    for side in ("old", "new"):
+        if args.manifest is None and getattr(args, f"{side}_manifest") is None:
+            p.error(f"--manifest or --{side}-manifest is required")
     for flag in ("manifest", "sink", "watermarks"):
+        if getattr(args, flag) is None:
+            continue
         if not getattr(args, flag).is_file():
             p.error(f"--{flag} {getattr(args, flag)} is not a file")
+    for flag in ("old_manifest", "new_manifest"):
+        given = getattr(args, flag)
+        if given is not None and not given.is_file():
+            p.error(f"--{flag.replace('_', '-')} {given} is not a file")
+    for flag in ("old_pipelines_d", "new_pipelines_d"):
+        given = getattr(args, flag)
+        if given is not None and not given.is_dir():
+            p.error(f"--{flag.replace('_', '-')} {given} is not a directory")
     try:
         now = _parse_now(args.now) if args.now else datetime.now(timezone.utc)
     except ValueError as exc:
