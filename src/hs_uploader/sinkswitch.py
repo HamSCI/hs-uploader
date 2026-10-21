@@ -10,6 +10,7 @@ import fcntl
 import logging
 import math
 import os
+import time
 import re
 import tomllib
 import datetime as _dt
@@ -22,6 +23,7 @@ log = logging.getLogger(__name__)
 DEFAULT_SINKS_DIR = Path("/etc/hs-uploader/sinks")
 STATES = ("off", "fill", "upload")  # strictness order, loosest last
 CLIENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
+LOCK_TIMEOUT_S = 10.0  # bound on waiting for sinks/.lock
 SITE = "site"  # sinks/site.toml is the site switch, never a client
 
 
@@ -40,6 +42,7 @@ class SwitchRead:
     missing: bool
     error: str
     data: Mapping = field(default_factory=dict)  # parsed file; {} if missing or broken
+    failed: bool = False  # True only for a read or parse failure (not a bad state)
 
 
 @dataclass
@@ -65,11 +68,11 @@ def _parse(path: Path) -> SwitchRead:
     except FileNotFoundError:
         return SwitchRead(None, True, "", {})
     except OSError as e:
-        return SwitchRead(None, False, f"{path}: unreadable: {e}", {})
+        return SwitchRead(None, False, f"{path}: unreadable: {e}", {}, True)
     try:
         data = tomllib.loads(raw.decode("utf-8"))
     except (tomllib.TOMLDecodeError, UnicodeDecodeError) as e:
-        return SwitchRead(None, False, f"{path}: parse error: {e}", {})
+        return SwitchRead(None, False, f"{path}: parse error: {e}", {}, True)
     state = data.get("state")
     if state not in STATES:
         return SwitchRead(
@@ -92,7 +95,7 @@ def read_switch(path: Path, *, cache: bool = True) -> SwitchRead:
         _cache.pop(key, None)
         return SwitchRead(None, True, "", {})
     except OSError as e:
-        return SwitchRead(None, False, f"{path}: unreadable: {e}", {})
+        return SwitchRead(None, False, f"{path}: unreadable: {e}", {}, True)
     if cache:
         hit = _cache.get(key)
         if hit and hit[0] == sig:
@@ -108,7 +111,12 @@ def read_switch(path: Path, *, cache: bool = True) -> SwitchRead:
 def effective_state(client: str, *, sinks_dir: Path = DEFAULT_SINKS_DIR) -> Effective:
     """The stricter of the client's file and site.toml (design §3.4)."""
     if not valid_client_name(client):
-        raise ValueError(f"bad client name: {client!r}")
+        # Fail closed.  Never form a path from the bad name.
+        msg = f"bad client name {client!r}: reading as off"
+        if ("name", repr(client)) not in _logged:
+            _logged.add(("name", repr(client)))
+            log.error("sink switch: %s", msg)
+        return Effective("off", None, None, [msg])
     sinks_dir = Path(sinks_dir)
     c = read_switch(sinks_dir / f"{client}.toml")
     s = read_switch(sinks_dir / f"{SITE}.toml")
@@ -239,13 +247,31 @@ def write_switch(path: Path, change: Mapping) -> None:
     if state not in STATES:
         raise ValueError(f"state {state!r} is not one of {'/'.join(STATES)}")
     d = path.parent
-    d.mkdir(parents=True, exist_ok=True)
-    lockfd = os.open(d / ".lock", os.O_RDWR | os.O_CREAT, 0o644)
+    if not d.is_dir():
+        d.mkdir(parents=True, exist_ok=True, mode=0o755)
+        os.chmod(d, 0o755)  # the umask must not narrow it (design §3.4)
+    lockpath = d / ".lock"
+    lockfd = os.open(lockpath, os.O_RDWR | os.O_CREAT, 0o600)
     try:
-        fcntl.flock(lockfd, fcntl.LOCK_EX)
+        os.fchmod(lockfd, 0o600)  # the umask must not widen it
+        deadline = time.monotonic() + LOCK_TIMEOUT_S
+        while True:
+            try:
+                fcntl.flock(lockfd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                break
+            except BlockingIOError:
+                if time.monotonic() >= deadline:
+                    raise TimeoutError(
+                        f"could not take the switch lock {lockpath} within "
+                        f"{LOCK_TIMEOUT_S} s; nothing written"
+                    ) from None
+                time.sleep(0.05)
         cur = read_switch(path, cache=False)
-        if cur.error and not cur.data:
-            raise ValueError(f"refusing to rewrite a broken switch file: {cur.error}")
+        if cur.failed:
+            raise ValueError(
+                f"refusing to rewrite a broken switch file: {cur.error}; "
+                "move the file aside to recreate it"
+            )
         data = dict(cur.data)
         old = cur.state or "off"
         at = change.get("set_at") or _now()

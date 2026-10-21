@@ -119,9 +119,11 @@ def test_valid_client_names(n):
     assert ss.valid_client_name(n)
 
 
-def test_effective_state_refuses_bad_client_name(tmp_path):
-    with pytest.raises(ValueError):
-        ss.effective_state("../x", sinks_dir=tmp_path)
+def test_effective_state_bad_client_name_fails_closed(tmp_path):
+    (tmp_path.parent / "x.toml").write_text(st("upload"))
+    e = ss.effective_state("../x", sinks_dir=tmp_path)
+    assert e.state == "off" and len(e.errors) == 1 and "../x" in e.errors[0]
+    assert ss.effective_state("site", sinks_dir=tmp_path).state == "off"
 
 
 # ---- writing (spec §6.1, test 18) ------------------------------------------
@@ -252,3 +254,50 @@ def test_dumps_toml_round_trips():
 def test_dumps_toml_rejects_other_types(bad):
     with pytest.raises(TypeError):
         ss.dumps_toml(bad)
+
+
+# ---- fix round 1 -------------------------------------------------------------
+
+@pytest.mark.parametrize("text", ["", "# only a comment\n"])
+def test_empty_or_comment_only_file_can_be_rewritten(tmp_path, text):
+    path = put(tmp_path, "c", text)
+    ss.write_switch(path, {"state": "fill", "reason": "r", "set_by": "t", "set_at": "t"})
+    assert ss.read_switch(path).state == "fill"
+
+
+def test_refusal_says_to_move_file_aside(tmp_path):
+    path = put(tmp_path, "c", "state = [\n")
+    with pytest.raises(ValueError, match="move the file aside"):
+        ss.write_switch(path, {"state": "fill"})
+
+
+def test_lock_holder_that_never_releases_times_out(tmp_path, monkeypatch):
+    import fcntl
+
+    monkeypatch.setattr(ss, "LOCK_TIMEOUT_S", 0.3)
+    lockf = open(tmp_path / ".lock", "a+")
+    fcntl.flock(lockf, fcntl.LOCK_EX)
+    t0 = time.monotonic()
+    with pytest.raises(TimeoutError, match=r"\.lock"):
+        ss.write_switch(tmp_path / "c.toml", {"state": "off"})
+    assert time.monotonic() - t0 < 3
+    assert not (tmp_path / "c.toml").exists()
+    lockf.close()
+
+
+def test_lock_file_mode_is_0600(tmp_path):
+    old = os.umask(0o000)
+    try:
+        ss.write_switch(tmp_path / "c.toml", {"state": "off"})
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((tmp_path / ".lock").stat().st_mode) == 0o600
+
+
+def test_new_sinks_dir_is_0755_under_umask_077(tmp_path):
+    old = os.umask(0o077)
+    try:
+        ss.write_switch(tmp_path / "sinks" / "c.toml", {"state": "off"})
+    finally:
+        os.umask(old)
+    assert stat.S_IMODE((tmp_path / "sinks").stat().st_mode) == 0o755
