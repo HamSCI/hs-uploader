@@ -46,6 +46,17 @@ PSK_TAR_KEY = ("sqlite:psk.spots", "wsprdaemon-tar-sftp:gw1.wsprdaemon.org",
 # ---- fixtures -----------------------------------------------------------------
 
 
+_ALL_MIGRATIONS = schema.MIGRATIONS
+
+
+@pytest.fixture(autouse=True)
+def _through_migration_2(monkeypatch):
+    """This file tests migration 2 and the store at version 2.  Migration 3
+    (columns and last_send) has its own file, test_migration_v3.py."""
+    monkeypatch.setattr(schema, "MIGRATIONS", _ALL_MIGRATIONS[:2])
+    monkeypatch.setattr(schema, "SCHEMA_VERSION", 2)
+
+
 def _version(db: Path) -> int:
     conn = sqlite3.connect(db)
     try:
@@ -153,8 +164,8 @@ def _table(db: Path, name: str) -> list[tuple]:
 # ---- migration 2: the records ----------------------------------------------------
 
 
-def test_schema_version_is_2():
-    assert schema.SCHEMA_VERSION == 2
+def test_migration_2_is_the_second_step():
+    assert [m.version for m in _ALL_MIGRATIONS][:2] == [1, 2]
     assert [m.version for m in schema.MIGRATIONS] == [1, 2]
 
 

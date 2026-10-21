@@ -56,7 +56,9 @@ CREATE TABLE IF NOT EXISTS attempts (
     outcome   TEXT NOT NULL,
     records   INTEGER,
     bytes     INTEGER,
-    error     TEXT
+    error     TEXT,
+    pipeline  TEXT NOT NULL DEFAULT '',
+    client    TEXT NOT NULL DEFAULT ''
 );
 CREATE INDEX IF NOT EXISTS attempts_ts_idx ON attempts(ts);
 
@@ -101,6 +103,15 @@ CREATE TABLE IF NOT EXISTS pipeline_state (
     client         TEXT NOT NULL,
     refused_reason TEXT NOT NULL DEFAULT '',
     updated_at     TEXT NOT NULL
+);
+
+CREATE TABLE IF NOT EXISTS last_send (
+    client   TEXT NOT NULL,
+    pipeline TEXT NOT NULL,
+    outcome  TEXT NOT NULL,
+    ts       TEXT NOT NULL,
+    records  INTEGER,
+    PRIMARY KEY (client, pipeline)
 );
 """
 

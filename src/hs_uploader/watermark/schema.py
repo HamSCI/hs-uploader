@@ -180,6 +180,59 @@ CREATE TABLE IF NOT EXISTS superseded_keys (
 """
 
 
+# ---- version 3: the send log names its pipeline and client (spec-sink-2b §4)
+
+# Frozen with migration 3, as migration 2's DDL above is.  The store's own
+# schema creates the same table on a new file.
+_V3_LAST_SEND_DDL = """
+CREATE TABLE IF NOT EXISTS last_send (
+    client   TEXT NOT NULL,
+    pipeline TEXT NOT NULL,
+    outcome  TEXT NOT NULL,
+    ts       TEXT NOT NULL,
+    records  INTEGER,
+    PRIMARY KEY (client, pipeline)
+)
+"""
+# A column added NOT NULL carries a default, so a v3.76 writer that names
+# only its own columns still inserts.
+_V3_ATTEMPT_COLUMNS = (
+    ("pipeline", "ALTER TABLE attempts ADD COLUMN pipeline "
+                 "TEXT NOT NULL DEFAULT ''"),
+    ("client", "ALTER TABLE attempts ADD COLUMN client "
+               "TEXT NOT NULL DEFAULT ''"),
+)
+
+
+def _add_send_log_names(conn: sqlite3.Connection, ctx: MigrateContext, *,
+                        write: bool = True) -> list[str]:
+    """Add the missing ``attempts`` columns and the ``last_send`` table.
+    No old row changes.  With ``write=False`` it reports what it would do."""
+    have = {r[1] for r in conn.execute("PRAGMA table_info(attempts)")}
+    lines: list[str] = []
+    for name, ddl in _V3_ATTEMPT_COLUMNS:
+        if name in have:
+            continue
+        if write:
+            conn.execute(ddl)
+        lines.append(f"{'added' if write else 'would add'} column "
+                     f"attempts.{name} (TEXT NOT NULL DEFAULT '')")
+    has_table = conn.execute(
+        "SELECT 1 FROM sqlite_master WHERE type='table' AND name='last_send'"
+    ).fetchone() is not None
+    if not has_table:
+        if write:
+            conn.execute(_V3_LAST_SEND_DDL)
+        lines.append(f"{'created' if write else 'would create'} table "
+                     "last_send (client, pipeline, outcome, ts, records)")
+    return lines
+
+
+def _preview_send_log_names(conn: sqlite3.Connection,
+                            ctx: MigrateContext) -> list[str]:
+    return _add_send_log_names(conn, ctx, write=False)
+
+
 def _show(blob: object) -> str:
     """A cursor for a report line: ASCII as it reads, anything else repr."""
     if isinstance(blob, (bytes, bytearray, memoryview)):
@@ -270,6 +323,8 @@ MIGRATIONS: tuple[Migration, ...] = (
               _record_version_only),
     Migration(2, "split the pskreporter send record by producer",
               _split_pskreporter, _preview_split),
+    Migration(3, "name the pipeline and client in the send log; add last_send",
+              _add_send_log_names, _preview_send_log_names),
 )
 
 
