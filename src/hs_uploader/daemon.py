@@ -18,6 +18,13 @@ pipelines and composes them into one ``hs_uploader.core.Uploader``:
 The pump loop is wake-driven (the shared ``upload-wake.sock``) with a polling
 backstop, and speaks systemd ``Type=notify`` + ``WatchdogSec`` (stdlib only).
 
+Beside the legacy manifest, ``pipelines.d/<client>.toml`` adds pipelines
+(:mod:`hs_uploader.pipelines_d`).  Before each pump the daemon stats that
+directory; when it moved, or on SIGHUP, :class:`Rebuilder` rebuilds between
+pumps, keeps every unchanged pipeline running, and runs the store check
+again.  The legacy manifest stays as read at start: an edit to it waits for
+a restart.
+
 Run via ``hs-uploader serve --manifest /etc/hs-uploader/pipelines.toml``.
 """
 
@@ -30,14 +37,16 @@ import signal
 import socket
 import threading
 import tomllib
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping
+from typing import Any, Callable, Mapping, Optional
 
 from .config import StationIdentity
 from .core import Pipeline, Uploader
 from .pipeline_factory import build_entry
 from .pipeline_factory import build_pipelines as build_generic_pipelines
-from .pipelines_d import LEGACY, Layout, Refusal, load_layout
+from .pipelines_d import (LEGACY, Layout, Refusal, load_layout,
+                          pipelines_dir_for, pipelines_signature)
 from .transports.discard import wrap_if_discard
 from .wake import WakeListener
 from .watermark.sqlite import SqliteWatermarkStore, default_path
@@ -159,7 +168,7 @@ def build_all_pipelines(
     return pipelines
 
 
-# ---- pipelines.d: build the layout, refuse whole files (spec sink-2b §3.2-§3.3)
+# ---- pipelines.d: build the layout, refuse whole files (spec sink-2b §3.2-§3.4)
 
 
 def pipeline_key(p: Pipeline) -> tuple[str, str, str]:
@@ -183,6 +192,7 @@ def _collision(p: Pipeline, names: Mapping[str, Pipeline],
 
 
 def _close_quietly(pipes: list[Pipeline]) -> None:
+    """Close the sources of pipelines that never pumped (main thread)."""
     for p in pipes:
         close = getattr(p.source, "close", None)
         if callable(close):
@@ -192,49 +202,232 @@ def _close_quietly(pipes: list[Pipeline]) -> None:
                 logger.debug("daemon: closing %s's source failed", p.name)
 
 
+def _always(_key: tuple) -> bool:
+    return True
+
+
+class _Once:
+    """Say whether a keyed message should log: once while its key recurs.
+
+    Each build calls ``begin()`` first and ``end()`` last.  A key the previous
+    build also met stays quiet.  A key that stops recurring is forgotten, so
+    it logs again if it comes back.  A refused file's key holds its own stat
+    and its reason, so touching a side file never repeats its ERROR (§3.4
+    step 2, ruling C15 note).
+    """
+
+    def __init__(self) -> None:
+        self._seen: set = set()
+        self._now: set = set()
+
+    def begin(self) -> None:
+        self._now = set()
+
+    def end(self) -> None:
+        self._seen, self._now = self._now, set()
+
+    def __call__(self, key: tuple) -> bool:
+        self._now.add(key)
+        return key not in self._seen
+
+
+def _file_stat(signature: tuple, filename: str) -> Optional[tuple]:
+    """One file's (mtime_ns, size, inode) from a ``pipelines_signature``."""
+    if len(signature) == 2:
+        for name, st in signature[1]:
+            if name == filename:
+                return st
+    return None
+
+
+@dataclass
+class _Slot:
+    """One entry and the pipelines it built: what a rebuild may reuse."""
+
+    origin: str
+    index: Optional[int]          # naming index of an unnamed generic entry
+    entry: Mapping[str, Any]
+    pipes: list[Pipeline]
+
+
+@dataclass
+class Build:
+    """One build's result, kept so the next rebuild can reuse it (§3.4).
+
+    ``pipelines`` holds every pipeline built, before the store check.
+    ``good`` holds each pipeline file's last accepted entries.
+    """
+
+    pipelines: list[Pipeline] = field(default_factory=list)
+    refused: list[Refusal] = field(default_factory=list)
+    slots: list[_Slot] = field(default_factory=list)
+    good: dict[str, list[Mapping[str, Any]]] = field(default_factory=dict)
+
+
+class _Pool:
+    """The previous build's slots; each one may be reused once."""
+
+    def __init__(self, slots: list[_Slot]):
+        self._free = list(slots)
+
+    def take(self, origin: str, index: Optional[int],
+             entry: Mapping[str, Any]) -> Optional[_Slot]:
+        for i, s in enumerate(self._free):
+            if s.origin == origin and s.index == index and s.entry == entry:
+                return self._free.pop(i)
+        return None
+
+    def give_back(self, slots: list[_Slot]) -> None:
+        self._free.extend(slots)
+
+
+def _naming_index(entry: Mapping[str, Any], i: int) -> Optional[int]:
+    """The index an entry's default name depends on, or None when it has none.
+
+    An unnamed generic entry is named ``pipeline-<i>``, so its index is part
+    of what makes it the same entry; a named one, or a builder, does not
+    move when an entry before it drops out.
+    """
+    return None if entry.get("name") or entry.get("builder") else i
+
+
+def _build_one(entry: Mapping[str, Any], origin: str, i: int, *,
+               manifest: Mapping[str, Any],
+               watermark: SqliteWatermarkStore) -> list[Pipeline]:
+    """Build one entry, generic or builder; raise on failure."""
+    if entry.get("builder"):
+        return _build_with_builder(entry, base_identity=_base_identity(manifest),
+                                   watermark=watermark, origin=origin)
+    return [build_entry(entry, base_identity=manifest.get("identity", {}) or {},
+                        watermark=watermark, origin=origin, index=i)]
+
+
+def _build_legacy(entries: list[Mapping[str, Any]], *,
+                  manifest: Mapping[str, Any],
+                  watermark: SqliteWatermarkStore, pool: _Pool,
+                  strict: bool) -> tuple[list[_Slot], list[Pipeline]]:
+    """Build the legacy entries as v3.76 did: generic ones, then builders.
+
+    A generic entry that fails raises when ``strict`` (the start, as v3.76),
+    else logs and builds nothing; a builder that fails logs and is skipped.
+    Returns (slots, the pipelines built fresh).
+    """
+    slots: list[_Slot] = []
+    fresh: list[Pipeline] = []
+    generic = [e for e in entries if not e.get("builder")]
+    for i, entry in enumerate(generic):
+        index = _naming_index(entry, i)
+        slot = pool.take(LEGACY, index, entry)
+        if slot is None:
+            try:
+                pipes = _build_one(entry, LEGACY, i, manifest=manifest,
+                                   watermark=watermark)
+            except Exception:
+                if strict:
+                    _close_quietly(fresh)
+                    raise
+                logger.exception("daemon: legacy pipeline %s failed to build;"
+                                 " skipped", entry.get("name") or f"pipeline-{i}")
+                pipes = []
+            fresh.extend(pipes)
+            slot = _Slot(LEGACY, index, entry, pipes)
+        slots.append(slot)
+    for entry in entries:
+        if not entry.get("builder"):
+            continue
+        slot = pool.take(LEGACY, None, entry)
+        if slot is None:
+            spec = str(entry["builder"])
+            try:
+                pipes = _build_one(entry, LEGACY, 0, manifest=manifest,
+                                   watermark=watermark)
+            except Exception:
+                logger.exception("daemon: builder %s failed for %s", spec,
+                                 str(entry.get("name") or spec))
+                pipes = []
+            fresh.extend(pipes)
+            slot = _Slot(LEGACY, None, entry, pipes)
+        slots.append(slot)
+    return slots, fresh
+
+
 def _build_file(entries: list[Mapping[str, Any]], origin: str, *,
-                manifest: Mapping[str, Any],
-                watermark: SqliteWatermarkStore) -> tuple[list[Pipeline], str]:
-    """Build every entry of one pipeline file: (pipelines, "") or ([], reason)."""
-    base = manifest.get("identity", {}) or {}
-    built: list[Pipeline] = []
+                manifest: Mapping[str, Any], watermark: SqliteWatermarkStore,
+                pool: _Pool) -> tuple[list[_Slot], list[_Slot], list[Pipeline], str]:
+    """Build one pipeline file whole, reusing unchanged entries.
+
+    Returns (slots, the slots reused, the pipelines built fresh, "") or, when
+    an entry fails, ([], [], [], reason) with the fresh ones closed and the
+    reused ones back in the pool.
+    """
+    slots: list[_Slot] = []
+    taken: list[_Slot] = []
+    fresh: list[Pipeline] = []
     for i, entry in enumerate(entries):
+        index = _naming_index(entry, i)
+        slot = pool.take(origin, index, entry)
+        if slot is not None:
+            taken.append(slot)
+            slots.append(slot)
+            continue
         label = entry.get("name") or entry.get("builder") or f"entry {i + 1}"
         try:
-            if entry.get("builder"):
-                built.extend(_build_with_builder(
-                    entry, base_identity=_base_identity(manifest),
-                    watermark=watermark, origin=origin))
-            else:
-                built.append(build_entry(entry, base_identity=base,
-                                         watermark=watermark, origin=origin,
-                                         index=i))
+            pipes = _build_one(entry, origin, i, manifest=manifest,
+                               watermark=watermark)
         except Exception as exc:
-            _close_quietly(built)
-            return [], f"pipeline {label!r} failed to build: {exc!r}"
-    return built, ""
+            _close_quietly(fresh)
+            pool.give_back(taken)
+            return [], [], [], f"pipeline {label!r} failed to build: {exc!r}"
+        fresh.extend(pipes)
+        slots.append(_Slot(origin, index, entry, pipes))
+    return slots, taken, fresh, ""
 
 
-def build_layout(
-    layout: Layout, *, watermark: SqliteWatermarkStore
-) -> tuple[list[Pipeline], list[Refusal]]:
-    """Build every entry of ``layout``; return (pipelines, every refused file).
+def _admit(slots: list[_Slot], names: dict[str, Pipeline],
+           keys: dict[tuple, Pipeline]) -> str:
+    """Accept one file's pipelines unless one collides; return the reason."""
+    f_names, f_keys = dict(names), dict(keys)
+    for s in slots:
+        for p in s.pipes:
+            reason = _collision(p, f_names, f_keys)
+            if reason:
+                return reason
+            f_names[p.name] = p
+            f_keys[pipeline_key(p)] = p
+    names.update(f_names)
+    keys.update(f_keys)
+    return ""
+
+
+def _assemble(layout: Layout, *, watermark: SqliteWatermarkStore,
+              previous: Optional[Build] = None, strict: bool = False,
+              note: Callable[[tuple], bool] = _always) -> Build:
+    """Build ``layout``, reusing every unchanged entry of ``previous``.
 
     Legacy entries build as v3.76 built them; a collision among them alone
     logs one ERROR naming both and both run (§3.3).  Each pipeline file then
-    builds whole or not at all: a failed entry, or a name or key that an
-    accepted pipeline already holds, refuses the file and names both
-    pipelines.  The refusals returned include ``layout.refused``.
+    builds whole or not at all: a failed entry, or a name or key an accepted
+    pipeline already holds, refuses the file and names both pipelines.  A
+    file refused at a rebuild keeps the pipelines it last built (§3.4 step
+    2).  Files whose entries match their last good build go first, so an
+    edited file cannot take a name or key from one that did not change.
+
+    Pipelines built here and then refused are closed here.  A previous
+    pipeline not reused is the caller's to close: it may still run.
     """
     manifest = layout.manifest
+    pool = _Pool(previous.slots if previous else [])
+    prev_good = previous.good if previous else {}
+
     legacy = [e for e, origin in layout.entries if origin == LEGACY]
-    pipelines = build_all_pipelines({**manifest, "pipeline": legacy},
-                                    watermark=watermark)
+    legacy_slots, fresh = _build_legacy(legacy, manifest=manifest,
+                                        watermark=watermark, pool=pool,
+                                        strict=strict)
     names: dict[str, Pipeline] = {}
     keys: dict[tuple, Pipeline] = {}
-    for p in pipelines:
+    for p in (p for s in legacy_slots for p in s.pipes):
         clash = _collision(p, names, keys)
-        if clash:
+        if clash and note(("legacy-collision", clash)):
             logger.error("daemon: legacy manifest: %s; running both as "
                          "before", clash)
         names.setdefault(p.name, p)
@@ -244,37 +437,86 @@ def build_layout(
     for entry, origin in layout.entries:
         if origin != LEGACY:
             by_file.setdefault(origin, []).append(entry)
+    load_refused = {r.row_name: r for r in layout.refused}
+    origins = sorted(set(by_file) | set(load_refused))
 
-    refused = list(layout.refused)
-    for origin, entries in by_file.items():
+    def unchanged(o: str) -> bool:
+        return o in by_file and prev_good.get(o) == by_file[o]
+
+    order = ([o for o in origins if unchanged(o)]
+             + [o for o in origins if not unchanged(o)])
+
+    accepted: dict[str, list[_Slot]] = {}
+    good: dict[str, list[Mapping[str, Any]]] = {}
+    refused: list[Refusal] = []
+    for origin in order:
         filename = origin.split("/", 1)[1]
-        client = filename[: -len(".toml")]
-        built, reason = _build_file(entries, origin, manifest=manifest,
-                                    watermark=watermark)
-        if not reason:
-            f_names, f_keys = dict(names), dict(keys)
-            for p in built:
-                reason = _collision(p, f_names, f_keys)
+        if origin in load_refused:
+            refused.append(load_refused[origin])
+        else:
+            entries = by_file[origin]
+            slots, taken, new, reason = _build_file(
+                entries, origin, manifest=manifest, watermark=watermark,
+                pool=pool)
+            if not reason:
+                reason = _admit(slots, names, keys)
                 if reason:
-                    break
-                f_names[p.name] = p
-                f_keys[pipeline_key(p)] = p
-        if reason:
-            _close_quietly(built)
-            refused.append(Refusal(filename, client, reason))
+                    _close_quietly(new)
+                    pool.give_back(taken)
+            if not reason:
+                accepted[origin] = slots
+                good[origin] = entries
+                fresh.extend(new)
+                continue
+            refused.append(Refusal(filename, filename[: -len(".toml")], reason))
+        last = prev_good.get(origin)
+        if last is None:
             continue
-        for p in built:
-            names[p.name] = p
-            keys[pipeline_key(p)] = p
-        pipelines.extend(built)
+        # §3.4 step 2: a file that now fails keeps what it last built.
+        slots, taken, new, reason = _build_file(
+            last, origin, manifest=manifest, watermark=watermark, pool=pool)
+        if not reason:
+            reason = _admit(slots, names, keys)
+            if reason:
+                _close_quietly(new)
+                pool.give_back(taken)
+        if reason:
+            if note(("last-good", origin, reason)):
+                logger.error("daemon: %s: cannot keep its last good build "
+                             "either: %s", origin, reason)
+            continue
+        accepted[origin] = slots
+        good[origin] = last
+        fresh.extend(new)
+
+    slots = legacy_slots + [s for o in sorted(accepted) for s in accepted[o]]
+    pipelines = [p for s in slots for p in s.pipes]
 
     for r in refused:
-        logger.error("daemon: refusing %s (client %s): %s",
-                     r.row_name, r.client, r.reason)
+        if note(("refused", r.file, _file_stat(layout.signature, r.file),
+                 r.reason)):
+            logger.error("daemon: refusing %s (client %s): %s",
+                         r.row_name, r.client, r.reason)
+    fresh_ids = {id(p) for p in fresh}
     for p in pipelines:
-        logger.info("daemon: pipeline %s (client %s, origin %s)",
-                    p.name, p.client or "(none)", p.origin)
-    return pipelines, refused
+        if id(p) in fresh_ids:
+            logger.info("daemon: pipeline %s (client %s, origin %s)",
+                        p.name, p.client or "(none)", p.origin)
+    return Build(pipelines=pipelines, refused=refused, slots=slots, good=good)
+
+
+def build_layout(
+    layout: Layout, *, watermark: SqliteWatermarkStore
+) -> tuple[list[Pipeline], list[Refusal]]:
+    """Build every entry of ``layout``; return (pipelines, every refused file).
+
+    The start's build: legacy entries build as v3.76 built them, and a
+    generic legacy entry that fails raises, as it did.  Each pipeline file
+    builds whole or not at all (§3.2-§3.3).  The refusals returned include
+    ``layout.refused``.
+    """
+    build = _assemble(layout, watermark=watermark, strict=True)
+    return build.pipelines, build.refused
 
 
 # A pipeline whose source has a ``producer`` reads one client's rows and
@@ -283,9 +525,14 @@ _PRODUCER_STORE_VERSION = 2
 
 
 def split_refused(
-    pipelines: list[Pipeline], store_version: int
+    pipelines: list[Pipeline], store_version: int, *,
+    note: Callable[[tuple], bool] = _always,
 ) -> tuple[list[Pipeline], dict[str, str]]:
-    """Return (pipelines that may run, {name: reason} for the refused)."""
+    """Return (pipelines that may run, {name: reason} for the refused).
+
+    ``note`` decides whether a refusal logs (the daemon logs each once
+    while it recurs across rebuilds).
+    """
     runnable: list[Pipeline] = []
     refused: dict[str, str] = {}
     for p in pipelines:
@@ -294,11 +541,122 @@ def split_refused(
             reason = (f"store is at schema version {store_version}; "
                       f"producer pipelines need version "
                       f"{_PRODUCER_STORE_VERSION} (run `hs-uploader migrate`)")
-            logger.error("daemon: refusing pipeline %s: %s", p.name, reason)
+            if note(("store", p.name, reason)):
+                logger.error("daemon: refusing pipeline %s: %s", p.name, reason)
             refused[p.name] = reason
         else:
             runnable.append(p)
     return runnable, refused
+
+
+# ---- the running build, and the rebuild between pumps (spec sink-2b §3.4-§3.5)
+
+
+class Rebuilder:
+    """The daemon's running set, and the rebuild between pumps.
+
+    The legacy manifest stays as the daemon read it at start (Michael,
+    10-21): a rebuild re-reads every file in ``pipelines.d/`` and passes the
+    start's copy of the legacy manifest, so its entries, ``[identity]`` and
+    host-wide settings never change while the daemon runs.
+
+    Each build runs the store check (§3.5) on a freshly read store version,
+    which also sets the version the send log writes for (§4.3), and writes
+    ``pipeline_state`` with ``replace=True``: one row per pipeline built,
+    and one ``pipelines.d/<file>`` row per refused file.
+    """
+
+    def __init__(self, manifest_path: str | Path,
+                 manifest: Mapping[str, Any],
+                 watermark: SqliteWatermarkStore):
+        self.manifest_path = Path(manifest_path)
+        self.manifest = manifest
+        self.watermark = watermark
+        self.pdir = pipelines_dir_for(manifest_path)
+        self.signature: Optional[tuple] = None
+        self.build = Build()
+        self.running: list[Pipeline] = []
+        self._rows: list[tuple[str, str, str]] = []
+        self._once = _Once()
+
+    def due(self) -> bool:
+        """Whether ``pipelines.d/`` moved since the last build (ruling X5)."""
+        return pipelines_signature(self.pdir) != self.signature
+
+    def _make(self, previous: Optional[Build], *, strict: bool):
+        self._once.begin()
+        try:
+            layout = load_layout(self.manifest_path, manifest=self.manifest,
+                                 note=self._once)
+            self.signature = layout.signature
+            build = _assemble(layout, watermark=self.watermark,
+                              previous=previous, strict=strict,
+                              note=self._once)
+            running, store_refused = split_refused(
+                build.pipelines, self.watermark.refresh_schema_version(),
+                note=self._once)
+        finally:
+            self._once.end()
+        rows = ([(p.name, p.client, store_refused.get(p.name, ""))
+                 for p in build.pipelines]
+                + [(r.row_name, r.client, r.reason) for r in build.refused])
+        return build, running, rows
+
+    def start(self) -> tuple[list[Pipeline], list[Pipeline], list[Refusal]]:
+        """The start's build: (running, every pipeline built, refused files)."""
+        build, running, rows = self._make(None, strict=True)
+        self.watermark.record_pipeline_states(rows, replace=True)
+        self.build, self.running, self._rows = build, running, rows
+        return running, build.pipelines, build.refused
+
+    def rebuild(self, uploader: Uploader) -> bool:
+        """Rebuild between pumps; return whether the running set changed.
+
+        Never call it during a pump: ``Uploader.pump()`` joins every
+        pipeline's future before it returns.
+        """
+        previous = self.build
+        build, running, rows = self._make(previous, strict=False)
+        self.build = build
+        pumped = {id(p) for p in uploader.pipelines}
+        kept = {id(p) for p in build.pipelines}
+        # A previous pipeline the store check held back never pumped: close
+        # it here.  One that pumped closes on its own thread, below.
+        _close_quietly([p for p in previous.pipelines
+                        if id(p) not in kept and id(p) not in pumped])
+        before = [id(p) for p in self.running]
+        if rows == self._rows and [id(p) for p in running] == before:
+            logger.debug("daemon: rebuild of %s changed nothing "
+                         "(%d pipeline(s) running)", self.pdir, len(running))
+            return False
+        self.watermark.record_pipeline_states(rows, replace=True)
+        self._rows = rows
+        uploader.replace_pipelines(running)
+        now = {id(p) for p in running}
+        added = [p.name for p in running if id(p) not in set(before)]
+        removed = [p.name for p in self.running if id(p) not in now]
+        self.running = running
+        logger.info("daemon: rebuilt from %s: %d pipeline(s) running; "
+                    "started %s; stopped %s", self.pdir, len(running),
+                    ", ".join(added) or "none", ", ".join(removed) or "none")
+        return True
+
+
+def _needs_wake(pipes: list[Pipeline]) -> bool:
+    """Whether any pipeline reads the sink, whose producers fire wakes."""
+    from .sources.sqlite import SqliteSource
+    try:
+        from .sources.wspr_cycle import WsprCycleSource
+        sink_types: tuple = (SqliteSource, WsprCycleSource)
+    except Exception:
+        sink_types = (SqliteSource,)
+    return any(isinstance(p.source, sink_types) for p in pipes)
+
+
+def _new_uploader(pipelines: list[Pipeline], **kw) -> Uploader:
+    """The daemon's Uploader: every pipeline on its own thread, even a lone
+    one, since a rebuild may add a second (a pipeline never moves thread)."""
+    return Uploader(pipelines, inline_single=False, **kw)
 
 
 # ---- daemon -----------------------------------------------------------------
@@ -317,18 +675,11 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
         return 1
 
     # pipelines.d/ never stops the daemon: a bad file becomes a refusal.
-    layout = load_layout(manifest_path, manifest=manifest)
+    # start() writes pipeline_state, refusal rows included, before any early
+    # return, so a refusal always leaves its reason (ruling C15).
     watermark = SqliteWatermarkStore(default_path())
-    pipelines, file_refused = build_layout(layout, watermark=watermark)
-
-    # pipeline_state records every pipeline and every refused file before any
-    # early return, so a refusal always leaves its reason (ruling C15).
-    built = pipelines
-    pipelines, refused = split_refused(built, watermark.refresh_schema_version())
-    watermark.record_pipeline_states(
-        [(p.name, p.client, refused.get(p.name, "")) for p in built]
-        + [(r.row_name, r.client, r.reason) for r in file_refused],
-        replace=True)
+    rebuilder = Rebuilder(manifest_path, manifest, watermark)
+    pipelines, built, file_refused = rebuilder.start()
     if not pipelines:
         if file_refused:
             # A refused file must not stop the daemon (spec §3.2, §13): exit
@@ -349,7 +700,7 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     logger.info("daemon: %d pipeline(s): %s",
                 len(pipelines), ", ".join(p.name for p in pipelines))
 
-    uploader = Uploader(pipelines)
+    uploader = _new_uploader(pipelines)
 
     if dry_run:
         logger.info("daemon: --dry-run — pipelines built, not pumping")
@@ -363,30 +714,31 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     dcfg = manifest.get("daemon", {}) or {}
     interval = float(dcfg.get("pump_interval_sec", 30.0))
     wake_sock = dcfg.get("wake_socket")  # None → default path
-
-    # Only bind the shared upload-wake socket when at least one pipeline reads
-    # from the sink (SqliteSource/WsprCycleSource) — those are the producers
-    # that fire wakes.  A file-spool-only daemon (e.g. GRAPE during migration)
-    # must NOT bind it, or it steals the socket from a recorder's still-running
-    # in-process uploader.  Overridable via [daemon] wake = true/false.
-    from .sources.sqlite import SqliteSource
-    try:
-        from .sources.wspr_cycle import WsprCycleSource
-        _sink_types: tuple = (SqliteSource, WsprCycleSource)
-    except Exception:
-        _sink_types = (SqliteSource,)
-    needs_wake = any(isinstance(p.source, _sink_types) for p in pipelines)
     wake_cfg = dcfg.get("wake")
-    use_wake = needs_wake if wake_cfg is None else bool(wake_cfg)
 
     stop = threading.Event()
     wake = threading.Event()
+    hangup = threading.Event()
+    listener: Optional[WakeListener] = None
 
-    listener = None
-    if use_wake:
+    def bind_wake_if_needed(pipes: list[Pipeline]) -> None:
+        # Only bind the shared upload-wake socket when at least one pipeline
+        # reads from the sink (SqliteSource/WsprCycleSource) — those are the
+        # producers that fire wakes.  A file-spool-only daemon (e.g. GRAPE
+        # during migration) must NOT bind it, or it steals the socket from a
+        # recorder's still-running in-process uploader.  Overridable via
+        # [daemon] wake = true/false.  A rebuild binds it when the new set
+        # first needs it, and nothing unbinds it while running (§3.4 step 6).
+        nonlocal listener
+        if listener is not None:
+            return
+        if not (_needs_wake(pipes) if wake_cfg is None else bool(wake_cfg)):
+            return
         listener = WakeListener(on_wake=wake.set, path=wake_sock)
         listener.start()  # best-effort; polling backstop covers a bind failure
-    else:
+
+    bind_wake_if_needed(pipelines)
+    if listener is None:
         logger.info("daemon: wake socket not bound (no sink pipeline); "
                     "polling every %.0fs", interval)
 
@@ -395,8 +747,15 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
         stop.set()
         wake.set()
 
+    def _hangup(_sig, _frame):
+        logger.info("daemon: SIGHUP — rebuilding from %s before the next pump",
+                    rebuilder.pdir)
+        hangup.set()
+        wake.set()
+
     signal.signal(signal.SIGINT, _handle)
     signal.signal(signal.SIGTERM, _handle)
+    signal.signal(signal.SIGHUP, _hangup)
 
     wd = threading.Thread(target=_watchdog_loop, args=(stop,),
                           name="hs-uploader-watchdog", daemon=True)
@@ -411,6 +770,14 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
         wake.clear()
         if stop.is_set():
             break
+        # Between pumps only (§3.4): pump() has joined every future.
+        try:
+            if hangup.is_set() or rebuilder.due():
+                hangup.clear()
+                if rebuilder.rebuild(uploader):
+                    bind_wake_if_needed(rebuilder.running)
+        except Exception:
+            logger.exception("daemon: rebuild failed; the running set stays")
         try:
             uploader.pump()
         except Exception:

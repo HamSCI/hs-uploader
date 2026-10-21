@@ -233,6 +233,25 @@ class Pipeline:
 _NowFn = Callable[[], float]
 
 
+def _pump_executor(pipe: "Pipeline"):
+    from concurrent.futures import ThreadPoolExecutor
+    return ThreadPoolExecutor(max_workers=1,
+                              thread_name_prefix=f"hs-uploader-{pipe.name}")
+
+
+def _close_objects(name: str, objs: Sequence[Any]) -> None:
+    """Close each object that has ``close()``; log and go on past a failure."""
+    for obj in objs:
+        close = getattr(obj, "close", None)
+        if not callable(close):
+            continue
+        try:
+            close()
+        except Exception:
+            logger.exception("%s: closing %s failed", name,
+                             type(obj).__name__)
+
+
 class Uploader:
     """Orchestrates one or more pipelines.
 
@@ -264,8 +283,14 @@ class Uploader:
         now_fn: _NowFn = time.time,
         on_batch_outcome: Optional[Callable[["Pipeline", "RecordBatch", "Outcome"], None]] = None,
         clock: Callable[[], float] = time.monotonic,
+        inline_single: bool = True,
     ):
         self.pipelines: list[Pipeline] = list(pipelines)
+        # ``inline_single`` pumps a lone pipeline on the caller's thread.
+        # The daemon passes False: its set changes at a rebuild, and a
+        # pipeline must keep one thread for its life (a SqliteSource's
+        # connection is pinned to the thread that opened it).
+        self._inline_single = inline_single
         self._now = now_fn
         # "acked, record held" windows, one per send-record key:
         # key -> [window start on `clock`, refusals since the last INFO].
@@ -283,18 +308,58 @@ class Uploader:
         # HTTP-to-wsprnet uploads in parallel (the user-stated goal),
         # since each pump iteration submits one task per pipeline to
         # its own executor and joins them at the end.
-        from concurrent.futures import ThreadPoolExecutor
-        self._pump_executors: list[ThreadPoolExecutor] = [
-            ThreadPoolExecutor(
-                max_workers=1,
-                thread_name_prefix=f"hs-uploader-{p.name}",
-            )
-            for p in self.pipelines
-        ]
+        self._pump_executors = [_pump_executor(p) for p in self.pipelines]
 
     def close(self) -> None:
         for ex in getattr(self, "_pump_executors", []):
             ex.shutdown(wait=False)
+
+    def replace_pipelines(self, new: Sequence[Pipeline]) -> None:
+        """Swap the running set between pumps (spec sink-2b §3.4 step 5).
+
+        Call it only between pumps: ``pump()`` joins every future before it
+        returns, so no pipeline is mid-pump here.  A pipeline object in
+        ``new`` that already runs keeps its executor, and so its thread and
+        its source's open connection.  Each removed pipeline's source, then
+        its transports, close on that pipeline's own executor thread (an
+        object a kept pipeline still holds stays open), and its executor
+        shuts down.  Each added pipeline gets a new executor.  Queued
+        retries need nothing here: they live in the store, keyed by
+        pipeline name.
+        """
+        new = list(new)
+        keep = {id(p) for p in new}
+        held = {id(obj) for p in new
+                for obj in (p.source, p.transport, p.fallback_transport)
+                if obj is not None}
+        closed: set[int] = set()
+        executors = {}
+        # A lone pipeline pumped inline ran on the caller's thread; close it
+        # there.  (Pass ``inline_single=False`` to any Uploader whose set
+        # may grow: an inline pipeline cannot move onto an executor.)
+        inline = self._inline_single and len(self.pipelines) <= 1
+        for pipe, ex in zip(self.pipelines, self._pump_executors):
+            if id(pipe) in keep:
+                executors[id(pipe)] = ex
+                continue
+            objs = []
+            for obj in (pipe.source, pipe.transport, pipe.fallback_transport):
+                if obj is None or id(obj) in held or id(obj) in closed:
+                    continue
+                closed.add(id(obj))
+                objs.append(obj)
+            try:
+                if inline:
+                    _close_objects(pipe.name, objs)
+                else:
+                    ex.submit(_close_objects, pipe.name, objs).result()
+            except Exception:
+                logger.exception("%s: closing the removed pipeline failed",
+                                 pipe.name)
+            ex.shutdown(wait=True)
+        self.pipelines = new
+        self._pump_executors = [executors.get(id(p)) or _pump_executor(p)
+                                for p in new]
 
     # -- public --
 
@@ -317,7 +382,7 @@ class Uploader:
         # The on_batch_outcome callback IS shared — caller must make it
         # thread-safe if it mutates state (see hs_uploader_shim's
         # callback which uses simple += under the GIL).
-        if len(self.pipelines) <= 1:
+        if self._inline_single and len(self.pipelines) <= 1:
             # Skip the executor hop for the one-pipeline case.
             did_work = False
             for pipe in self.pipelines:

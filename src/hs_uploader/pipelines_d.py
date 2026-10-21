@@ -30,7 +30,7 @@ import stat
 import tomllib
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Any, Mapping, Optional
+from typing import Any, Callable, Mapping, Optional
 
 from .sinkswitch import valid_client_name
 
@@ -157,7 +157,13 @@ def _start_at_problem(source: Mapping[str, Any]) -> str:
     return ""
 
 
-def _check_file(filename: str, data: Mapping[str, Any]) -> tuple[list[Mapping[str, Any]], str]:
+def _always(_key: tuple) -> bool:
+    return True
+
+
+def _check_file(filename: str, data: Mapping[str, Any],
+                note: Callable[[tuple], bool] = _always,
+                ) -> tuple[list[Mapping[str, Any]], str]:
     """Return (entries with ``client`` set, "") or ([], reason)."""
     client = filename[: -len(".toml")]
     if "daemon" in data:
@@ -169,7 +175,7 @@ def _check_file(filename: str, data: Mapping[str, Any]) -> tuple[list[Mapping[st
         if "ssh_key_file" in ident:
             return [], ("[identity] names ssh_key_file, a host-wide setting; "
                         "it belongs in the legacy manifest")
-        if ident:
+        if ident and note(("identity", filename, tuple(sorted(ident)))):
             logger.info("pipelines.d: %s: ignoring [identity] tables (%s); "
                         "nothing reads per-instance identity yet",
                         filename, ", ".join(sorted(ident)))
@@ -196,7 +202,8 @@ def _check_file(filename: str, data: Mapping[str, Any]) -> tuple[list[Mapping[st
 
 
 def load_layout(manifest_path: str | Path, *,
-                manifest: Optional[Mapping[str, Any]] = None) -> Layout:
+                manifest: Optional[Mapping[str, Any]] = None,
+                note: Callable[[tuple], bool] = _always) -> Layout:
     """Read the legacy manifest and ``pipelines.d/``; apply precedence and the file rules.
 
     The legacy manifest stays required: a missing or broken one raises, as
@@ -204,6 +211,8 @@ def load_layout(manifest_path: str | Path, *,
     its exit codes stay as they were; a rebuild passes the copy read at start,
     since the daemon never re-reads the legacy manifest).  Nothing in
     ``pipelines.d/`` ever raises: each bad file becomes a :class:`Refusal`.
+    ``note`` decides whether a keyed INFO line logs; the daemon passes one
+    that logs each once while it recurs across rebuilds.
     """
     pdir = pipelines_dir_for(manifest_path)
     signature = pipelines_signature(pdir)          # before anything is read (X5)
@@ -239,7 +248,7 @@ def load_layout(manifest_path: str | Path, *,
         except Exception as exc:  # parse error, unreadable, a directory ...
             refused.append(Refusal(name, client, f"cannot read: {exc}"))
             continue
-        entries, reason = _check_file(name, data)
+        entries, reason = _check_file(name, data, note)
         if reason:
             refused.append(Refusal(name, client, reason))
             continue

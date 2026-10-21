@@ -524,6 +524,22 @@ class SqliteSource:
         self._schema_checked = True
         return True
 
+    def close(self) -> None:
+        """Close the connection, on the thread that opened it.
+
+        The daemon calls this when a rebuild removes the pipeline.  A later
+        read opens a new connection.
+        """
+        if self._conn is not None:
+            try:
+                self._conn.close()
+            except Exception:
+                logger.debug("SqliteSource: closing %s failed",
+                             self.database, exc_info=True)
+            self._conn = None
+            self._has_producer_column = None
+            self._schema_checked = False
+
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
             assert self._config is not None
