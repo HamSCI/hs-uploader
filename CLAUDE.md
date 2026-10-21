@@ -47,6 +47,9 @@ uv build
 hs-uploader --help
 hs-uploader migrate --check    # watermarks.db schema version; writes nothing
 hs-uploader migrate            # run pending migrations (sigmond does this on each manifest write)
+hs-uploader capabilities            # store schema version this code writes (one integer, now 3)
+hs-uploader capabilities --features # feature words: pipelines.d, send-log-v3, switch-files
+hs-uploader sink status             # each client's switch file and effective state; enforces nothing
 ```
 
 Clients store rows through `hs_uploader.sink.Writer` and build
@@ -110,7 +113,9 @@ src/hs_uploader/
   core.py                 # Pipeline + Uploader orchestration
   cli.py                  # diagnostic CLI
   config.py               # config loading helpers
-  daemon.py               # host daemon (`hs-uploader serve`)
+  daemon.py               # host daemon (`hs-uploader serve`); Rebuilder rebuilds between pumps
+  pipelines_d.py          # loads pipelines.d/<client>.toml; precedence and refusal rules
+  sinkswitch.py           # reads and writes sinks/<client>.toml and site.toml (stdlib only)
   sink/
     writer.py             # sink Writer: stores client rows in sink.db
                           # (moved from sigmond in v3.70)
@@ -118,6 +123,7 @@ src/hs_uploader/
     base.py               # Source ABC + Record / RecordBatch types
     sqlite.py             # SqliteSource (preferred path)
     wspr_cycle.py         # WsprCycleSource (cycle-aligned variant)
+    _local_rows.py        # the `local = 0` condition both queue sources share
     files.py              # FileTreeSource (fallback)
   transports/
     base.py               # Transport ABC + Outcome variants
@@ -128,7 +134,8 @@ src/hs_uploader/
   watermark/
     base.py               # WatermarkStore ABC
     sqlite.py             # SqliteWatermarkStore
-    schema.py             # PRAGMA user_version + migrate() (`hs-uploader migrate`)
+    schema.py             # PRAGMA user_version + migrate() (`hs-uploader migrate`);
+                          # migration 3 names pipeline and client, adds last_send
   payload/
     psk_pskr.py           # PSK Reporter binary frame builder
 tests/
@@ -174,10 +181,52 @@ explicit even when no third-party deps are required.
   `hs_uploader.sink.Writer` (imported as `sigmond.hamsci_sink`), and the
   sources here read it.  Since v3.70 each row carries `producer` and
   `local`; the writer adds both columns when it opens an older file and
-  never rewrites an existing row.
+  never rewrites an existing row.  `Writer(local=True)` stores `local = 1`.
+  `SqliteSource` and `WsprCycleSource` both AND `local = 0` into every
+  statement that selects rows to send, and `SqliteSource`'s delete-on-ack
+  does too, so a local row stays in the sink.  `sources/_local_rows.py`
+  adds the condition only when `PRAGMA table_info` lists the column.  The
+  writer also creates `idx_pending_uploads_producer`, after it adds the
+  columns.
 - Watermark store: `/var/lib/hs-uploader/watermarks.db` (per-consumer
   state; survives restarts).
 - File spool (fallback): consumer-defined per pipeline.
+
+## pipelines.d/, rebuild and switch files
+
+- `pipelines_d.py` derives `pipelines.d/` and `sinks/` from the legacy
+  manifest's own path.  `load_layout` reads the legacy manifest and each
+  `pipelines.d/<client>.toml`.  The file name gives the client
+  (`^[a-z0-9][a-z0-9-]*$`, `site` reserved).  A present file drops every
+  legacy entry of that client, even when the file fails to parse.
+  Legacy entries with no client stay.
+- A file is accepted or refused whole (`Refusal` in the layout).  Refusals:
+  parse failure, an entry naming another client, `[daemon]`,
+  `[identity] ssh_key_file`, `start_at = "now"`, a `wspr_cycle` `start_at`
+  other than `"beginning"`, a build failure, a collision on pipeline name
+  or send-record key with an accepted pipeline.  A refusal never stops the
+  daemon; it lands in `pipeline_state` under `pipelines.d/<file>`.  A
+  file-sourced `wspr_cycle` entry defaults to `start_at = "beginning"`
+  (`pipeline_factory.default_start_at`); legacy keeps `"now"`.
+- `daemon.Rebuilder` holds the running set.  Before each pump the loop
+  compares `pipelines_signature` (mtime, size, inode of the directory and
+  each entry) with the last build's; SIGHUP also triggers it.  The rebuild
+  runs between pumps, reuses each entry that did not change, passes the
+  start's copy of the legacy manifest (the daemon never re-reads it), runs
+  the store check against a freshly read version, and rewrites
+  `pipeline_state`.  `Uploader.replace_pipelines` closes removed
+  pipelines on their own threads.  A refused file at rebuild keeps its
+  last good pipelines.  A raise leaves the running set and signature as
+  they were; the next pump retries.
+- `sinkswitch.py` reads `sinks/<client>.toml` and `sinks/site.toml`
+  (`state` is `off`, `fill` or `upload`; effective is the stricter; a
+  missing client file or a read failure reads `off`; a missing site file
+  sets no limit).  `write_switch` writes under `sinks/.lock`, atomically.
+- No switch stops or gates anything in this release.  `Rebuilder.report_switches`
+  logs what each governed client's switch would read, and
+  `hs-uploader sink status` prints it with "not enforced".  The pump never
+  consults a switch.  `governed` on an entry is stored on the `Pipeline`
+  and read only for that report.
 
 ## watermarks.db schema version (`hs-uploader migrate`)
 
@@ -229,6 +278,19 @@ the ordered `MIGRATIONS`, and `migrate(path, *, check=False, ctx=MigrateContext(
   `sqlite:psk.spots@meteor-scatter`, unless a record already sits there.
   The old row stays, frozen, and `superseded_keys` pairs each old key
   with each new one (spec-key-split-v373 §4.4).
+- Version 3 (v3.77) adds `attempts.pipeline` and `attempts.client` (`TEXT
+  NOT NULL DEFAULT ''`) and creates `last_send(client, pipeline, outcome,
+  ts, records)`, keyed on `(client, pipeline)`.  It changes no old row.
+  `SCHEMA_VERSION` is 3.  `--check` previews the producer-key fill
+  unless a pending migration 2 will do the copy itself.
+- `SqliteWatermarkStore.record_attempt` writes the version-3 columns and
+  upserts `last_send` (acked and partial_ack only, one transaction with
+  the attempt row) only when the cached version is 3 or above.  The store
+  reads the version on open (`refresh_schema_version`), and the daemon
+  refreshes it at start and at each rebuild.  A transport with
+  `ships = False` (`DiscardTransport`) leaves `last_send` alone.
+  `backlog.summarize` returns the table as top-level `last_send`, `[]`
+  below version 3.
 - Every migrate at version 2 or above (up to this code's) then copies the
   old record to any producer key that holds no record yet, and records it
   in `superseded_keys`; it never touches an existing key.  A store the

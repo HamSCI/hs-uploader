@@ -58,11 +58,17 @@ with Writer.from_env(table="spots", mode="psk", schema_version=2) as w:
   pass `producer=`; otherwise `infer_producer` names it from the row's
   `target_db`, and within `psk` from its `mode` (MSK144 rows belong to
   meteor-scatter, the rest to psk-recorder).
-- `local` marks a row kept only as a local archive.  In v3.70 the writer
-  stores 0 on every row.
+- `local` marks a row kept only as a local archive.  `Writer(local=True)`
+  and `Writer.from_env(local=True)` store 1 on every row they write; the
+  default stores 0.  Every source skips a local row: it selects none, and
+  its delete-on-ack never removes one.  A sink older than v3.70 has no
+  `local` column, and the sources then add no `local` condition.
 - On a `sink.db` from before v3.70, the writer adds both columns with
   `ALTER TABLE ADD COLUMN` (`ensure_columns`).  SQLite rewrites no row, and
   older rows keep `producer = ''`.
+- The writer creates the index `idx_pending_uploads_producer`
+  (`target_db`, `target_table`, `producer`, `id`) after it adds the
+  columns.  A source that reads one client's rows walks it.
 - `PENDING_UPLOADS_DDL` gives tools and tests the writer's own schema.
 
 ## Architecture
@@ -140,6 +146,106 @@ counts dead letters whose pipeline the manifest no longer builds as
 orphaned.  `reset-cursor` refuses a superseded key and names the keys to
 reset instead.
 
+## Pipeline files: `pipelines.d/`
+
+The daemon reads `/etc/hs-uploader/pipelines.toml`, the legacy manifest.
+It also reads `pipelines.d/` beside it, one file per client:
+`/etc/hs-uploader/pipelines.d/<client>.toml`.  The file's name gives the
+client, which must match `^[a-z0-9][a-z0-9-]*$`; the name `site` stays
+reserved.  Only names ending in `.toml` and not starting with a dot load,
+so an editor's backup never does.
+
+A file holds `[[pipeline]]` tables in the legacy form.  The daemon sets each
+entry's `client` from the file name.  An entry that names another client
+refuses the file.  An optional `governed = true | false` (default true)
+marks whether a client's switch applies to the entry.  The daemon stores
+it and uses it only to choose which clients its switch report names.
+
+Precedence and refusal follow four rules:
+
+- Once `pipelines.d/<client>.toml` exists, every legacy entry whose `client`
+  reads that name drops out.  A file that fails to parse silences those
+  entries too.  A legacy entry with no `client` stays.
+- The daemon accepts or refuses a file whole.  It refuses a file that fails
+  to parse, names a client other than its own, fails to build, or collides
+  with a pipeline already accepted on name or on send-record key.  A refused
+  file sends nothing.  It never stops the daemon.
+- A file also refuses when it holds a `[daemon]` table, an
+  `[identity]` table with `ssh_key_file` (both are host-wide and belong in
+  the legacy manifest), or `start_at = "now"`.  A `wspr_cycle` source in a
+  file may set `start_at` to `"beginning"` only, and defaults to it.  The
+  legacy manifest keeps `"now"` as its default.  The daemon ignores any other `[identity]` content
+  with one INFO line; nothing reads per-instance identity yet.
+- Two legacy entries that collide log one ERROR and both run, as before.
+
+The daemon records each pipeline, and each refused file, in the store's
+`pipeline_state` table.  `hs-uploader status` prints it.
+
+**Rebuild.**  The daemon starts with the legacy manifest as it reads it and
+never re-reads it; an edit there waits for a restart.  Before each pump it
+stats `pipelines.d/`.  When the directory changed, or when the process
+receives SIGHUP, the daemon rebuilds between two pumps.  It keeps every
+pipeline whose entry did not change, running on its own thread with its
+own open source.  It closes the sources and transports of a pipeline that
+leaves, starts new ones, and runs the store-version check again.  A file
+that now fails keeps the pipelines it last built.  A rebuild that raises
+leaves the running set alone and tries again at the next pump.  If every
+file is refused and no pipeline can run, the daemon stays up and idle until
+a file changes; with nothing built and nothing refused, it exits 1.
+
+## Sink switches
+
+A client's switch is a file, `sinks/<client>.toml`, beside the legacy
+manifest.  `sinks/site.toml` is the site switch.  Each file holds a `state`
+of `off`, `fill` or `upload`.  A client's effective state is the stricter of
+its own file and the site file.  A missing client file reads `off`.  A
+missing site file sets no limit.  A file that fails to read or parse reads
+`off`, and the error logs once.  `hs_uploader.sinkswitch` reads and writes
+these files; stdlib only, so a client's venv can import it.
+
+No switch stops or gates anything yet.  The daemon reads the files and
+reports what each governed client's switch would say, as one INFO line per
+change.  It sends exactly what the manifests say.
+
+```bash
+hs-uploader sink status [--json] [--manifest PATH] [--sinks DIR]
+```
+
+`sink status` lists the site file and each client that owns a pipeline or a
+switch file: the file's state, the effective state and any read error.  It
+counts pipelines that carry no client, since no switch applies to them, and
+it says "not enforced".  `--sinks` defaults to `sinks/` beside `--manifest`.
+It exits 2 when it cannot read the manifest.
+
+## Features: `hs-uploader capabilities --features`
+
+`hs-uploader capabilities` prints the store schema version, one integer.
+With `--features` it prints one feature word per line instead:
+
+- `pipelines.d` -- the daemon reads pipeline files.
+- `send-log-v3` -- the store has migration 3 and the send log names its
+  pipeline and client.
+- `switch-files` -- the code reads switch files and reports them.
+
+An hs-uploader without the flag exits 2.  Sigmond's manifest step prints the
+answer.
+
+## The send log: `attempts` and `last_send`
+
+Each send attempt writes a row to `attempts`.  From store version 3, the row
+also names its `pipeline` and `client`.  The store also keeps `last_send`,
+one row per `(client, pipeline)`: the outcome, time and record count of the
+latest acked or partly acked send.  The daemon writes the attempt row and
+the `last_send` row in one transaction.  A pipeline with `discard = true`
+ships nothing, so it writes attempts and no `last_send` row.
+
+The store writes these columns and rows only when it stands at version 3.
+It reads its version when it opens, at the daemon's start and at each
+rebuild.  On an older store it writes the old attempt row alone, so a daemon that
+runs before `hs-uploader migrate` adds no column and sets no version.
+`hs_uploader.backlog.summarize` returns the rows under a top-level
+`last_send` key, empty on a store below version 3.
+
 ## The store's schema version: `hs-uploader migrate`
 
 The watermark store, `/var/lib/hs-uploader/watermarks.db`, records its
@@ -163,6 +269,9 @@ starts the daemon again.
   destination to both producer keys, unless a record already sits there.
   The old row stays, frozen, and the store records which keys superseded it
   in `superseded_keys`.
+- Version 3 adds `attempts.pipeline` and `attempts.client` (`TEXT NOT NULL
+  DEFAULT ''`) and creates `last_send`.  It changes no old row.  The default
+  lets a v3.76 daemon, which names neither column, keep inserting.
 - Every migrate also copies the old record to a producer key that holds no
   record yet, and records it in `superseded_keys`.  It never touches a key
   that exists.  A store the daemon created stands at version 2 with no
