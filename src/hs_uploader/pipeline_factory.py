@@ -77,7 +77,7 @@ def _identity(base: Mapping[str, Any], override: Optional[Mapping[str, Any]]) ->
 # ---- source builders --------------------------------------------------------
 
 
-def _build_source(spec: Mapping[str, Any]):
+def _build_source(spec: Mapping[str, Any], *, default_start_at: str = "now"):
     stype = str(spec.get("type", "")).strip().lower()
     if stype == "filetree":
         patterns = spec.get("patterns") or [spec.get("pattern", "*")]
@@ -121,7 +121,7 @@ def _build_source(spec: Mapping[str, Any]):
         reporters = spec.get("expected_reporters")
         return WsprCycleSource(
             db_path=str(spec.get("db_path", "/var/lib/sigmond/sink.db")),
-            start_at=str(spec.get("start_at", "now")),
+            start_at=str(spec.get("start_at", default_start_at)),
             expected_reporters=set(reporters) if reporters else None,
             backstop_sec=float(spec.get("backstop_sec", 90.0)),
             include_psk=bool(spec.get("include_psk", False)),
@@ -249,6 +249,48 @@ def _retry(spec: Optional[Mapping[str, Any]]) -> RetryPolicy:
     )
 
 
+def default_start_at(origin: str) -> str:
+    """A ``wspr_cycle`` source's ``start_at`` when the entry names none.
+
+    The legacy manifest keeps ``"now"``; a pipeline file defaults to
+    ``"beginning"`` (spec sink-2b §3.2), where ``"now"`` is refused outright.
+    """
+    return "now" if origin == "legacy" else "beginning"
+
+
+def build_entry(
+    entry: Mapping[str, Any],
+    *,
+    base_identity: Mapping[str, Any],
+    watermark: SqliteWatermarkStore,
+    origin: str = "legacy",
+    index: int = 0,
+) -> Pipeline:
+    """Build one generic (``source`` + ``transport``) entry; raise on failure."""
+    name = str(entry.get("name") or f"pipeline-{index}")
+    source = _build_source(entry["source"],
+                           default_start_at=default_start_at(origin))
+    transport = wrap_if_discard(entry, _build_transport(entry["transport"]))
+    identity = _identity(base_identity, entry.get("identity"))
+    mrpp = entry.get("max_records_per_pump")
+    pipe = Pipeline(
+        name=name,
+        source=source,
+        transport=transport,
+        watermark=watermark,
+        identity=identity,
+        retry=_retry(entry.get("retry")),
+        batch_limit=int(entry.get("batch_limit", 1000)),
+        max_records_per_pump=None if mrpp is None else int(mrpp),
+        client=str(entry.get("client") or ""),
+        governed=bool(entry.get("governed", True)),
+        origin=origin,
+    )
+    logger.info("pipeline-factory: built %s (%s → %s)",
+                name, type(source).__name__, transport.name)
+    return pipe
+
+
 def build_pipelines(
     manifest: Mapping[str, Any],
     *,
@@ -266,22 +308,6 @@ def build_pipelines(
     for entry in manifest.get("pipeline", []) or []:
         if entry.get("builder"):
             continue  # builder-entrypoint pipelines handled by the daemon
-        name = str(entry.get("name") or f"pipeline-{len(pipelines)}")
-        source = _build_source(entry["source"])
-        transport = wrap_if_discard(entry, _build_transport(entry["transport"]))
-        identity = _identity(base_identity, entry.get("identity"))
-        mrpp = entry.get("max_records_per_pump")
-        pipelines.append(Pipeline(
-            name=name,
-            source=source,
-            transport=transport,
-            watermark=wm,
-            identity=identity,
-            retry=_retry(entry.get("retry")),
-            batch_limit=int(entry.get("batch_limit", 1000)),
-            max_records_per_pump=None if mrpp is None else int(mrpp),
-            client=str(entry.get("client") or ""),
-        ))
-        logger.info("pipeline-factory: built %s (%s → %s)",
-                    name, type(source).__name__, transport.name)
+        pipelines.append(build_entry(entry, base_identity=base_identity,
+                                     watermark=wm, index=len(pipelines)))
     return pipelines

@@ -35,7 +35,9 @@ from typing import Any, Mapping
 
 from .config import StationIdentity
 from .core import Pipeline, Uploader
+from .pipeline_factory import build_entry
 from .pipeline_factory import build_pipelines as build_generic_pipelines
+from .pipelines_d import LEGACY, Layout, Refusal, load_layout
 from .transports.discard import wrap_if_discard
 from .wake import WakeListener
 from .watermark.sqlite import SqliteWatermarkStore, default_path
@@ -100,12 +102,46 @@ def _base_identity(manifest: Mapping[str, Any]) -> StationIdentity:
     return ident
 
 
+def _build_with_builder(
+    entry: Mapping[str, Any],
+    *,
+    base_identity: StationIdentity,
+    watermark: SqliteWatermarkStore,
+    origin: str = LEGACY,
+) -> list[Pipeline]:
+    """Run one ``builder = "module:function"`` entry; raise on failure."""
+    spec = str(entry["builder"])
+    name = str(entry.get("name") or spec)
+    fn = resolve_builder(spec)
+    built = fn(
+        identity=base_identity,
+        watermark=watermark,
+        config=entry.get("config", {}) or {},
+        name=name,
+    )
+    if built is None:
+        return []
+    if isinstance(built, Pipeline):
+        built = [built]
+    for p in built:
+        p.client = str(entry.get("client") or "")
+        p.governed = bool(entry.get("governed", True))
+        p.origin = origin
+        p.transport = wrap_if_discard(entry, p.transport)
+    logger.info("daemon: builder %s contributed %d pipeline(s)", name, len(built))
+    return list(built)
+
+
 def build_all_pipelines(
     manifest: Mapping[str, Any],
     *,
     watermark: SqliteWatermarkStore,
 ) -> list[Pipeline]:
-    """Compose every pipeline in the manifest — generic + builder entrypoints."""
+    """Compose every pipeline in the manifest — generic + builder entrypoints.
+
+    The legacy path, unchanged: a generic entry that fails to build raises; a
+    builder that fails is logged and skipped.
+    """
     pipelines: list[Pipeline] = list(
         build_generic_pipelines(manifest, watermark=watermark)
     )
@@ -116,30 +152,129 @@ def build_all_pipelines(
             continue
         name = str(entry.get("name") or spec)
         try:
-            fn = resolve_builder(str(spec))
-        except Exception:
-            logger.exception("daemon: cannot resolve builder %s for %s", spec, name)
-            continue
-        try:
-            built = fn(
-                identity=base_identity,
-                watermark=watermark,
-                config=entry.get("config", {}) or {},
-                name=name,
-            )
+            pipelines.extend(_build_with_builder(
+                entry, base_identity=base_identity, watermark=watermark))
         except Exception:
             logger.exception("daemon: builder %s failed for %s", spec, name)
-            continue
-        if built is None:
-            continue
-        if isinstance(built, Pipeline):
-            built = [built]
-        for p in built:
-            p.client = str(entry.get("client") or "")
-            p.transport = wrap_if_discard(entry, p.transport)
-        pipelines.extend(built)
-        logger.info("daemon: builder %s contributed %d pipeline(s)", name, len(built))
     return pipelines
+
+
+# ---- pipelines.d: build the layout, refuse whole files (spec sink-2b §3.2-§3.3)
+
+
+def pipeline_key(p: Pipeline) -> tuple[str, str, str]:
+    """The send-record key: (source, destination, table)."""
+    return (p.source_id(), p.dest_id(), p.transport.primary_table())
+
+
+def _collision(p: Pipeline, names: Mapping[str, Pipeline],
+               keys: Mapping[tuple, Pipeline]) -> str:
+    """Describe p's first collision with an accepted pipeline, or ""."""
+    other = names.get(p.name)
+    if other is not None:
+        what = "name"
+    else:
+        other = keys.get(pipeline_key(p))
+        what = "key " + "|".join(pipeline_key(p))
+        if other is None:
+            return ""
+    return (f"pipeline {p.name!r} ({p.origin}) collides on {what} with "
+            f"pipeline {other.name!r} ({other.origin})")
+
+
+def _close_quietly(pipes: list[Pipeline]) -> None:
+    for p in pipes:
+        close = getattr(p.source, "close", None)
+        if callable(close):
+            try:
+                close()
+            except Exception:
+                logger.debug("daemon: closing %s's source failed", p.name)
+
+
+def _build_file(entries: list[Mapping[str, Any]], origin: str, *,
+                manifest: Mapping[str, Any],
+                watermark: SqliteWatermarkStore) -> tuple[list[Pipeline], str]:
+    """Build every entry of one pipeline file: (pipelines, "") or ([], reason)."""
+    base = manifest.get("identity", {}) or {}
+    built: list[Pipeline] = []
+    for i, entry in enumerate(entries):
+        label = entry.get("name") or entry.get("builder") or f"entry {i + 1}"
+        try:
+            if entry.get("builder"):
+                built.extend(_build_with_builder(
+                    entry, base_identity=_base_identity(manifest),
+                    watermark=watermark, origin=origin))
+            else:
+                built.append(build_entry(entry, base_identity=base,
+                                         watermark=watermark, origin=origin,
+                                         index=i))
+        except Exception as exc:
+            _close_quietly(built)
+            return [], f"pipeline {label!r} failed to build: {exc!r}"
+    return built, ""
+
+
+def build_layout(
+    layout: Layout, *, watermark: SqliteWatermarkStore
+) -> tuple[list[Pipeline], list[Refusal]]:
+    """Build every entry of ``layout``; return (pipelines, every refused file).
+
+    Legacy entries build as v3.76 built them; a collision among them alone
+    logs one ERROR naming both and both run (§3.3).  Each pipeline file then
+    builds whole or not at all: a failed entry, or a name or key that an
+    accepted pipeline already holds, refuses the file and names both
+    pipelines.  The refusals returned include ``layout.refused``.
+    """
+    manifest = layout.manifest
+    legacy = [e for e, origin in layout.entries if origin == LEGACY]
+    pipelines = build_all_pipelines({**manifest, "pipeline": legacy},
+                                    watermark=watermark)
+    names: dict[str, Pipeline] = {}
+    keys: dict[tuple, Pipeline] = {}
+    for p in pipelines:
+        clash = _collision(p, names, keys)
+        if clash:
+            logger.error("daemon: legacy manifest: %s; running both as "
+                         "before", clash)
+        names.setdefault(p.name, p)
+        keys.setdefault(pipeline_key(p), p)
+
+    by_file: dict[str, list[Mapping[str, Any]]] = {}
+    for entry, origin in layout.entries:
+        if origin != LEGACY:
+            by_file.setdefault(origin, []).append(entry)
+
+    refused = list(layout.refused)
+    for origin, entries in by_file.items():
+        filename = origin.split("/", 1)[1]
+        client = filename[: -len(".toml")]
+        built, reason = _build_file(entries, origin, manifest=manifest,
+                                    watermark=watermark)
+        if not reason:
+            f_names, f_keys = dict(names), dict(keys)
+            for p in built:
+                reason = _collision(p, f_names, f_keys)
+                if reason:
+                    break
+                f_names[p.name] = p
+                f_keys[pipeline_key(p)] = p
+        if reason:
+            _close_quietly(built)
+            refused.append(Refusal(filename, client, reason))
+            continue
+        for p in built:
+            names[p.name] = p
+            keys[pipeline_key(p)] = p
+        pipelines.extend(built)
+
+    for r in refused:
+        logger.error("daemon: refusing %s (client %s): %s",
+                     r.row_name, r.client, r.reason)
+    for p in pipelines:
+        logger.info("daemon: pipeline %s (client %s, origin %s)",
+                    p.name, p.client or "(none)", p.origin)
+    return pipelines, refused
 
 
 # A pipeline whose source has a ``producer`` reads one client's rows and
@@ -181,8 +316,10 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
         logger.exception("daemon: cannot parse manifest %s", manifest_path)
         return 1
 
+    # pipelines.d/ never stops the daemon: a bad file becomes a refusal.
+    layout = load_layout(manifest_path, manifest=manifest)
     watermark = SqliteWatermarkStore(default_path())
-    pipelines = build_all_pipelines(manifest, watermark=watermark)
+    pipelines, file_refused = build_layout(layout, watermark=watermark)
     if not pipelines:
         logger.error("daemon: no pipelines built from %s — nothing to do", manifest_path)
         return 1
@@ -190,7 +327,8 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     built = pipelines
     pipelines, refused = split_refused(built, watermark.refresh_schema_version())
     watermark.record_pipeline_states(
-        [(p.name, p.client, refused.get(p.name, "")) for p in built],
+        [(p.name, p.client, refused.get(p.name, "")) for p in built]
+        + [(r.row_name, r.client, r.reason) for r in file_refused],
         replace=True)
     if not pipelines:
         logger.error("daemon: every pipeline refused — nothing to do")

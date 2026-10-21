@@ -214,6 +214,10 @@ class Pipeline:
     # The client package that owns this pipeline (manifest ``client``).
     # The daemon records it in ``pipeline_state``; "" means unnamed.
     client: str = ""
+    # Manifest ``governed`` (spec sink-2b §3.2).  Stored; nothing reads it yet.
+    governed: bool = True
+    # Where the entry came from: "legacy" or "pipelines.d/<file>" (§3.6).
+    origin: str = "legacy"
 
     def source_id(self) -> str:
         return self.source.source_id()
