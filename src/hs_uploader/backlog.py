@@ -82,7 +82,9 @@ def summarize(watermark_db_path: Union[str, Path],
          "cursors": [{"source_id": ..., "dest_id": ..., "table_name": ...,
                        "last_ack": ..., "cursor_len": int,
                        "superseded_by": [new source ids; [] when live]}, ...],
-         "orphaned_dead_letters": int}
+         "orphaned_dead_letters": int,
+         "last_send": [{"client": str, "pipeline": str, "outcome": str,
+                         "ts": str, "records": int | None}, ...]}
 
     ``client`` and ``refused_reason`` come from ``pipeline_state`` (what the
     daemon knew at its last start; "" when the table is absent or has no row
@@ -90,6 +92,8 @@ def summarize(watermark_db_path: Union[str, Path],
     ``orphaned_dead_letters`` counts dead letters whose pipeline the current
     manifest no longer builds (no ``pipeline_state`` row); it is 0 when
     ``pipeline_state`` holds no rows, since orphans cannot then be told.
+    ``last_send`` is top-level only; each per-pipeline dict keeps its keys.
+    It is [] on a version-1 or version-2 store (spec 4.4).
     ``superseded_by`` reads ``superseded_keys`` (spec 4.5).
 
     ``pipelines`` is derived from the distinct pipeline names present
@@ -153,6 +157,10 @@ def summarize(watermark_db_path: Union[str, Path],
             states = _optional_rows(
                 conn, "SELECT name, client, refused_reason "
                       "FROM pipeline_state ORDER BY name")
+            # Spec 4.4: absent on a version-1 store, empty on version 2.
+            last_send = [dict(r) for r in _optional_rows(
+                conn, "SELECT client, pipeline, outcome, ts, records "
+                      "FROM last_send ORDER BY client, pipeline")]
         finally:
             conn.close()
     except Exception as exc:  # noqa: BLE001 — deliberately catch-all
@@ -199,7 +207,7 @@ def summarize(watermark_db_path: Union[str, Path],
         for name in pipeline_names
     ]
     return {"readable": True, "pipelines": pipelines, "cursors": cursors,
-            "orphaned_dead_letters": orphaned}
+            "orphaned_dead_letters": orphaned, "last_send": last_send}
 
 
 def _main(argv: "list[str] | None" = None) -> int:

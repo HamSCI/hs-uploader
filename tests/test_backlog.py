@@ -117,7 +117,7 @@ def test_empty_store_is_readable_with_empty_lists(tmp_path):
     result = summarize(db)
 
     assert result == {"readable": True, "pipelines": [], "cursors": [],
-                      "orphaned_dead_letters": 0}
+                      "orphaned_dead_letters": 0, "last_send": []}
 
 
 # ---- failure modes ---------------------------------------------------------
@@ -451,3 +451,56 @@ def test_reset_cursor_refuses_superseded_key(tmp_path, capsys):
     s = SqliteWatermarkStore(db)
     assert len(s.all_cursors()) == 1   # nothing was removed
     s.close()
+
+
+# --- spec 4.4, test 14: last_send at the top level ---------------------------
+
+V376_PIPELINE_KEYS = {
+    "name", "client", "refused_reason", "deliverable_count",
+    "dead_letter_count", "dead_letter_recent_count", "dead_letter_newest",
+}
+
+
+def _seed_last_send(db):
+    s = SqliteWatermarkStore(db)
+    s.record_pipeline_states([("grape", "grape", "")])
+    s.record_attempt(ts="2026-10-20T01:02:03+00:00", source_id="a",
+                     dest_id="b", table="t", outcome="acked", records=7,
+                     bytes_=1, error=None, pipeline="grape", client="grape")
+    s.close()
+
+
+def test_last_send_is_top_level_and_pipeline_keys_are_unchanged(tmp_path):
+    db = tmp_path / "wm.db"
+    _seed_last_send(db)
+    out = summarize(db)
+    assert out["last_send"] == [{
+        "client": "grape", "pipeline": "grape", "outcome": "acked",
+        "ts": "2026-10-20T01:02:03+00:00", "records": 7}]
+    assert out["pipelines"]
+    for p in out["pipelines"]:
+        assert set(p) == V376_PIPELINE_KEYS
+
+
+def test_last_send_reads_empty_on_a_version_2_store(tmp_path):
+    db = tmp_path / "wm.db"
+    s = SqliteWatermarkStore(db)
+    s._conn.execute("PRAGMA user_version = 2")
+    s.close()
+    s = SqliteWatermarkStore(db)
+    assert s._v3 is False
+    s.record_attempt(ts="2026-10-20T01:02:03+00:00", source_id="a",
+                     dest_id="b", table="t", outcome="acked", records=7,
+                     bytes_=1, error=None, pipeline="grape", client="grape")
+    s.close()
+    out = summarize(db)
+    assert out["readable"] is True and out["last_send"] == []
+
+
+def test_last_send_reads_empty_when_the_table_is_absent(tmp_path):
+    db = tmp_path / "wm.db"
+    s = SqliteWatermarkStore(db)
+    s._conn.execute("DROP TABLE last_send")
+    s._conn.commit()
+    s.close()
+    assert summarize(db)["last_send"] == []
