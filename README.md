@@ -60,8 +60,9 @@ with Writer.from_env(table="spots", mode="psk", schema_version=2) as w:
   meteor-scatter, the rest to psk-recorder).
 - `local` marks a row kept only as a local archive.  `Writer(local=True)`
   and `Writer.from_env(local=True)` store 1 on every row they write; the
-  default stores 0.  Every source skips a local row: it selects none, and
-  its delete-on-ack never removes one.  A sink older than v3.70 has no
+  default stores 0.  `SqliteSource` and `WsprCycleSource`, the two sources
+  that read the sink, skip a local row.  Each selects none, and
+  `SqliteSource`'s delete-on-ack never removes one.  A sink older than v3.70 has no
   `local` column, and the sources then add no `local` condition.
 - On a `sink.db` from before v3.70, the writer adds both columns with
   `ALTER TABLE ADD COLUMN` (`ensure_columns`).  SQLite rewrites no row, and
@@ -158,24 +159,33 @@ so an editor's backup never does.
 A file holds `[[pipeline]]` tables in the legacy form.  The daemon sets each
 entry's `client` from the file name.  An entry that names another client
 refuses the file.  An optional `governed = true | false` (default true)
-marks whether a client's switch applies to the entry.  The daemon stores
+marks whether a client's switch applies to the entry (see Sink switches).  The daemon stores
 it and uses it only to choose which clients its switch report names.
 
-Precedence and refusal follow four rules:
+Precedence and refusal follow these rules:
 
 - Once `pipelines.d/<client>.toml` exists, every legacy entry whose `client`
   reads that name drops out.  A file that fails to parse silences those
   entries too.  A legacy entry with no `client` stays.
-- The daemon accepts or refuses a file whole.  It refuses a file that fails
-  to parse, names a client other than its own, fails to build, or collides
-  with a pipeline already accepted on name or on send-record key.  A refused
-  file sends nothing.  It never stops the daemon.
-- A file also refuses when it holds a `[daemon]` table, an
-  `[identity]` table with `ssh_key_file` (both are host-wide and belong in
-  the legacy manifest), or `start_at = "now"`.  A `wspr_cycle` source in a
-  file may set `start_at` to `"beginning"` only, and defaults to it.  The
-  legacy manifest keeps `"now"` as its default.  The daemon ignores any other `[identity]` content
-  with one INFO line; nothing reads per-instance identity yet.
+- The daemon accepts or refuses a file whole.  A file refused at start sends
+  nothing.  At a rebuild, a file that now fails keeps the pipelines it last
+  built.  A refused file never stops the daemon.
+- It refuses a file that fails to parse, names a client other than its own,
+  or fails to build.
+- It refuses a file that collides with a pipeline already accepted.  A
+  collision is the same pipeline name, or the same send-record key.  The
+  send-record key is the triple (source, destination, table) under which
+  the store keeps a pipeline's cursor.
+- It refuses a file whose name gives an illegal client name, `site`
+  included, and a name in `pipelines.d/` that is not a regular file.
+- It refuses a file that holds a `[daemon]` table.  It refuses one whose
+  `[identity]` names `ssh_key_file`.  Both settings are host-wide and
+  belong in the legacy manifest.
+- It refuses `start_at = "now"`.  A `wspr_cycle` source in a file may set
+  `start_at` to `"beginning"` only, and defaults to it.  The legacy
+  manifest keeps `"now"` as its default.
+- The daemon ignores any other `[identity]` content, with one INFO line;
+  nothing reads per-instance identity yet.
 - Two legacy entries that collide log one ERROR and both run, as before.
 
 The daemon records each pipeline, and each refused file, in the store's
@@ -191,14 +201,17 @@ leaves, starts new ones, and runs the store-version check again.  A file
 that now fails keeps the pipelines it last built.  A rebuild that raises
 leaves the running set alone and tries again at the next pump.  If every
 file is refused and no pipeline can run, the daemon stays up and idle until
-a file changes; with nothing built and nothing refused, it exits 1.
+a file changes.  At start it exits 1 when nothing built and no file was
+refused, and when the store check refused every pipeline that built and no
+file was refused.
 
 ## Sink switches
 
 A client's switch is a file, `sinks/<client>.toml`, beside the legacy
 manifest.  `sinks/site.toml` is the site switch.  Each file holds a `state`
 of `off`, `fill` or `upload`.  A client's effective state is the stricter of
-its own file and the site file.  A missing client file reads `off`.  A
+its own file and the site file, `off` being the strictest and `upload` the
+loosest.  A missing client file reads `off`.  A
 missing site file sets no limit.  A file that fails to read or parse reads
 `off`, and the error logs once.  `hs_uploader.sinkswitch` reads and writes
 these files; stdlib only, so a client's venv can import it.
@@ -239,7 +252,7 @@ latest acked or partly acked send.  The daemon writes the attempt row and
 the `last_send` row in one transaction.  A pipeline with `discard = true`
 ships nothing, so it writes attempts and no `last_send` row.
 
-The store writes these columns and rows only when it stands at version 3.
+The store writes these columns and rows only when it has reached version 3.
 It reads its version when it opens, at the daemon's start and at each
 rebuild.  On an older store it writes the old attempt row alone, so a daemon that
 runs before `hs-uploader migrate` adds no column and sets no version.

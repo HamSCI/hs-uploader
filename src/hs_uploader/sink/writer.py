@@ -35,7 +35,7 @@ Storage shape:
         payload_json    TEXT     -- the row, JSON-serialized
         queued_at       TEXT     -- ISO8601 UTC (writer wall-clock)
         producer        TEXT     -- the client that stored the row
-        local           INTEGER  -- 1 = a local archive row (no caller sets it yet)
+        local           INTEGER  -- 1 = a local archive row (Writer(local=True))
 
     `hs-uploader` reads rows in FIFO order, ships them upstream, and
     deletes on success.  JSON-on-disk means the uploader owns schema
@@ -46,9 +46,9 @@ Storage shape:
     §10.4 item 2).  A writer that opens an older file adds both with
     ALTER TABLE ADD COLUMN, which changes only the schema: SQLite
     rewrites no row.  Rows stored before v3.70 keep `producer = ''`, and
-    readers name their producer with `infer_producer` (D12).  The writer
-    stores `local = 0` on every row; a caller that keeps a local archive
-    gains a way to say so in a later release.
+    readers name their producer with `infer_producer` (D12).  A writer
+    built with `local=True` stores `local = 1` on every row; otherwise it
+    stores 0.  Sources skip rows marked local.
 
 Thread-safe: see `Writer`.
 """

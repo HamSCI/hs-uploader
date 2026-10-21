@@ -182,7 +182,7 @@ explicit even when no third-party deps are required.
   sources here read it.  Since v3.70 each row carries `producer` and
   `local`; the writer adds both columns when it opens an older file and
   never rewrites an existing row.  `Writer(local=True)` stores `local = 1`.
-  `SqliteSource` and `WsprCycleSource` both AND `local = 0` into every
+  `SqliteSource` and `WsprCycleSource` both add the condition `local = 0` to every
   statement that selects rows to send, and `SqliteSource`'s delete-on-ack
   does too, so a local row stays in the sink.  `sources/_local_rows.py`
   adds the condition only when `PRAGMA table_info` lists the column.  The
@@ -204,7 +204,7 @@ explicit even when no third-party deps are required.
   parse failure, an entry naming another client, `[daemon]`,
   `[identity] ssh_key_file`, `start_at = "now"`, a `wspr_cycle` `start_at`
   other than `"beginning"`, a build failure, a collision on pipeline name
-  or send-record key with an accepted pipeline.  A refusal never stops the
+  or send-record key (source, destination, table) with an accepted pipeline.  A refusal never stops the
   daemon; it lands in `pipeline_state` under `pipelines.d/<file>`.  A
   file-sourced `wspr_cycle` entry defaults to `start_at = "beginning"`
   (`pipeline_factory.default_start_at`); legacy keeps `"now"`.
@@ -219,7 +219,7 @@ explicit even when no third-party deps are required.
   last good pipelines.  A raise leaves the running set and signature as
   they were; the next pump retries.
 - `sinkswitch.py` reads `sinks/<client>.toml` and `sinks/site.toml`
-  (`state` is `off`, `fill` or `upload`; effective is the stricter; a
+  (`state` is `off`, `fill` or `upload`; the effective state is the stricter of the client's file and the site file, where `off` is strictest; a
   missing client file or a read failure reads `off`; a missing site file
   sets no limit).  `write_switch` writes under `sinks/.lock`, atomically.
 - No switch stops or gates anything in this release.  `Rebuilder.report_switches`
@@ -278,7 +278,7 @@ the ordered `MIGRATIONS`, and `migrate(path, *, check=False, ctx=MigrateContext(
   `sqlite:psk.spots@meteor-scatter`, unless a record already sits there.
   The old row stays, frozen, and `superseded_keys` pairs each old key
   with each new one (spec-key-split-v373 §4.4).
-- Version 3 (v3.77) adds `attempts.pipeline` and `attempts.client` (`TEXT
+- Version 3 adds `attempts.pipeline` and `attempts.client` (`TEXT
   NOT NULL DEFAULT ''`) and creates `last_send(client, pipeline, outcome,
   ts, records)`, keyed on `(client, pipeline)`.  It changes no old row.
   `SCHEMA_VERSION` is 3.  `--check` previews the producer-key fill
@@ -294,7 +294,7 @@ the ordered `MIGRATIONS`, and `migrate(path, *, check=False, ctx=MigrateContext(
 - Every migrate at version 2 or above (up to this code's) then copies the
   old record to any producer key that holds no record yet, and records it
   in `superseded_keys`; it never touches an existing key.  A store the
-  daemon created stands at version 2 with no producer keys (final review
+  daemon created has version 2 with no producer keys (final review
   I1).  `--check` counts that copy as a write.
 - The retry pass runs on every migrate, after the migrations and the
   copy, in the same transaction.  For each retry still queued under

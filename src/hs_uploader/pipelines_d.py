@@ -18,8 +18,9 @@ The rules:
 * Once ``pipelines.d/<client>.toml`` exists, parsed or not, every legacy entry
   whose ``client`` reads that name drops out.  A broken file therefore
   silences its client rather than reviving stale legacy entries.
-* A file is accepted or refused whole.  A refused file sends nothing and never
-  stops the daemon.
+* A file is accepted or refused whole.  A file refused at start sends
+  nothing.  At a rebuild, a file that now fails keeps the pipelines it last
+  built.  A refused file never stops the daemon.
 """
 
 from __future__ import annotations
