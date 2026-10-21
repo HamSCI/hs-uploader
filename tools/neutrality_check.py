@@ -363,6 +363,13 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
         out.write_text(json.dumps(result))
         return 0
 
+    if layout is None and (manifest_path.parent / "pipelines.d").exists():
+        # The tree cannot read the directory it was given.  Say so: its
+        # result would otherwise stand for a layout it never saw.
+        result["refused"].append({
+            "file": "(directory)", "client": "",
+            "reason": "this tree has no pipelines.d loader; the directory "
+                      "was not read"})
     try:
         if layout is not None:
             pipelines, refused = build_layout(layout, watermark=store)
@@ -514,8 +521,9 @@ def _run_tree(label: str, tree: Path, args, now_iso: str, scratch: Path) -> dict
     # finds the directory where it finds it on a station.
     etc = work / "etc"
     etc.mkdir()
-    side_manifest = getattr(args, f"{label.lower()}_manifest") or args.manifest
-    side_pdir = getattr(args, f"{label.lower()}_pipelines_d")
+    side_manifest = (getattr(args, f"{label.lower()}_manifest", None)
+                     or args.manifest)
+    side_pdir = getattr(args, f"{label.lower()}_pipelines_d", None)
     manifest = etc / "pipelines.toml"
     shutil.copyfile(side_manifest, manifest)
     if side_pdir is not None:

@@ -1164,3 +1164,61 @@ def test_the_report_lists_refused_files_and_never_agrees_beside_one(capsys):
     out = capsys.readouterr().out
     assert "NEW refused pipelines.d/x.toml: no good" in out
     assert out.rstrip().endswith("RESULT: INCONCLUSIVE (1 refused file; see above)")
+
+
+# ---- fix round 1 -------------------------------------------------------------
+
+
+def _old_tree(tmp_path: Path) -> Path:
+    """hs-uploader 334e71e: a tree with no pipelines_d module."""
+    import subprocess
+    tree = tmp_path / "old-tree"
+    tree.mkdir()
+    git = subprocess.run(
+        f"git -C {ROOT} archive 334e71e src | tar -x -C {tree}",
+        shell=True, capture_output=True)
+    if git.returncode != 0 or not (tree / "src" / "hs_uploader").is_dir():
+        pytest.skip("commit 334e71e is not in this checkout")
+    assert not (tree / "src" / "hs_uploader" / "pipelines_d.py").exists()
+    return tree / "src"
+
+
+def test_a_tree_without_a_loader_never_agrees_on_a_directory_it_was_given(
+        tmp_path, capsys):
+    manifest, legacy, pdir, sink, watermarks = _split_station(
+        tmp_path, legacy_limit=500, file_limit=500)
+    args = _split_args(manifest, legacy, pdir, sink, watermarks)
+    args[args.index("--old") + 1] = str(SRC)
+    args[args.index("--new") + 1] = str(_old_tree(tmp_path))
+    code = nc.main(args)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "NEW refused pipelines.d/(directory): this tree has no pipelines.d loader" in out
+    assert "RESULT: AGREE" not in out
+    assert "INCONCLUSIVE (1 refused file; see above)" in out
+
+
+def test_a_refused_file_beside_a_real_difference_is_a_disagreement(tmp_path, capsys):
+    manifest, legacy, pdir, sink, watermarks = _split_station(
+        tmp_path, file_limit=2)
+    (pdir / "broken.toml").write_text("this is [not toml")
+    code = nc.main(_split_args(manifest, legacy, pdir, sink, watermarks))
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "NEW refused pipelines.d/broken.toml" in out
+    assert out.rstrip().endswith("RESULT: DISAGREE")
+
+
+def test_a_refusal_on_the_old_side_alone_is_not_agree(tmp_path, capsys):
+    manifest, legacy, pdir, sink, watermarks = _split_station(tmp_path)
+    (pdir / "broken.toml").write_text("this is [not toml")
+    args = ["--old-manifest", str(legacy), "--old-pipelines-d", str(pdir),
+            "--new-manifest", str(manifest), "--sink", str(sink),
+            "--watermarks", str(watermarks), "--old", str(SRC),
+            "--new", str(SRC), "--now", NOW]
+    code = nc.main(args)
+    out = capsys.readouterr().out
+    assert code == 1
+    assert "OLD refused pipelines.d/broken.toml" in out
+    assert "NEW refused" not in out
+    assert out.rstrip().endswith("RESULT: INCONCLUSIVE (1 refused file; see above)")
