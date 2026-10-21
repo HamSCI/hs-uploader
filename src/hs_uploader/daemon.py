@@ -46,7 +46,9 @@ from .core import Pipeline, Uploader
 from .pipeline_factory import build_entry
 from .pipeline_factory import build_pipelines as build_generic_pipelines
 from .pipelines_d import (LEGACY, Layout, Refusal, load_layout,
-                          pipelines_dir_for, pipelines_signature)
+                          pipelines_dir_for, pipelines_signature,
+                          sinks_dir_for)
+from .sinkswitch import effective_state
 from .transports.discard import wrap_if_discard
 from .wake import WakeListener
 from .watermark.sqlite import SqliteWatermarkStore, default_path
@@ -577,6 +579,9 @@ class Rebuilder:
         self.manifest = manifest
         self.watermark = watermark
         self.pdir = pipelines_dir_for(manifest_path)
+        self.sdir = sinks_dir_for(manifest_path)
+        self._said: dict[str, str] = {}      # client -> last answer logged
+        self._said_no_files = False
         self.signature: Optional[tuple] = None
         self.build = Build()
         self.running: list[Pipeline] = []
@@ -618,12 +623,35 @@ class Rebuilder:
                 + [(r.row_name, r.client, r.reason) for r in build.refused])
         return layout.signature, build, running, rows
 
+    def report_switches(self) -> None:
+        """Log what each client's switch would say.  Enforces nothing (§6.2).
+
+        One INFO line per client when its answer changes; one line when
+        ``sinks/`` is missing.  ``effective_state`` logs each file error once
+        per signature.  Nothing here, and nothing in the pump, gates a send.
+        """
+        if not self.sdir.is_dir():
+            if not self._said_no_files:
+                logger.info("no switch files; the manifest's policy governs")
+                self._said_no_files = True
+            self._said.clear()
+            return
+        self._said_no_files = False
+        clients = sorted({p.client for p in self.build.pipelines if p.client})
+        for client in clients:
+            state = effective_state(client, sinks_dir=self.sdir).state
+            if self._said.get(client) != state:
+                self._said[client] = state
+                logger.info("sink switch for %s would read %s "
+                            "(not enforced in this release)", client, state)
+
     def start(self) -> tuple[list[Pipeline], list[Pipeline], list[Refusal]]:
         """The start's build: (running, every pipeline built, refused files)."""
         signature, build, running, rows = self._make(None, strict=True)
         self.watermark.record_pipeline_states(rows, replace=True)
         self.build, self.running, self._rows = build, running, rows
         self.signature = signature
+        self.report_switches()
         return running, build.pipelines, build.refused
 
     def rebuild(self, uploader: Uploader) -> bool:
@@ -646,6 +674,7 @@ class Rebuilder:
                 raise
         self.build = build
         self.signature = signature
+        self.report_switches()
         pumped = {id(p) for p in uploader.pipelines}
         kept = {id(p) for p in build.pipelines}
         # A previous pipeline the store check held back never pumped: close

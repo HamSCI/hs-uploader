@@ -128,6 +128,17 @@ def _build_parser() -> argparse.ArgumentParser:
     )
     sp_caps.set_defaults(func=None)
 
+    sp_sink = sub.add_parser("sink", help="Sink switches (reported, not enforced).")
+    sink_sub = sp_sink.add_subparsers(dest="sink_cmd", required=True)
+    sp_ss = sink_sub.add_parser(
+        "status", help="Show each client's switch file and effective state.")
+    sp_ss.add_argument("--json", action="store_true")
+    sp_ss.add_argument("--manifest", default="/etc/hs-uploader/pipelines.toml",
+                       help="legacy manifest; sinks/ lies beside it")
+    sp_ss.add_argument("--sinks", default=None,
+                       help="switch directory (default: sinks/ beside --manifest)")
+    sp_ss.set_defaults(func=None)
+
     sp_serve = sub.add_parser(
         "serve",
         help="Run the host uploader daemon — every outbound pipeline in the "
@@ -157,6 +168,8 @@ def main(argv: list[str] | None = None) -> int:
         )
         from . import daemon
         return daemon.run(args.manifest, dry_run=args.dry_run, once=args.once)
+    if args.cmd == "sink":
+        return _cmd_sink_status(args)
     if args.cmd == "capabilities":
         from .watermark import schema
         print(schema.SCHEMA_VERSION)
@@ -179,6 +192,60 @@ def main(argv: list[str] | None = None) -> int:
 
 
 # ---- subcommands ----
+
+_NOT_ENFORCED = "not enforced: the manifest's policy decides what ships"
+_NO_FILES = "no switch files; the manifest's policy governs"
+
+
+def _cmd_sink_status(args) -> int:
+    import json
+    from . import sinkswitch
+    from .pipelines_d import sinks_dir_for
+    sinks = Path(args.sinks) if args.sinks else sinks_dir_for(args.manifest)
+    owners: set[str] = set()
+    try:
+        from .pipelines_d import load_layout
+        for entry, _origin in load_layout(args.manifest).entries:
+            if entry.get("client"):
+                owners.add(str(entry["client"]))
+    except Exception as exc:
+        print(f"hs-uploader: cannot read {args.manifest}: {exc}", file=sys.stderr)
+    has_dir = sinks.is_dir()
+    names = set(owners)
+    if has_dir:
+        for f in sinks.glob("*.toml"):
+            if f.name != "site.toml" and sinkswitch.valid_client_name(f.stem):
+                names.add(f.stem)
+
+    def row(name: str) -> dict:
+        r = sinkswitch.read_switch(sinks / f"{name}.toml")
+        d = {"file": "missing" if r.missing else (r.state or "error"),
+             "error": r.error}
+        if name == sinkswitch.SITE:
+            d["effective"] = r.state if r.state else ("unset" if r.missing
+                                                      else "off")
+        else:
+            e = sinkswitch.effective_state(name, sinks_dir=sinks)
+            d["effective"] = e.state
+            d["error"] = "; ".join(e.errors)
+        return d
+
+    site = row(sinkswitch.SITE)
+    clients = {n: row(n) for n in sorted(names)}
+    if args.json:
+        print(json.dumps({"sinks_dir": str(sinks), "has_sinks_dir": has_dir,
+                          "enforced": False, "note": _NOT_ENFORCED,
+                          "site": site, "clients": clients}, indent=2))
+        return 0
+    print(f"hs-uploader sink status - {sinks}")
+    if not has_dir:
+        print(f"  {_NO_FILES}")
+    for name, d in [("site", site), *clients.items()]:
+        err = f"  error: {d['error']}" if d["error"] else ""
+        print(f"  {name}: file {d['file']}, effective {d['effective']}{err}")
+    print(f"  {_NOT_ENFORCED}")
+    return 0
+
 
 
 def _cmd_status(args, store: SqliteWatermarkStore) -> int:

@@ -246,3 +246,62 @@ def test_capabilities_prints_store_version(capsys):
     from hs_uploader.watermark import schema
     assert main(["capabilities"]) == 0
     assert capsys.readouterr().out == f"{schema.SCHEMA_VERSION}\n"
+
+
+# ---- sink status (spec 6.2) ----------------------------------------------------------
+
+import json as _json
+
+
+def _station_dir(tmp_path, *, clients=("c1",)):
+    etc = tmp_path / "etc"
+    etc.mkdir()
+    m = etc / "pipelines.toml"
+    m.write_text("".join(
+        f'[[pipeline]]\nname = "p-{c}"\nbuilder = "x:y"\nclient = "{c}"\n'
+        for c in clients))
+    return m
+
+
+def test_sink_status_without_sinks_dir_says_so(tmp_path, capsys):
+    m = _station_dir(tmp_path)
+    assert main(["sink", "status", "--manifest", str(m)]) == 0
+    out = capsys.readouterr().out
+    assert "no switch files; the manifest's policy governs" in out
+    assert "not enforced: the manifest's policy decides what ships" in out
+
+
+def test_sink_status_lists_site_and_each_client(tmp_path, capsys):
+    from hs_uploader import sinkswitch
+    m = _station_dir(tmp_path, clients=("c1", "c2"))
+    sinks = tmp_path / "etc" / "sinks"
+    sinkswitch.write_switch(sinks / "c1.toml", {"state": "upload"})
+    sinkswitch.write_switch(sinks / "site.toml", {"state": "fill"})
+    sinkswitch.write_switch(sinks / "only-file.toml", {"state": "off"})
+    (sinks / "c3.toml").write_text("state = [bad\n")
+    assert main(["sink", "status", "--json", "--manifest", str(m)]) == 0
+    d = _json.loads(capsys.readouterr().out)
+    assert d["site"]["file"] == "fill" and d["site"]["effective"] == "fill"
+    assert d["clients"]["c1"]["file"] == "upload"
+    assert d["clients"]["c1"]["effective"] == "fill"      # site limits it
+    assert d["clients"]["c2"]["file"] == "missing"
+    assert d["clients"]["c2"]["effective"] == "off"
+    assert d["clients"]["only-file"]["effective"] == "off"
+    assert d["clients"]["c3"]["error"]
+    assert d["enforced"] is False
+    assert main(["sink", "status", "--manifest", str(m)]) == 0
+    out = capsys.readouterr().out
+    for word in ("site", "c1", "c2", "c3", "only-file",
+                 "not enforced: the manifest's policy decides what ships"):
+        assert word in out
+
+
+def test_sink_status_sinks_flag_overrides_the_derived_directory(tmp_path, capsys):
+    from hs_uploader import sinkswitch
+    m = _station_dir(tmp_path)
+    other = tmp_path / "elsewhere"
+    sinkswitch.write_switch(other / "c1.toml", {"state": "upload"})
+    assert main(["sink", "status", "--json", "--manifest", str(m),
+                 "--sinks", str(other)]) == 0
+    d = _json.loads(capsys.readouterr().out)
+    assert d["clients"]["c1"]["effective"] == "upload"

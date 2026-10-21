@@ -829,3 +829,78 @@ def test_sqlite_source_closes_on_its_worker_thread_and_leaks_no_fd(
             src.closed_conn.execute("SELECT 1")
         counts.append(_fd_count())
     assert counts[-1] <= counts[2], counts
+
+
+# ---- test 19 and the switch report: reported, never enforced (spec 6.2) --------------
+
+
+def _sw(station, client, state):
+    from hs_uploader import sinkswitch
+    sinkswitch.write_switch(station.manifest.parent / "sinks" / f"{client}.toml",
+                            {"state": state})
+
+
+@pytest.fixture(autouse=False)
+def fresh_switch_state():
+    from hs_uploader import sinkswitch
+    sinkswitch._cache.clear()
+    sinkswitch._logged.clear()
+    yield
+    sinkswitch._cache.clear()
+    sinkswitch._logged.clear()
+
+
+def _would(caplog):
+    return [r.getMessage() for r in caplog.records
+            if "would read" in r.getMessage()]
+
+
+def test_switch_reading_off_does_not_stop_the_pipeline_shipping(
+        station, caplog, fresh_switch_state):
+    """Test 19: the daemon reports the switch and enforces nothing."""
+    station.legacy(_entry("leg", client="c1"))
+    _sw(station, "c1", "off")
+    with caplog.at_level(logging.INFO, logger="hs_uploader"):
+        r, up, wm = station.runner()
+        up.pump_until_idle()
+    p = _by_name(up, "leg")
+    assert p.transport.shipped, "an off switch must not stop the send"
+    assert _would(caplog) == [
+        "sink switch for c1 would read off (not enforced in this release)"]
+
+
+def test_switch_report_logs_changes_only_and_errors_once(
+        station, caplog, fresh_switch_state):
+    station.legacy(_entry("leg", client="c1"))
+    _sw(station, "c1", "upload")
+    sinks = station.manifest.parent / "sinks"
+    (sinks / "site.toml").write_text("state = [broken\n")
+    with caplog.at_level(logging.INFO, logger="hs_uploader"):
+        r, up, _ = station.runner()
+        for _i in range(3):                      # three rebuilds, same answer
+            station.file("x.toml.new", str(_i))
+            r.rebuild(up)
+    assert _would(caplog) == [
+        "sink switch for c1 would read off (not enforced in this release)"]
+    errors = [x for x in caplog.records if x.levelno == logging.ERROR]
+    assert len(errors) == 1
+    # the answer changes: one more line
+    (sinks / "site.toml").unlink()
+    caplog.clear()
+    with caplog.at_level(logging.INFO, logger="hs_uploader"):
+        r.rebuild(up)
+    assert _would(caplog) == [
+        "sink switch for c1 would read upload (not enforced in this release)"]
+
+
+def test_no_sinks_directory_logs_one_info_line(
+        station, caplog, fresh_switch_state):
+    station.legacy(_entry("leg", client="c1"), _entry("old"))
+    with caplog.at_level(logging.INFO, logger="hs_uploader"):
+        r, up, _ = station.runner()
+        station.file("x.toml.new", "1")
+        r.rebuild(up)
+    msgs = [x.getMessage() for x in caplog.records]
+    assert msgs.count(
+        "no switch files; the manifest's policy governs") == 1
+    assert _would(caplog) == []
