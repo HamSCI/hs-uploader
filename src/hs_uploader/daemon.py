@@ -956,6 +956,7 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
                 last_failure = None
                 if changed:
                     bind_wake_if_needed(rebuilder.running)
+                    gate.forget(rebuilder.build.pipelines)
         except Exception as exc:
             failure = (type(exc).__name__, str(exc))
             if failure != last_failure:

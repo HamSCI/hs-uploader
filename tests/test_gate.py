@@ -330,7 +330,9 @@ def test_logged_keys_are_capped(tree, monkeypatch, caplog):
                 assert not g.may_send(pipe(f"p{i}", origin=PSK_ORIGIN,
                                            governed=False))
     assert len(g._said) == 5
-    warns = [r.getMessage() for r in gate_lines(caplog, logging.WARNING)]
+    # (the per-pipeline transition table has its own cap line; Task 6)
+    warns = [r.getMessage() for r in gate_lines(caplog, logging.WARNING)
+             if "transition" not in r.getMessage()]
     assert len(warns) == 6 and "will not be logged" in warns[-1]
 
 

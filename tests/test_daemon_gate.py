@@ -415,3 +415,108 @@ def test_daemon_keeps_one_gate_across_rebuilds(station, monkeypatch, signals):
     assert isinstance(made[0]._gate.__self__, SinkGate)
     assert gates[0].__self__ is made[0]._gate.__self__
     assert all(p.transport.shipped == [] for p in made[0].pipelines)
+
+
+# ---- fix round 1 ---------------------------------------------------------------
+
+def _two(wm):
+    # Bad_Name fails valid_client_name: effective_state returns before it
+    # reads site.toml or looks for sinks/, so it must judge neither.
+    return mkpipe("good", "good", wm), mkpipe("bad", "Bad_Name", wm)
+
+
+def test_bad_client_name_does_not_clear_the_missing_sinks_fault(tmp_path, caplog):
+    marker = tmp_path / "carry-over-v1.done"
+    marker.write_text("x\n")
+    clock = Clock()
+    g = SinkGate(tmp_path / "sinks", marker, clock=clock)
+    wm = SqliteWatermarkStore(":memory:")
+    good, bad = _two(wm)
+    with caplog.at_level(logging.DEBUG, logger="hs_uploader"):
+        for _ in range(100):
+            clock.t += 1
+            assert not g.may_send(good)
+            assert not g.may_send(bad)
+    missing = [m for m in hsu_lines(caplog, logging.ERROR) if "is missing" in m]
+    assert len(missing) == 1
+
+
+def test_bad_client_name_does_not_reset_the_site_reminder(tree, caplog):
+    sinks, marker = tree
+    sw(sinks, "good", "upload")
+    (sinks / "site.toml").write_text("state = [broken\n")
+    clock = Clock()
+    g = SinkGate(sinks, marker, clock=clock)
+    wm = SqliteWatermarkStore(":memory:")
+    good, bad = _two(wm)
+    with caplog.at_level(logging.DEBUG, logger="hs_uploader"):
+        for _ in range(100):
+            clock.t += REMIND_S / 49          # a reminder at pumps 50 and 99
+            assert not g.may_send(good)
+            assert not g.may_send(bad)
+    site = [m for m in hsu_lines(caplog, logging.ERROR) if "site.toml" in m]
+    assert len(site) == 1 + 2                 # first sight, then each 6 h
+    assert all("reminder" in m for m in site[1:])
+
+
+def test_gate_exception_that_clears_logs_a_new_outbreak_as_first_sight(
+        tree, monkeypatch, caplog):
+    sinks, marker = tree
+    sw(sinks, "c1", "upload")
+    g = SinkGate(sinks, marker, clock=Clock())
+    wm = SqliteWatermarkStore(":memory:")
+    p = mkpipe("p1", "c1", wm)
+    real = gate_mod.effective_state
+
+    def boom(*a, **k):
+        raise RuntimeError("disk on fire")
+
+    with caplog.at_level(logging.DEBUG, logger="hs_uploader"):
+        monkeypatch.setattr(gate_mod, "effective_state", boom)
+        for _ in range(10):
+            assert not g.may_send(p)
+        monkeypatch.setattr(gate_mod, "effective_state", real)
+        assert g.may_send(p)                  # it clears
+        monkeypatch.setattr(gate_mod, "effective_state", boom)
+        for _ in range(10):
+            assert not g.may_send(p)
+    errs = [m for m in hsu_lines(caplog, logging.ERROR) if "gate failed" in m]
+    assert len(errs) == 2
+    assert not any("reminder" in m for m in errs)
+
+
+def test_transition_cap_warns_once(tree, caplog, monkeypatch):
+    sinks, marker = tree
+    sw(sinks, "c1", "fill")
+    monkeypatch.setattr(gate_mod, "SAID_CAP", 3)
+    g = SinkGate(sinks, marker)
+    wm = SqliteWatermarkStore(":memory:")
+    with caplog.at_level(logging.DEBUG, logger=gate_mod.log.name):
+        for _ in range(5):
+            for i in range(10):
+                g.may_send(mkpipe(f"p{i}", "c1", wm))
+    warns = [m for m in hsu_lines(caplog, logging.WARNING) if "transition" in m]
+    assert len(warns) == 1
+
+
+def test_forget_drops_removed_pipelines(tree, caplog):
+    sinks, marker = tree
+    sw(sinks, "c1", "fill")
+    g = SinkGate(sinks, marker)
+    wm = SqliteWatermarkStore(":memory:")
+    a, b = mkpipe("a", "c1", wm), mkpipe("b", "c1", wm)
+    g.may_send(a), g.may_send(b)
+    g.forget([a])
+    assert set(g._last) == {gate_mod._key(a)}
+
+
+def test_daemon_rebuild_forgets_removed_pipelines(station, monkeypatch, signals):
+    station.legacy(_entry("leg", client="c1"))
+    station.mark()
+    sw(station.sinks, "c1", "fill")
+    script = [None] * 6
+    script[0] = lambda: station.file("c2.toml", _entry("x1"))
+    script[2] = lambda: (station.pdir / "c2.toml").unlink()
+    made = _run_loop(monkeypatch, station, script)
+    g = made[0]._gate.__self__
+    assert [k[1] for k in g._last] == ["leg"]

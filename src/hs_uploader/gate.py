@@ -25,10 +25,13 @@ What it logs (spec §9.2, plan ruling 6):
   A pipeline held for a week logs nothing more.
 * A fault logs at ERROR once, then a reminder at most every
   ``REMIND_S`` seconds while it lasts.  Faults: an exception inside a
-  decision (keyed by pipeline and exception type, never by its text), a
+  decision (keyed by pipeline and exception type, never by its text;
+  a clean decision clears it, so a new outbreak logs as a first sight), a
   broken or unreadable switch file (``sinkswitch`` logs its first sight,
   once per file signature; the gate adds the reminders), and ``sinks/``
-  missing while the marker stands.
+  missing while the marker stands.  A pipeline with a bad client name
+  judges only its own fault: ``effective_state`` reads neither
+  ``site.toml`` nor ``sinks/`` for it.
 
 The daemon keeps ONE gate for its life, across rebuilds, so a pipeline the
 rebuild kept keeps its last decision and the rule 4 line appears once per
@@ -92,6 +95,11 @@ class SinkGate:
         # When each fault in ``_said`` last logged.  A key enters here only
         # once ``_said`` admitted it, so the cap on ``_said`` bounds it too.
         self._fault_at: dict[Hashable, float] = {}
+        # Each pipeline's gate-exception fault keys, so a clean decision
+        # clears them and a new outbreak logs as a first sight.  Holds only
+        # keys ``_said`` admitted.
+        self._exc_keys: dict[tuple, set] = {}
+        self._last_capped = False
 
     def may_send(self, pipe) -> bool:
         return self.decide(pipe).send
@@ -99,12 +107,16 @@ class SinkGate:
     def decide(self, pipe) -> Decision:
         try:
             d = self._decide(pipe)
+            self._clear_exceptions(pipe)
         except Exception as e:  # fail closed (ruling 6)
             msg = f"{type(e).__name__}: {e}"
             # Key by type, never by free text: a message that changes each
             # call must not log each call (ruling 6).
-            say = self._fault(("fault", _key(pipe), type(e).__name__),
-                              first_logs=True)
+            fkey = ("fault", _key(pipe), type(e).__name__)
+            say = self._fault(fkey, first_logs=True)
+            with self._lock:
+                if fkey in self._fault_at:
+                    self._exc_keys.setdefault(_key(pipe), set()).add(fkey)
             if say:
                 log.error("pipeline %s held: the sink gate failed (%s)%s",
                           getattr(pipe, "name", "?"), msg,
@@ -121,17 +133,49 @@ class SinkGate:
         """
         try:
             k = _key(pipe)
+            warn = False
             with self._lock:
                 prev = self._last.get(k)
                 if prev is None and len(self._last) >= SAID_CAP:
-                    return  # past the cap: decide, but log no transition
-                self._last[k] = d.send
+                    # past the cap: decide, but log no transition
+                    warn, self._last_capped = not self._last_capped, True
+                else:
+                    self._last[k] = d.send
+            if warn:
+                log.warning("sink gate: %d pipelines tracked; further "
+                            "pipelines will log no transition lines",
+                            SAID_CAP)
+            if warn or (prev is None and k not in self._last):
+                return
             if prev == d.send or (prev is None and d.send):
                 return
             log.info("pipeline %s %s: %s", getattr(pipe, "name", "?"),
                      "sending" if d.send else "held", d.reason)
         except Exception:  # noqa: BLE001
             pass
+
+    def _clear_exceptions(self, pipe) -> None:
+        with self._lock:
+            keys = self._exc_keys.pop(_key(pipe), None)
+            for fkey in keys or ():
+                self._fault_at.pop(fkey, None)
+                self._said.discard(fkey)
+
+    def forget(self, pipes) -> None:
+        """Drop the per-pipeline state of every pipeline not in ``pipes``.
+
+        The daemon calls it after a rebuild changed the running set, so
+        removed pipelines leave ``_last`` and their exception faults.  The
+        once-per-daemon lines (rule 4, ruling 2) stay said.
+        """
+        keep = {_key(p) for p in pipes}
+        with self._lock:
+            for k in [k for k in self._last if k not in keep]:
+                del self._last[k]
+            for k in [k for k in self._exc_keys if k not in keep]:
+                for fkey in self._exc_keys.pop(k):
+                    self._fault_at.pop(fkey, None)
+                    self._said.discard(fkey)
 
     # -- the rules ---------------------------------------------------------
 
@@ -190,12 +234,16 @@ class SinkGate:
         ``sinks/`` missing while the marker stands logs here, first sight
         included: nothing else reports it.
         """
-        faults = (
-            (("fault", "site"), eff.site_error, False),
-            (("fault", "client", client), eff.client_error, False),
-            (("fault", "no-sinks"),
-             eff.client_missing and not self.sinks_dir.is_dir(), True),
-        )
+        faults = [(("fault", "client", client), eff.client_error, False)]
+        # A bad client name returns from effective_state before it reads
+        # site.toml or looks for sinks/: it says nothing about either, so
+        # it must neither raise nor clear their shared faults.
+        if valid_client_name(client):
+            faults += [
+                (("fault", "site"), eff.site_error, False),
+                (("fault", "no-sinks"),
+                 eff.client_missing and not self.sinks_dir.is_dir(), True),
+            ]
         for key, err, first_logs in faults:
             if not err:
                 self._clear(key)
