@@ -247,8 +247,8 @@ these files; stdlib only, so a client's venv can import it.
 **The carry-over marker.**  The switches take effect only while the marker
 `/var/lib/hs-uploader/carry-over-v1.done` stands.  `HS_UPLOADER_STATE_DIR`
 moves it, as it moves the store.  sigmond writes the marker once it has
-carried each station's `[uploads]` setting into switch files.  While the
-marker stands absent, the gate passes every pipeline, the writer stores
+carried each station's `[uploads]` setting into switch files.  While no
+marker exists, the gate passes every pipeline, the writer stores
 every row and the WSPR tar keeps every psk row: the station sends as part
 1 did.  The marker counts when anything stands at its path, a dangling
 link included.  An error other than "no such file", such as a directory
