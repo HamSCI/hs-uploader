@@ -14,8 +14,24 @@ Where it lives:
     carries a copy for venvs that hold no hs-uploader (D14), and a drift
     test holds the two together.  Keep this file stdlib-only and free of
     imports from the rest of `hs_uploader`, so that copy can stay a
-    plain file copy.  The logger name and the `hamsci_sink:` message
-    prefix stay as they were: operators grep them.
+    plain file copy.  One exception: the switch check imports
+    `hs_uploader.sinkswitch` by its absolute name at each `insert()`,
+    inside a guard, and a venv without it gets no enforcement.  The
+    logger name and the `hamsci_sink:` message prefix stay as they
+    were: operators grep them.
+
+The switch check (spec-sink-2b-part2 §4):
+    `insert()` judges each row as it arrives, by the row's producer as
+    `flush()` names it.  It drops the row when the writer is not local,
+    the carry-over marker stands, `sinks/<producer>.toml` exists, and
+    the effective state reads `off`.  `fill` and `upload` store.  It
+    reads the switch once per producer per `insert()` and remembers no
+    verdict, so a change counts at the next `insert()`.  A broken or
+    unreadable switch file reads `off` in `effective_state` (design
+    §3.4), and its rows drop.  A failure to load or run the check itself
+    stores the row: the daemon's gate holds what must not ship.  `Writer.dropped`
+    counts dropped rows per producer; `health` ignores it.  One INFO
+    line marks each change of a producer's verdict; no row logs.
 
 Selection (`Writer.from_env`):
     `SIGMOND_SQLITE_PATH` set → writer at that path (explicit override;
@@ -54,6 +70,7 @@ Thread-safe: see `Writer`.
 """
 from __future__ import annotations
 
+import importlib
 import json
 import logging
 import os
@@ -111,6 +128,32 @@ def _default_sqlite_writable(path: str) -> bool:
         return os.access(parent, os.W_OK)
     grandparent = parent.parent
     return grandparent.exists() and os.access(grandparent, os.W_OK)
+
+
+# Bound on the producers a writer counts and remembers for its log lines.
+# Past it a new producer is still judged, but neither counted nor logged.
+_PRODUCER_CAP = 1024
+
+# A check that keeps failing logs at ERROR once per exception type, then
+# a reminder at most this often (Global Constraint 2, Ruling 6).
+_REMIND_S = 6 * 3600.0
+
+
+def _switch_api() -> Optional[tuple]:
+    """The names the switch check needs, or None for no enforcement.
+
+    Imports `hs_uploader.sinkswitch` by its absolute name at each call;
+    `sys.modules` answers after the first.  A venv without hs-uploader
+    (sigmond's bundled copy in codar-sounder, hf-tec, superdarn-sounder)
+    raises ImportError; an hs-uploader older than a name raises
+    AttributeError.  Either means no enforcement (Ruling 16).
+    """
+    try:
+        sw = importlib.import_module("hs_uploader.sinkswitch")
+        return (sw.effective_state, sw.marker_stands, sw.marker_path,
+                sw.DEFAULT_SINKS_DIR, sw.valid_client_name)
+    except (ImportError, AttributeError):
+        return None
 
 
 class BufferFull(Exception):
@@ -313,6 +356,8 @@ class Writer:
         auto_flush_seconds: float = DEFAULT_SQLITE_AUTO_FLUSH_SECONDS,
         config: Optional[SqliteConfig] = None,
         connect_factory: Optional[Any] = None,
+        sinks_dir: Optional[Any] = None,
+        marker: Optional[Any] = None,
     ) -> None:
         self.database = database
         self.table = table
@@ -333,6 +378,14 @@ class Writer:
         # Initialized to "now" so we don't immediately flush a 1-row
         # buffer on the first insert after a long idle.
         self._last_flush_monotonic: float = time.monotonic()
+        # The switch check.  None means the library's default paths,
+        # read at each insert().
+        self._sinks_dir = sinks_dir
+        self._marker = marker
+        self.dropped: dict = {}           # producer -> rows dropped at `off`
+        self._dropping: dict = {}         # producer -> last verdict, for the log
+        self._cap_said = False
+        self._check_failed: dict = {}     # exception type -> when last logged
 
     @classmethod
     def from_env(
@@ -414,7 +467,7 @@ class Writer:
         with self._lock:
             if self.is_noop or not rows:
                 return
-            self._buffer.extend(rows)
+            self._buffer.extend(self._judge(rows))
             if len(self._buffer) > self._buffer_max:
                 self._health = HEALTH_DEGRADED
                 buffered = len(self._buffer)
@@ -433,6 +486,91 @@ class Writer:
             )
             if size_trigger or age_trigger:
                 self.flush()
+
+    def _judge(self, rows: Sequence) -> Sequence:
+        """The rows to store: every row unless its producer reads `off` (§4).
+
+        Called under the lock.  Never raises: a check that fails stores.
+        """
+        if self.local:
+            return rows
+        api = _switch_api()
+        if api is None:
+            return rows
+        effective_state, marker_stands, marker_path, default_dir, valid = api
+        try:
+            marker = self._marker if self._marker is not None else marker_path()
+            enforced = marker_stands(marker)
+            if not enforced and not any(self._dropping.values()):
+                return rows
+            sinks_dir = self._sinks_dir if self._sinks_dir is not None else default_dir
+            verdict: dict = {}
+            kept = []
+            for row in rows:
+                producer = self.producer or infer_producer(self.database, self.table, row)
+                drop = verdict.get(producer)
+                if drop is None:
+                    drop = verdict[producer] = enforced and self._reads_off(
+                        producer, effective_state, valid, sinks_dir)
+                    self._note_verdict(producer, drop)
+                if drop:
+                    # A producer past the cap never entered _dropping.
+                    if producer in self._dropping:
+                        self.dropped[producer] = self.dropped.get(producer, 0) + 1
+                else:
+                    kept.append(row)
+            return kept
+        except Exception as e:
+            kind = type(e).__name__
+            now = time.monotonic()
+            last = self._check_failed.get(kind)
+            if (last is None and len(self._check_failed) < _PRODUCER_CAP) or (
+                    last is not None and now - last >= _REMIND_S):
+                self._check_failed[kind] = now
+                logger.error(
+                    "hamsci_sink: the sink switch check failed (%s); "
+                    "storing every row", kind)
+            return rows
+
+    @staticmethod
+    def _reads_off(producer, effective_state, valid, sinks_dir) -> bool:
+        # No file can exist for a name the switch library refuses, such
+        # as '' for an unknown target_db: such a producer stores.
+        if not producer or not valid(producer):
+            return False
+        eff = effective_state(producer, sinks_dir=sinks_dir)
+        if eff.client_missing:            # no switch file: store (design §3.4)
+            return False
+        return eff.state == "off"
+
+    def _track(self, producer: str) -> bool:
+        """True when `producer` may join the per-producer tables (capped).
+
+        `dropped` holds only producers that `_dropping` holds, so one
+        bound covers both.
+        """
+        if len(self._dropping) < _PRODUCER_CAP:
+            return True
+        if not self._cap_said:
+            self._cap_said = True
+            logger.warning(
+                "hamsci_sink: %d producers tracked; further producers are "
+                "judged but neither counted nor logged", _PRODUCER_CAP)
+        return False
+
+    def _note_verdict(self, producer: str, drop: bool) -> None:
+        """Log one INFO line when a producer's verdict changes, never per row."""
+        if self._dropping.get(producer, False) == drop:
+            return
+        if producer not in self._dropping and not self._track(producer):
+            return
+        self._dropping[producer] = drop
+        if drop:
+            logger.info("hamsci_sink: sink switch reads off for %s: "
+                        "storing nothing for repositories", producer)
+        else:
+            logger.info("hamsci_sink: sink switch no longer reads off for %s: "
+                        "storing again", producer)
 
     def flush(self) -> None:
         """Force a flush. Quiet on transient failures (buffer retained)."""
