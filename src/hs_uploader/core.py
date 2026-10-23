@@ -40,6 +40,8 @@ if TYPE_CHECKING:
 
 logger = logging.getLogger(__name__)
 
+GATE_FAULT_CAP = 64  # bound on the exception types a raising gate logs
+
 
 # --------------------------------------------------------------------- Record
 
@@ -294,6 +296,11 @@ class Uploader:
         # daemon passes one (a SinkGate).  Never default this to the
         # system's switch files.
         self._gate = gate
+        # Exception types a gate has raised, each logged once (bounded:
+        # keyed by type, never by message, and capped at GATE_FAULT_CAP).
+        self._gate_faults: set[str] = set()
+        self._gate_faults_full = False
+        self._gate_lock = threading.Lock()
         # ``inline_single`` pumps a lone pipeline on the caller's thread.
         # The daemon passes False: its set changes at a rebuild, and a
         # pipeline must keep one thread for its life (a SqliteSource's
@@ -416,7 +423,40 @@ class Uploader:
         return any(results)
 
     def _may_send(self, pipe: "Pipeline") -> bool:
-        return self._gate is None or bool(self._gate(pipe))
+        """Ask the gate; a gate that raises holds (fail closed).
+
+        Raising out of here would abort ``pump()`` with other pipelines'
+        futures unjoined (``replace_pipelines`` relies on every future
+        having finished) and repeat on every pump.  So hold instead, and
+        log at ERROR once per exception type, within GATE_FAULT_CAP types.
+        """
+        if self._gate is None:
+            return True
+        try:
+            return bool(self._gate(pipe))
+        except Exception as e:  # noqa: BLE001 — fail closed
+            self._note_gate_fault(pipe, type(e).__name__)
+            return False
+
+    def _note_gate_fault(self, pipe: "Pipeline", kind: str) -> None:
+        with self._gate_lock:
+            if kind in self._gate_faults:
+                return
+            if len(self._gate_faults) >= GATE_FAULT_CAP:
+                if self._gate_faults_full:
+                    return
+                self._gate_faults_full = True
+                first = False
+            else:
+                self._gate_faults.add(kind)
+                first = True
+        if first:
+            logger.error("%s: the sink gate raised %s; holding (fail closed). "
+                         "Further %s faults stay silent until restart",
+                         pipe.name, kind, kind)
+        else:
+            logger.error("sink gate faults reached %d exception types; new "
+                         "types now hold without logging", GATE_FAULT_CAP)
 
     def _pump_one(self, pipe: "Pipeline") -> bool:
         """Drain one pipeline (deliverables first, then source).
@@ -512,6 +552,10 @@ class Uploader:
         shipped = 0
         any_shipped = False
         while budget is None or shipped < budget:
+            # Ask before reading the next batch, so a hold arriving after a
+            # batch stops the drain without reading one batch ahead.
+            if not self._may_send(pipe):
+                return any_shipped
             cursor = pipe.watermark.get_cursor(
                 pipe.source_id(), pipe.dest_id(),
                 pipe.transport.primary_table(),

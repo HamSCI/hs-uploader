@@ -6,6 +6,7 @@ the same harness, that the same pipeline sends once the gate opens.
 """
 from __future__ import annotations
 
+import logging
 import time
 from datetime import datetime, timezone
 
@@ -294,3 +295,107 @@ def test_no_gate_control_tree_holds(tmp_path, holding_tree):
     up = Uploader(pipes, gate=SinkGate(sinks, marker).may_send)
     assert up.pump() is False
     assert log == []
+
+
+# -- fix round 1: a raising gate holds (fail closed); no read ahead on a hold --
+
+class Boom(Exception):
+    pass
+
+
+def test_raising_gate_holds_logs_once_and_every_pipeline_completes(tmp_path, caplog):
+    log, asked = [], []
+
+    def gate(pipe):
+        asked.append(pipe.name)
+        raise Boom("gate broke")
+
+    pipes = _shim_pipelines(tmp_path, log)
+    up = Uploader(pipes, gate=gate)
+    with caplog.at_level("DEBUG", logger="hs_uploader.core"):
+        for _ in range(100):
+            assert up.pump() is False          # no raise out of pump()
+    assert log == []                           # nothing shipped
+    # Every pipeline's future ran to completion on each of the 100 pumps.
+    assert sorted(set(asked)) == ["wsprdaemon", "wsprnet"]
+    assert asked.count("wsprdaemon") == 100 and asked.count("wsprnet") == 100
+    errors = [r for r in caplog.records
+              if r.name == "hs_uploader.core" and r.levelno == logging.ERROR]
+    assert len(errors) == 1
+    assert "Boom" in errors[0].getMessage()
+
+
+def test_raising_gate_control_new_type_logs_and_cap_bounds(tmp_path, caplog, monkeypatch):
+    """Control: a second exception type logs its own line (the logger does
+    fire per type), and past the cap no new type logs."""
+    from hs_uploader import core
+    monkeypatch.setattr(core, "GATE_FAULT_CAP", 2)
+    kinds = [type(f"E{i}", (Exception,), {}) for i in range(5)]
+    n = [0]
+
+    def gate(pipe):
+        n[0] += 1
+        raise kinds[min(n[0] - 1, 4)]()
+
+    log = []
+    pipe = _shim_pipelines(tmp_path, log)[0]
+    up = Uploader([pipe], gate=gate)
+    with caplog.at_level("DEBUG", logger="hs_uploader.core"):
+        for _ in range(10):
+            up.pump()
+    errors = [r.getMessage() for r in caplog.records
+              if r.name == "hs_uploader.core" and r.levelno == logging.ERROR]
+    assert log == []
+    assert len(errors) == 3                     # E0, E1, then one "cap reached" line
+    assert "E0" in errors[0] and "E1" in errors[1]
+    assert len(up._gate_faults) == 2
+
+
+def test_hold_after_first_drain_batch_reads_no_second_batch(tmp_path):
+    log, gate = [], Switch(True)
+    pipe, wm = _drain_mode(tmp_path, log, gate)
+    Uploader([pipe], gate=gate).pump()
+    assert log == [("ship", (1,))]
+    assert pipe.source.reads == 1               # never asked for batch 2
+
+
+def test_hold_after_first_drain_batch_control(tmp_path):
+    """Control: no flip, the source is read once per batch plus the empty read."""
+    log, gate = [], Switch(True)
+    pipe, wm = _drain_mode(tmp_path, log, gate, flip=False)
+    Uploader([pipe], gate=gate).pump()
+    assert pipe.source.reads == 4
+
+
+class MultiBatchSource(CountingSource):
+    """Yields every eligible row in `limit`-sized batches from ONE read, so
+    the per-batch check (not the top-of-loop one) must stop the second."""
+
+    def iter_batches(self, cursor, limit):
+        from hs_uploader.core import RecordBatch
+        self.reads += 1
+        eligible = [(r, c) for (r, c) in self._records if c > cursor]
+        for i in range(0, len(eligible), limit):
+            chunk = eligible[i:i + limit]
+            yield RecordBatch(records=tuple(r for r, _ in chunk), cursor_after=chunk[-1][1])
+
+
+def _multi(tmp_path, log, gate, flip):
+    pipe, wm = _drain_mode(tmp_path, log, gate, flip=flip)
+    pipe.source = MultiBatchSource(records=[_rec(1), _rec(2), _rec(3)])
+    return pipe, wm
+
+
+def test_flip_within_one_read_stops_the_second_batch(tmp_path):
+    log, gate = [], Switch(True)
+    pipe, wm = _multi(tmp_path, log, gate, flip=True)
+    Uploader([pipe], gate=gate).pump()
+    assert log == [("ship", (1,))]
+    assert wm.get_cursor(SRC, DEST, TABLE) == b"1"
+
+
+def test_flip_within_one_read_control(tmp_path):
+    log, gate = [], Switch(True)
+    pipe, wm = _multi(tmp_path, log, gate, flip=False)
+    Uploader([pipe], gate=gate).pump()
+    assert log == [("ship", (1,)), ("ship", (2,)), ("ship", (3,))]

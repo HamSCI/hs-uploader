@@ -224,14 +224,17 @@ explicit even when no third-party deps are required.
   (`state` is `off`, `fill` or `upload`; the effective state is the stricter of the client's file and the site file, where `off` is strictest; a
   missing client file or a read failure reads `off`; a missing site file
   sets no limit).  `write_switch` writes under `sinks/.lock`, atomically.
-- No switch stops or gates anything in this release.  `Rebuilder.report_switches`
+- The gate exists (`gate.SinkGate`, and `Uploader(gate=...)` below), but the
+  daemon does not pass it yet; spec sink-2b-part2 Task 6 wires it.  Until then
+  no switch stops anything.  `Rebuilder.report_switches`
   logs what each governed client's switch would read, and
   `hs-uploader sink status` prints it with "not enforced".  `governed` on
   an entry is stored on the `Pipeline` and read only for that report.
 - `Uploader(gate=...)` asks the gate at the top of each pipeline's pump,
   before each retry pop and before each source batch; a held pipeline
   touches nothing and resumes where it stopped.  `gate=None` (the default,
-  and every in-process shim) sends always.  The daemon passes no gate yet.
+  and every in-process shim) sends always.  A gate that raises holds the
+  pipeline and logs at ERROR once per exception type (capped).
 
 ## watermarks.db schema version (`hs-uploader migrate`)
 
