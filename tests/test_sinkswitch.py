@@ -20,6 +20,7 @@ def st(state):
     return f'state = "{state}"\n'
 
 
+@pytest.mark.real_defaults
 def test_constants():
     assert ss.STATES == ("off", "fill", "upload")
     assert str(ss.DEFAULT_SINKS_DIR) == "/etc/hs-uploader/sinks"

@@ -541,8 +541,15 @@ def build_layout(
     The start's build: legacy entries build as v3.76 built them, and a
     generic legacy entry that fails raises, as it did.  Each pipeline file
     builds whole or not at all (§3.2-§3.3).  The refusals returned include
-    ``layout.refused``.
+    ``layout.refused``.  ``paths`` left out reads ``sinks/`` beside the
+    layout's manifest and ``marker_path()``, as the Rebuilder does.
     """
+    if paths is None:
+        # The Rebuilder's own paths: sinks/ beside the manifest, and the
+        # marker under the state dir.
+        paths = SinkPaths(
+            None if layout.path is None else sinks_dir_for(layout.path),
+            marker_path())
     build = _assemble(layout, watermark=watermark, strict=True, paths=paths)
     return build.pipelines, build.refused
 

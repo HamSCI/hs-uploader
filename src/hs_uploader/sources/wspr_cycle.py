@@ -65,6 +65,8 @@ _LOGICAL_TABLE = "wspr.cycle"
 # remembered for the once-per-6-h ERROR line, are each capped.
 _RIDER_CAP = 64
 _REMIND_S = 6 * 3600.0
+# The clock the reminder reads; tests replace it.
+_clock = time.monotonic
 
 
 class WsprCycleSource:
@@ -531,7 +533,7 @@ class WsprCycleSource:
             return out
         except Exception as exc:  # noqa: BLE001 — the WSPR rows still ship
             kind = type(exc).__name__
-            now = time.monotonic()
+            now = _clock()
             last = self._check_failed.get(kind)
             if (last is None and len(self._check_failed) < _RIDER_CAP) or (
                     last is not None and now - last >= _REMIND_S):

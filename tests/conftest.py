@@ -131,6 +131,31 @@ class MemorySource:
 # ---- fixtures ----
 
 
+def pytest_configure(config):
+    config.addinivalue_line(
+        "markers",
+        "real_defaults: run without the hermetic state-dir and sinks-dir "
+        "fixture (a test that checks the library's own default paths)")
+
+
+@pytest.fixture(autouse=True)
+def _hermetic_switch_paths(request, tmp_path, monkeypatch):
+    """Point the library's default state dir and sinks dir at scratch.
+
+    Every default-path reader (the carry-over marker, the watermark store,
+    the switch files) would otherwise read this host's real
+    /var/lib/hs-uploader and /etc/hs-uploader/sinks, and a host where the
+    marker stands would change what tests see (Task 8 review M1).  A test
+    that patches either path itself wins, since its monkeypatch runs
+    after this one.  `@pytest.mark.real_defaults` opts out.
+    """
+    if request.node.get_closest_marker("real_defaults"):
+        return
+    import hs_uploader.sinkswitch as sinkswitch
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    monkeypatch.setattr(sinkswitch, "DEFAULT_SINKS_DIR", tmp_path / "sinks")
+
+
 @pytest.fixture
 def memory_transport():
     return MemoryTransport()

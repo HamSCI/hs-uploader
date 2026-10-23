@@ -451,3 +451,133 @@ def test_the_daemon_gives_the_rider_its_own_sinks_dir_and_marker(tree, monkeypat
     for s in sources.values():
         assert s.sinks_dir == sinks_dir_for(manifest) == etc / "sinks"
         assert s.marker == tree.marker
+
+
+# ---- caps, the reminder, the warnings (Task 8 review M2, M3) ------------------
+
+
+def _times(n):
+    return [f"2026-01-05T{(i * 2) // 60:02d}:{(i * 2) % 60:02d}:00Z"
+            for i in range(n)]
+
+
+def test_tracked_producers_are_capped_at_64_with_one_warning(tree, caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    # 65 producers, none with a switch file: each reads off, each stays out.
+    names = [f"p-{i:02d}" for i in range(65)]
+    for c in _times(3):
+        _add(tree.db, "wspr", "spots", {"time": c, "k": "s"}, producer="wspr-recorder")
+        _add(tree.db, "wspr", "noise", {"time": c, "k": "n"}, producer="wspr-recorder")
+        for n in names:
+            _add(tree.db, "psk", "spots", {"time": c, "k": n, "mode": "FT8"},
+                 producer=n)
+    got = _batches(_src(tree))
+    assert len(got) == 3 and all(_keys(b, "psk.spots") == [] for b in got)
+    lines = _rider_lines(caplog)
+    assert len(lines) == 64                       # one per tracked producer
+    assert {n for n in names if any(n in r.getMessage() for r in lines)} \
+        == set(names[:64])
+    warnings = [r for r in caplog.records
+                if r.name == LOGGER and r.levelno == logging.WARNING
+                and "producers tracked" in r.getMessage()]
+    assert len(warnings) == 1 and "64" in warnings[0].getMessage()
+
+
+def test_exception_types_are_capped_at_64(tree, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    times = _times(66)
+    for c in times:
+        _add(tree.db, "wspr", "spots", {"time": c, "k": "s"}, producer="wspr-recorder")
+        _add(tree.db, "wspr", "noise", {"time": c, "k": "n"}, producer="wspr-recorder")
+        _add(tree.db, "psk", "spots", {"time": c, "k": "f", "mode": "FT8"},
+             producer="psk-recorder")
+    kinds = [type(f"Fault{i:02d}", (Exception,), {}) for i in range(66)]
+    calls = iter(kinds)
+
+    def boom(*_a, **_k):
+        raise next(calls)("x")
+
+    monkeypatch.setattr(sinkswitch, "effective_state", boom)
+    got = _batches(_src(tree))
+    assert len(got) == 66
+    errors = [r.getMessage() for r in caplog.records if r.levelno == logging.ERROR]
+    assert len(errors) == 64                      # the 65th and 66th stay silent
+    assert all(f"Fault{i:02d}" in errors[i] for i in range(64))
+
+
+def test_a_recurring_check_fault_reminds_every_six_hours(tree, monkeypatch, caplog):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    _cycle(tree.db)
+    now = [1000.0]
+    monkeypatch.setattr(wspr_cycle, "_clock", lambda: now[0])
+
+    def boom(*_a, **_k):
+        raise RuntimeError("x")
+
+    monkeypatch.setattr(sinkswitch, "effective_state", boom)
+    src = _src(tree)
+
+    def errors():
+        return [r for r in caplog.records if r.levelno == logging.ERROR]
+
+    _batches(src)
+    assert len(errors()) == 1
+    for dt in (60.0, 3600.0, 6 * 3600.0 - 1):
+        now[0] = 1000.0 + dt
+        _batches(src)
+    assert len(errors()) == 1                     # silent inside 6 h
+    now[0] = 1000.0 + 6 * 3600.0
+    _batches(src)
+    assert len(errors()) == 2                     # the reminder
+    now[0] += 1.0
+    _batches(src)
+    assert len(errors()) == 2
+
+
+@pytest.mark.parametrize("missing", ["noise", "spots"])
+def test_the_one_table_warnings_count_the_riders_left_out(tree, caplog, missing):
+    caplog.set_level(logging.INFO, logger=LOGGER)
+    present = "spots" if missing == "noise" else "noise"
+    _add(tree.db, "wspr", present, {"time": C1, "k": "w"}, producer="wspr-recorder")
+    for k in ("ft8-a", "ft8-b", "ft8-c"):
+        _add(tree.db, "psk", "spots", {"time": C1, "k": k, "mode": "FT8"},
+             producer="psk-recorder")
+    _add(tree.db, "psk", "spots", {"time": C1, "k": "msk", "mode": "MSK144"},
+         producer="meteor-scatter")
+    _switch(tree.sinks, "psk-recorder", "fill")
+    _switch(tree.sinks, "meteor-scatter", "upload")
+    (got,) = _batches(_src(tree))
+    assert _keys(got, "psk.spots") == ["msk"]
+    warns = [r.getMessage() for r in caplog.records
+             if r.name == LOGGER and r.levelno == logging.WARNING]
+    assert len(warns) == 1
+    assert f"shipping {present}-only" in warns[0]
+    assert "1 psk, 3 psk left out)" in warns[0]
+
+
+def test_build_layout_defaults_to_the_manifests_sinks_dir_and_marker(tree):
+    from hs_uploader.pipelines_d import load_layout
+
+    etc = tree.tmp / "etc"
+    (etc / "pipelines.d").mkdir(parents=True)
+    manifest = etc / "pipelines.toml"
+    manifest.write_text(
+        '[identity]\ncall = "AC0G"\ngrid = "EM38ww"\n\n[[pipeline]]\n'
+        'name = "wspr-wsprdaemon"\n'
+        '[pipeline.source]\ntype = "wspr_cycle"\ninclude_psk = true\n'
+        f'db_path = "{tree.db}"\n'
+        '[pipeline.transport]\ntype = "wsprdaemon_tar"\n'
+        'servers = ["gw1.example"]\nreceiver = "AC0G"\n')
+    store = SqliteWatermarkStore(tree.tmp / "wm.db")
+    layout = load_layout(manifest)
+    assert layout.path == manifest
+    pipes, refused = daemon.build_layout(layout, watermark=store)
+    assert refused == [] and len(pipes) == 1
+    assert pipes[0].source.sinks_dir == sinks_dir_for(manifest) == etc / "sinks"
+    assert pipes[0].source.marker == sinkswitch.marker_path()
+    # Passed paths win.
+    pipes, _ = daemon.build_layout(
+        layout, watermark=store,
+        paths=daemon.SinkPaths(tree.sinks, tree.marker))
+    assert pipes[0].source.sinks_dir == tree.sinks
+    assert pipes[0].source.marker == tree.marker

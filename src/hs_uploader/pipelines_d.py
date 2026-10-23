@@ -97,6 +97,8 @@ class Layout:
     entries: list[tuple[Mapping[str, Any], str]] = field(default_factory=list)
     refused: list[Refusal] = field(default_factory=list)
     signature: tuple = ()
+    # The legacy manifest's path, so a build finds ``sinks/`` beside it.
+    path: Optional[Path] = None
 
 
 # ---- the signature (ruling X5: one function, used at start and before each pump)
@@ -256,4 +258,5 @@ def load_layout(manifest_path: str | Path, *,
         files.extend((e, origin_for(name)) for e in entries)
 
     return Layout(manifest=manifest, entries=legacy + files,
-                  refused=refused, signature=signature)
+                  refused=refused, signature=signature,
+                  path=Path(manifest_path))
