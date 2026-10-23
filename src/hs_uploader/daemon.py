@@ -49,6 +49,7 @@ from .pipelines_d import (LEGACY, Layout, Refusal, load_layout,
                           pipelines_dir_for, pipelines_signature,
                           sinks_dir_for)
 from .sinkswitch import effective_state
+from .gate import SinkGate  # noqa: F401  (re-export: spec §11.2 finds hs_uploader.daemon.SinkGate)
 from .transports.discard import wrap_if_discard
 from .wake import WakeListener
 from .watermark.sqlite import SqliteWatermarkStore, default_path
