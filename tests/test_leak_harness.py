@@ -22,7 +22,9 @@ The pipelines:
 The walk: first without the marker (part 1 behaviour: everything stores and
 ships), then with it, through every pair of (site state, client state) and
 every transition between two pairs, 72 of them.  Each step writes rows, drops
-a heartbeat file and pumps until idle.  Then a switch falls from inside a
+a heartbeat file and pumps until idle.  Past the middle of the walk the marker
+moves aside for two steps (V11): rule 3 governs again, the fill backlog ships,
+and what the writer dropped while off never does; then it returns.  Then a switch falls from inside a
 transport callback twice: between two drain-mode batches, and between two
 replays.
 Last, the impostor rises to ``upload`` and its backlog ships (its positive
@@ -32,7 +34,8 @@ Each assertion carries a tag, so a failure names what leaked:
 
 * ``LEAK``: something left for a client whose switches read off or fill;
 * ``OFF ROW SHIPPED``: a row written while its producer read off shipped;
-* ``BACKLOG``: what shipped is not every stored row, once each, oldest first;
+* ``BACKLOG``: what shipped is not every stored row, once each, oldest first,
+  under its own pipeline's identity (each client pipeline names its own call);
 * ``HEARTBEAT``: a step's heartbeat did not ship;
 * ``HELD WORK``: a pipeline held at the start of a pump touched its store
   (spec §3.3: it returns without work).  The check at the top of
@@ -116,6 +119,8 @@ type = "sqlite"
 database = "psk"
 table = "spots"
 producer = "psk-recorder"
+[pipeline.identity]
+call = "AC0G/P"
 [pipeline.transport]
 type = "pskreporter"
 name = "pskreporter-psk"
@@ -128,6 +133,8 @@ max_records_per_pump = 1000
 type = "wspr_cycle"
 db_path = "{sink_db}"
 start_at = "beginning"
+[pipeline.identity]
+call = "AC0G/W"
 [pipeline.transport]
 type = "wsprdaemon_tar"
 servers = ["gw1.example"]
@@ -143,6 +150,8 @@ type = "sqlite"
 database = "psk"
 table = "spots"
 producer = "meteor-scatter"
+[pipeline.identity]
+call = "AC0G/M"
 [pipeline.transport]
 type = "pskreporter"
 name = "pskreporter-msk"
@@ -180,11 +189,11 @@ class Recorder:
     def batch_policy(self):
         return self._policy
 
-    def encode(self, batch) -> bytes:
+    def encode(self, batch, identity) -> bytes:
         out = []
         for r in batch.records:
             d = {"table": r.table, "time": r.time.isoformat(),
-                 "columns": dict(r.columns)}
+                 "columns": dict(r.columns), "identity": repr(identity)}
             if r.payload_path is not None:
                 p = Path(r.payload_path)
                 d["file"], d["content"] = p.name, p.read_text()
@@ -197,13 +206,13 @@ class Recorder:
             self.sent.append(bytes(blob))
 
     def ship(self, batch, identity) -> Outcome:
-        self._keep(self.encode(batch))
+        self._keep(self.encode(batch, identity))
         if self.on_ship is not None:
             self.on_ship(batch)
         return Outcome.acked()
 
     def serialize_for_retry(self, batch, identity) -> bytes:
-        return self.encode(batch)
+        return self.encode(batch, identity)
 
     def replay(self, blob, identity) -> Outcome:
         self._keep(blob)
@@ -354,7 +363,7 @@ def euler_walk() -> list[tuple[str, str]]:
 
 @dataclass
 class Pump:
-    held: set            # clients the model held when the pump began
+    held: list           # clients the model held when the pump began, sorted
     calls: list          # store calls the pump made
     did_work: bool
 
@@ -439,7 +448,8 @@ class Harness:
                 h.uploader = self
 
             def pump(self):
-                held = {c for c in GOVERNED if h.model.eff(c) != "upload"}
+                held = sorted(c for c in GOVERNED
+                              if h.model.eff(c) != "upload")
                 store = SpyStore.current
                 store.calls, store.active = [], True
                 try:
@@ -519,11 +529,18 @@ class Harness:
             assert sent == m.expected(c), (
                 f"BACKLOG: {c} sent {sent}, expected every stored row once, "
                 f"oldest first: {m.expected(c)} {state}")
+            want = repr(self.pipe(c).identity)
+            wrong = sorted({d["identity"] for d in _records(self.rec(c))
+                            if "columns" in d and "row" in d["columns"]
+                            and d["identity"] != want})
+            assert not wrong, (
+                f"BACKLOG: {c} shipped under identity {wrong}, not its own "
+                f"{want} {state}")
         self.check_held_work(label, pumps)
 
     def check_held_work(self, label, pumps) -> None:
         for n, p in enumerate(pumps):
-            for c in p.held:
+            for c in sorted(p.held):
                 pipe = self.pipe(c)
                 mine = {("name", pipe.name), ("key", daemon.pipeline_key(pipe))}
                 touched = [call for call in p.calls if call in mine]
@@ -604,11 +621,29 @@ def test_every_switch_state_and_transition_through_the_daemon(
         marker_path().write_text("carried over\n")
         m.enforced = True
         yield from h.step("marker appears")
+        # The marker vanishes mid-walk (V11), at the first step past the
+        # middle whose site reads off: every governed client then reads off.
+        vanish = next(i for i, (site, _c) in enumerate(walk)
+                      if i >= len(walk) // 2 and site == "off")
         for i, (site, client) in enumerate(walk):
             h.set_site(site)
             h.set_client(PSK, client)
             h.set_client(WSPR, client)
             yield from h.step(f"walk {i}")
+            if i != vanish:
+                continue
+            # Moved aside, as a rollback does: rule 3 governs again, so the
+            # gate sends and the writer stores whatever the switches say.
+            # The fill backlog ships; what was dropped while off never does.
+            aside = marker_path().with_name(
+                marker_path().name + ".rolled-back-20200101T000000Z")
+            marker_path().rename(aside)
+            m.enforced = False
+            yield from h.step("marker gone")
+            yield from h.step("marker still gone")
+            aside.rename(marker_path())
+            m.enforced = True
+            yield from h.step("marker back")
 
         # -- a switch falls between two drain-mode batches ---------------------
         h.set_site("upload")
