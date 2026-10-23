@@ -40,9 +40,11 @@ uv build
 
 # Do two trees send the same thing?  Runs OLD and NEW on copies of a
 # station's state; never writes the given files (v3.70 neutrality proof).
-# --sinks/--marker give NEW the switches; verdicts AGREE, HELD, DISAGREE,
-# predicted by the tool's own switch reader (never hs_uploader's), and
-# the last line reads RESULT: PASS only with no DISAGREE (spec 2b-part2 §11.2)
+# --sinks/--marker give NEW the switches.  Each pipeline ends AGREE, HELD,
+# DISAGREE or INCONCLUSIVE; the tool predicts HELD with its own switch
+# reader, never hs_uploader's.  The last line reads
+# RESULT: PASS (a AGREE, h HELD, d DISAGREE), or RESULT: DISAGREE (...),
+# or RESULT: INCONCLUSIVE (...; reason); exit 0 only on PASS (spec 2b-part2 §11.2)
 .venv/bin/python tools/neutrality_check.py --manifest pipelines.toml \
     --sink sink.db --watermarks watermarks.db --old OLD/src --new NEW/src \
     [--sinks sinks/ --marker carry-over-v1.done]
@@ -52,8 +54,8 @@ hs-uploader --help
 hs-uploader migrate --check    # watermarks.db schema version; writes nothing
 hs-uploader migrate            # run pending migrations (sigmond does this on each manifest write)
 hs-uploader capabilities            # store schema version this code writes (one integer, now 3)
-hs-uploader capabilities --features # feature words: pipelines.d, send-log-v3, switch-files
-hs-uploader sink status [--json]    # switches, effective states, and what the gate holds ("enforced" once the marker stands)
+hs-uploader capabilities --features # feature words: gate, pipelines.d, send-log-v3, switch-files
+hs-uploader sink status [--json] [--marker P]  # switches, effective states, and what the gate holds ("enforced" once the marker stands)
 hs-uploader sink set <site|client> <off|fill|upload> --reason R --by B   # through write_switch (root on the real sinks/)
 hs-uploader sink mark-carried [--note N]   # writes the carry-over marker atomically
 ```
@@ -61,6 +63,11 @@ hs-uploader sink mark-carried [--note N]   # writes the carry-over marker atomic
 Clients store rows through `hs_uploader.sink.Writer` and build
 in-process senders from `hs_uploader`'s sources and transports.  The CLI
 inspects state and runs the host daemon (`hs-uploader serve`).
+
+To run the CLI without the console script, use
+`<venv>/bin/python -I -m hs_uploader.cli <args>`, as sigmond does (from
+`cwd=/`).  The package has no `__main__.py`, so `python -m hs_uploader`
+fails.
 
 ## Architecture
 
@@ -283,6 +290,49 @@ explicit even when no third-party deps are required.
   `WsprCycleSource`, the cycle before the current floor, `None` for
   `"beginning"`.  So a pipeline
   held from its first pump ships its `fill` rows when raised.
+- The writer's switch check (spec sink-2b-part2 §4; `sink/writer.py`,
+  `Writer._judge`): `insert()` drops a row when the writer is not local,
+  the marker stands, `sinks/<producer>.toml` exists and
+  `effective_state(producer)` reads `off`.  A broken or unreadable switch
+  file reads `off` there too, so its rows drop.  The producer comes from
+  `self.producer or infer_producer(...)`, row by row.  The switch is read
+  at each `insert()`; nothing is cached.  `Writer.dropped` counts per
+  producer; `health` ignores it.  One INFO line per change of a
+  producer's verdict.  A check that raises stores the row and logs ERROR
+  once per exception type, then every 6 h.  `hs_uploader.sinkswitch` is
+  imported by absolute name inside a guard: an `ImportError` or
+  `AttributeError` means no enforcement, which is what sigmond's bundled
+  copy needs.  Any commit here that touches `sink/writer.py` needs a
+  refresh of sigmond's `lib/sigmond/hamsci_sink/_bundled.py` (recipe in
+  sigmond's CLAUDE.md); its compat test fails until then.
+- The psk rider check (spec §5; `sources/wspr_cycle.py`,
+  `WsprCycleSource._judge_riders`): while the marker stands, a `psk.spots`
+  row rides in the WSPR tar only when its producer's effective state reads
+  `upload` as the cycle's batch is built.  Producer: the `producer` column,
+  else `infer_producer`.  A missing client file keeps the row out.
+  `sinks_dir=None, marker=None` mean the library defaults, read each cycle,
+  so wspr-recorder's shim filters too; the daemon passes its own paths
+  through `pipeline_factory`.  A check that raises keeps every rider of
+  that cycle out and ships the WSPR rows.  The per-cycle INFO line counts
+  `psk left out`.
+- `capabilities --features` prints `gate` (`cli.FEATURES`).  The word
+  promises all of: the pump gate (rules 1-5), the starting record, the
+  writer check, the rider check, `sink set` and `sink mark-carried`.
+  sigmond carries a station over to the switches only when it sees it.
+- `sink status --json`, schema 1, top-level keys: `schema`, `enforced`,
+  `marker`, `sinks_dir`, `site` (`state`, `error`, `set_at`, `set_by`,
+  `reason`), `clients[]` (`client`, `file_state`, `effective`, `held_by`,
+  `error`, `pipelines`), `held_pipelines[]` (`pipeline`, `client`,
+  `held_by`, `reason`), `refused_files[]` (`file`, `pipeline`, `client`,
+  `reason`; `file` is null for a pipeline refused for the store's schema),
+  `no_client_pipelines`, `builder_pipelines`, `errors`.  sigmond refuses
+  any other `schema` number (`sigmond/lib/sigmond/sink_state.py`).  A
+  change to this layout needs a new number and a sigmond that reads it.
+- The marker (`sinkswitch.marker_path()`, `$HS_UPLOADER_STATE_DIR` or
+  `/var/lib/hs-uploader`, then `carry-over-v1.done`): `marker_stands` uses
+  `lstat`, so anything at the path counts; only ENOENT/ENOTDIR read
+  absent.  `write_marker` writes `carried over at <UTC>` and one line per
+  note, mode 0644, atomically.
 
 ## watermarks.db schema version (`hs-uploader migrate`)
 

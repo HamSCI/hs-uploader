@@ -71,6 +71,23 @@ with Writer.from_env(table="spots", mode="psk", schema_version=2) as w:
   (`target_db`, `target_table`, `producer`, `id`) after it adds the
   columns.  A source that reads one client's rows walks it.
 - `PENDING_UPLOADS_DDL` gives tools and tests the writer's own schema.
+- The writer stores nothing for a repository while a producer's switch
+  reads `off` (see Sink switches).  `insert()` drops a row when all four
+  hold: the writer is not local, the carry-over marker stands,
+  `sinks/<producer>.toml` exists, and the producer's effective state reads
+  `off`.  A broken or unreadable switch file reads `off`, so its rows drop
+  too.  `fill` and `upload` store.  The writer takes each row's producer
+  as `flush()` does, so a mixed batch splits row by row: meteor-scatter at
+  `off` drops its MSK144 rows while psk-recorder's FT8 rows store.  It
+  reads the switch at each `insert()`, so a change counts at the next
+  `insert()` with no restart.  `Writer.dropped` counts the dropped rows
+  per producer; `health` ignores the count.  The writer logs one INFO line
+  each time a producer's verdict changes ("sink switch reads off for X:
+  storing nothing for repositories"), never one per row.  When the check
+  itself fails, the writer stores the row and logs one ERROR line per
+  exception type, then a reminder every 6 hours: the daemon's gate still
+  holds what must not ship.  A venv without `hs_uploader.sinkswitch`
+  (sigmond's bundled copy of this writer) gets no check at all.
 
 ## Architecture
 
@@ -159,8 +176,11 @@ so an editor's backup never does.
 A file holds `[[pipeline]]` tables in the legacy form.  The daemon sets each
 entry's `client` from the file name.  An entry that names another client
 refuses the file.  An optional `governed = true | false` (default true)
-marks whether a client's switch applies to the entry (see Sink switches).  The daemon stores
-it and uses it only to choose which clients its switch report names.
+marks whether a client's switch applies to the entry (see The gate).  The
+gate honours `governed = false` only from `pipelines.d/sigmond.toml`, the
+file that carries sigmond's heartbeat.  Any other entry that says it,
+in another file or in the legacy manifest, gets one WARNING line, and the
+switches judge it all the same.
 
 Precedence and refusal follow these rules:
 
@@ -218,32 +238,167 @@ missing site file sets no limit.  A file that fails to read or parse reads
 `off`, and the error logs once.  `hs_uploader.sinkswitch` reads and writes
 these files; stdlib only, so a client's venv can import it.
 
-No switch stops or gates anything yet.  The daemon reads the files and
-reports what each governed client's switch would say, as one INFO line per
-change.  It sends exactly what the manifests say.
+| Effective state | The writer | The daemon |
+|---|---|---|
+| `upload` | stores | sends |
+| `fill` | stores | holds the client's pipelines |
+| `off` | stores nothing for a repository | holds the client's pipelines |
+
+**The carry-over marker.**  The switches take effect only while the marker
+`/var/lib/hs-uploader/carry-over-v1.done` stands.  `HS_UPLOADER_STATE_DIR`
+moves it, as it moves the store.  sigmond writes the marker once it has
+carried each station's `[uploads]` setting into switch files.  While the
+marker stands absent, the gate passes every pipeline, the writer stores
+every row and the WSPR tar keeps every psk row: the station sends as part
+1 did.  The marker counts when anything stands at its path, a dangling
+link included.  An error other than "no such file", such as a directory
+the reader may not search, reads as standing, so the switches keep
+governing.
+
+### The gate
+
+The daemon asks one `gate.SinkGate` before every send.  Its `may_send`
+answers by five rules; the first that applies decides:
+
+1. `governed = false` in `pipelines.d/sigmond.toml`: send.  That file
+   carries the heartbeat.
+2. The legacy heartbeat, an entry of the legacy manifest whose `client`
+   reads `sigmond` or whose transport is `heartbeat_sftp`: send.  An older
+   sigmond renders the heartbeat there.
+3. No carry-over marker: send.
+4. The pipeline names no client: send.  sigmond v3.69 to v3.72 renders no
+   `client`, and that manifest's own policy governs.  The daemon logs one
+   INFO line per such pipeline.
+5. Otherwise send when the client's effective state reads `upload`, and
+   hold in every other case.  `fill` and `off` hold alike, and so do a
+   missing client file, a broken file, an unknown state and a missing
+   `sinks/` directory.
+
+The pump asks at the top of each pipeline's pump, before each queued
+retry, and before each source batch, so a switch that changes in the
+middle of a pump counts at the next send.  A held pipeline opens no
+batch, ships nothing and writes no attempt row.  Its send record and its
+queued retries stay as they stand; a retry keeps its attempt count and
+replays first once the pipeline sends again.  Raising a client from `fill`
+to `upload` therefore ships what it stored, oldest first, exactly once.  A
+gate that raises holds the pipeline.
+
+`Uploader(gate=None)`, the default, sends always.  The in-process senders
+that psk-recorder, meteor-scatter and wspr-recorder build pass no gate, so
+the switches do not govern them; sigmond turns those senders off instead.
+
+The gate logs each pipeline's change between sending and held once, at
+INFO: "pipeline X held: sink filling (site)", "pipeline X sending: sink
+uploading".  A pipeline held at its first decision logs its held line
+then, so the daemon's start names each held pipeline.  A pipeline held
+for a week logs nothing more.  A fault (a broken switch file, `sinks/`
+missing while the marker stands, an exception inside the gate) logs at
+ERROR once, then a reminder every 6 hours while it lasts.
+
+**The starting record.**  A legacy entry with `start_at = "now"` fixes its
+starting point at its first pump.  A pipeline held from its first pump
+would never fix one, and the first real pump would skip everything stored
+while it was held.  So while the marker stands, the daemon gives each
+governed pipeline whose source starts at `now` and whose key holds no send
+record a starting record.  It does so at each build, and again when the
+marker first appears.  `SqliteSource`
+anchors at the highest row id in its scope.  `WsprCycleSource` anchors at
+the cycle before the current cycle floor, as its first pump would, so the
+cycle in progress still ships.  The store writes the record through
+`start_cursor`, an insert that does nothing when the key already holds a
+row, so an existing record never moves.
+
+**The psk rider.**  wspr-recorder's `wspr-wsprdaemon` pipeline sets
+`include_psk = true`, and its `WsprCycleSource` adds the cycle's
+`psk.spots` rows to each WSPR tar.  While the marker stands, a psk row
+rides only when its producer's effective state reads `upload` as the
+source builds that cycle's batch.  The producer comes from the row's
+`producer` column, or from `infer_producer` when the column reads `''`.  A
+missing client file keeps the row out.  The cycle's WSPR spots and noise
+stay as they are, and the per-cycle line counts the rows left out
+(`%d psk left out`).  A left-out row never rides a later tar, since the
+cycle's send record moves when the tar ships; it still reaches
+pskreporter.info through its producer's own pipeline once that reads
+`upload`.  If the check itself raises, every psk row of that cycle stays
+out and the source logs one ERROR line per exception type, then a
+reminder every 6 hours.  The source reads the library's default paths
+when given none, so wspr-recorder's in-process shim filters too.
+
+### Commands
 
 ```bash
-hs-uploader sink status [--json] [--manifest PATH] [--sinks DIR]
+hs-uploader sink status [--json] [--manifest PATH] [--sinks DIR] [--marker PATH]
+hs-uploader sink set <site|client> <off|fill|upload> --reason TEXT --by TEXT \
+    [--identity-json FILE|-] [--sinks DIR | --manifest PATH]
+hs-uploader sink mark-carried [--note TEXT] [--marker PATH]
 ```
 
-`sink status` lists the site file and each client that owns a pipeline or a
-switch file: the file's state, the effective state and any read error.  It
-counts pipelines that carry no client, since no switch applies to them, and
-it says "not enforced".  `--sinks` defaults to `sinks/` beside `--manifest`.
-It exits 2 when it cannot read the manifest.
+`sink status` lists the site file and each client that owns a governed
+pipeline or a switch file: the file's state, the effective state, which
+switch holds it, and any read error.  It says "enforced" while the marker
+stands, and lists each pipeline the gate holds, with the switch that holds
+it.  The held list comes from the daemon's own gate, asked about the
+pipelines the daemon would build from the same files.  The effective
+states do not depend on the marker; only "enforced" and the held list do.
+It also lists the pipeline files the daemon refused, the pipelines that
+name no client, and the `builder` entries it cannot see inside.
+`--sinks` defaults to `sinks/` beside `--manifest`, and `--marker` to the
+marker path above.  The command exits 2 when it cannot read the manifest,
+and 0 otherwise.
+
+`sink status --json` prints one object, `"schema": 1`.  Its keys:
+
+- `schema` (1), `enforced` (true while the marker stands), `marker`,
+  `sinks_dir`;
+- `site`: `state` (`off`, `fill`, `upload`, `missing` or `error`),
+  `error`, `set_at`, `set_by`, `reason`;
+- `clients[]`: `client`, `file_state` (a state, `missing` or `error`),
+  `effective`, `held_by` (`site`, `client`, `fault`, or null while the
+  client reads `upload`), `error`, `pipelines`;
+- `held_pipelines[]`: `pipeline`, `client`, `held_by` (`site`, `client` or
+  `fault`), `reason`;
+- `refused_files[]`: `file`, `pipeline`, `client`, `reason`.  A refused
+  pipeline file names its `file`, with `pipeline` null.  A pipeline the
+  daemon refused for the store's schema has `file` null and names its
+  `pipeline`;
+- `no_client_pipelines`, `builder_pipelines`: pipeline names;
+- `errors`: what the command could not read, such as the manifest or the
+  store.
+
+`sink set` writes one switch file through `write_switch`: under
+`sinks/.lock`, atomically, with one new `[[history]]` entry.  It refuses an
+unknown state or a bad name, and exits 1 with the reason.  On the real
+`sinks/` it refuses a caller who is not root.  `--identity-json -` reads
+the history entry's identity tables from stdin, at most 1 MiB, and refuses
+a value TOML cannot hold.  `sink mark-carried` writes the marker, mode
+0644, through a temporary file and a rename: one line with the UTC time,
+then the `--note` line if given.  sigmond's carry-over passes one note
+line that names every switch file it wrote.
+
+sigmond runs each of these through the daemon's own interpreter as
+`<python> -I -m hs_uploader.cli <args>`, from `/`.  The package has no
+`__main__`, so `python -m hs_uploader` does not run the CLI.
+
+At each change the daemon also logs one line per governed client, for
+example "sink switch for psk-recorder reads fill (enforced)", and again
+when the marker appears or goes.
 
 ## Features: `hs-uploader capabilities --features`
 
 `hs-uploader capabilities` prints the store schema version, one integer.
-With `--features` it prints one feature word per line instead:
+With `--features` it prints one feature word per line instead, sorted:
 
+- `gate` -- the switches take effect: the gate in the pump, the starting
+  record, the writer's check, the psk rider check, `sink set` and
+  `sink mark-carried`.
 - `pipelines.d` -- the daemon reads pipeline files.
 - `send-log-v3` -- the store has migration 3 and the send log names its
   pipeline and client.
 - `switch-files` -- the code reads switch files and reports them.
 
-An hs-uploader without the flag exits 2.  Sigmond's manifest step prints the
-answer.
+An hs-uploader without the flag exits 2.  sigmond's manifest step prints the
+answer, and carries the station over to the switches only when it sees
+`gate`.
 
 ## The send log: `attempts` and `last_send`
 
