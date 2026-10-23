@@ -26,7 +26,9 @@ What it logs (spec §9.2, plan ruling 6):
 * A fault logs at ERROR once, then a reminder at most every
   ``REMIND_S`` seconds while it lasts.  Faults: an exception inside a
   decision (keyed by pipeline and exception type, never by its text;
-  a clean decision clears it, so a new outbreak logs as a first sight), a
+  a clean decision marks it cleared, and a recurrence logs as a first
+  sight only once 6 h have passed since its last line; a gate fault logs
+  no transition line), a
   broken or unreadable switch file (``sinkswitch`` logs its first sight,
   once per file signature; the gate adds the reminders), and ``sinks/``
   missing while the marker stands.  A pipeline with a bad client name
@@ -99,6 +101,9 @@ class SinkGate:
         # clears them and a new outbreak logs as a first sight.  Holds only
         # keys ``_said`` admitted.
         self._exc_keys: dict[tuple, set] = {}
+        # Exception fault keys a clean decision cleared.  Each keeps its
+        # time in ``_fault_at``: the 6 h clock governs a recurrence.
+        self._cleared: set[Hashable] = set()
         self._last_capped = False
 
     def may_send(self, pipe) -> bool:
@@ -113,7 +118,9 @@ class SinkGate:
             # Key by type, never by free text: a message that changes each
             # call must not log each call (ruling 6).
             fkey = ("fault", _key(pipe), type(e).__name__)
-            say = self._fault(fkey, first_logs=True)
+            say = self._recur(fkey)
+            if say is None:
+                say = self._fault(fkey, first_logs=True)
             with self._lock:
                 if fkey in self._fault_at:
                     self._exc_keys.setdefault(_key(pipe), set()).add(fkey)
@@ -131,6 +138,11 @@ class SinkGate:
         Its first decision logs only when it holds.  Any failure here
         leaves the decision alone (a log line never changes a send).
         """
+        if d.rule == 0:
+            # A gate fault: its ERROR line and reminders report it.  It
+            # neither logs a transition nor counts as the last decision,
+            # so the next one is judged against the last real decision.
+            return
         try:
             k = _key(pipe)
             warn = False
@@ -155,11 +167,28 @@ class SinkGate:
             pass
 
     def _clear_exceptions(self, pipe) -> None:
+        """A clean decision marks the pipeline's exception faults cleared.
+
+        Each keeps its last-logged time: a recurrence within REMIND_S of
+        that line stays silent; a later one logs as a first sight.
+        """
         with self._lock:
             keys = self._exc_keys.pop(_key(pipe), None)
-            for fkey in keys or ():
-                self._fault_at.pop(fkey, None)
-                self._said.discard(fkey)
+            self._cleared.update(keys or ())
+
+    def _recur(self, fkey: Hashable) -> Optional[str]:
+        """For a cleared exception fault that recurs: "first" when REMIND_S
+        has passed since its last line, else "" (silent).  None when the key
+        is not a cleared fault."""
+        now = self._clock()
+        with self._lock:
+            if fkey not in self._cleared:
+                return None
+            self._cleared.discard(fkey)
+            if now - self._fault_at.get(fkey, now - REMIND_S) < REMIND_S:
+                return ""
+            self._fault_at[fkey] = now
+            return "first"
 
     def forget(self, pipes) -> None:
         """Drop the per-pipeline state of every pipeline not in ``pipes``.
@@ -176,6 +205,10 @@ class SinkGate:
                 for fkey in self._exc_keys.pop(k):
                     self._fault_at.pop(fkey, None)
                     self._said.discard(fkey)
+            for fkey in [f for f in self._cleared if f[1] not in keep]:
+                self._cleared.discard(fkey)
+                self._fault_at.pop(fkey, None)
+                self._said.discard(fkey)
 
     # -- the rules ---------------------------------------------------------
 

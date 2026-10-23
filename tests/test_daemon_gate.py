@@ -463,7 +463,8 @@ def test_gate_exception_that_clears_logs_a_new_outbreak_as_first_sight(
         tree, monkeypatch, caplog):
     sinks, marker = tree
     sw(sinks, "c1", "upload")
-    g = SinkGate(sinks, marker, clock=Clock())
+    clock = Clock()
+    g = SinkGate(sinks, marker, clock=clock)
     wm = SqliteWatermarkStore(":memory:")
     p = mkpipe("p1", "c1", wm)
     real = gate_mod.effective_state
@@ -477,12 +478,55 @@ def test_gate_exception_that_clears_logs_a_new_outbreak_as_first_sight(
             assert not g.may_send(p)
         monkeypatch.setattr(gate_mod, "effective_state", real)
         assert g.may_send(p)                  # it clears
+        clock.t += REMIND_S + 1               # the 6 h clock governs a recurrence
         monkeypatch.setattr(gate_mod, "effective_state", boom)
         for _ in range(10):
             assert not g.may_send(p)
     errs = [m for m in hsu_lines(caplog, logging.ERROR) if "gate failed" in m]
     assert len(errs) == 2
     assert not any("reminder" in m for m in errs)
+
+
+def _flaky(real):
+    n = iter(range(10**6))
+
+    def flaky(*a, **k):
+        if next(n) % 2:
+            raise OSError("transient")
+        return real(*a, **k)
+    return flaky
+
+
+def test_alternating_gate_fault_logs_one_error_and_no_transition_lines(
+        tree, monkeypatch, caplog):
+    sinks, marker = tree
+    sw(sinks, "c1", "upload")
+    clock = Clock()
+    g = SinkGate(sinks, marker, clock=clock)
+    wm = SqliteWatermarkStore(":memory:")
+    p = mkpipe("p1", "c1", wm)
+    real = gate_mod.effective_state
+    monkeypatch.setattr(gate_mod, "effective_state", _flaky(real))
+    with caplog.at_level(logging.DEBUG, logger="hs_uploader"):
+        for _ in range(100):
+            clock.t += 30.0                   # 50 min in all, under 6 h
+            g.may_send(p)
+        errs = [m for m in hsu_lines(caplog, logging.ERROR)]
+        assert len(errs) == 1
+        infos = hsu_lines(caplog)
+        assert len([m for m in infos if " held: " in m]) <= 1
+        assert [m for m in infos if " sending: " in m] == []
+        # positive control: a real switch change still logs, once each way
+        caplog.clear()
+        monkeypatch.setattr(gate_mod, "effective_state", real)
+        sw(sinks, "c1", "fill")
+        for _ in range(10):
+            assert not g.may_send(p)
+        sw(sinks, "c1", "upload")
+        for _ in range(10):
+            assert g.may_send(p)
+    assert hsu_lines(caplog) == ["pipeline p1 held: sink filling (client)",
+                                 "pipeline p1 sending: sink uploading"]
 
 
 def test_transition_cap_warns_once(tree, caplog, monkeypatch):
