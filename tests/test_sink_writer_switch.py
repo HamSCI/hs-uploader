@@ -294,3 +294,54 @@ def test_a_sinkswitch_lacking_a_name_stores_and_raises_nothing(tree, monkeypatch
     monkeypatch.setitem(sys.modules, "hs_uploader.sinkswitch", old)
     _put(w, [{"mode": "FT8"}])
     assert _stored(tree) == [("psk-recorder", "FT8")]
+
+
+# ---- review fix round 1 -----------------------------------------------------
+
+def test_a_broken_site_file_drops_a_producer_with_a_sound_upload_file(tree):
+    _switch(tree.sinks, "psk-recorder", "upload")
+    w = _writer(tree, producer="psk-recorder")
+    _put(w, [{"mode": "FT8"}])                         # control: a sound site stores
+    assert len(_stored(tree)) == 1
+    (tree.sinks / "site.toml").write_text("state = [broken\n")
+    _put(w, [{"mode": "FT8"}])
+    assert len(_stored(tree)) == 1
+    assert w.dropped == {"psk-recorder": 1}
+
+
+def test_a_broken_site_file_with_no_client_file_stores(tree):
+    (tree.sinks / "site.toml").write_text("state = [broken\n")
+    w = _writer(tree, producer="psk-recorder")
+    _put(w, [{"mode": "FT8"}])
+    assert len(_stored(tree)) == 1
+    assert w.dropped == {}
+    _switch(tree.sinks, "psk-recorder", "upload")      # control: the file exists,
+    _put(w, [{"mode": "FT8"}])                         # the broken site drops it
+    assert len(_stored(tree)) == 1
+    assert w.dropped == {"psk-recorder": 1}
+
+
+def test_the_marker_vanishing_logs_the_storing_again_line_once(tree, caplog):
+    _switch(tree.sinks, "psk-recorder", "off")
+    w = _writer(tree, producer="psk-recorder")
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        _put(w, [{"mode": "A"}])                       # control: off drops, one line
+    assert [r.getMessage() for r in caplog.records] == [
+        "hamsci_sink: sink switch reads off for psk-recorder: "
+        "storing nothing for repositories"]
+    assert _stored(tree) == []
+    caplog.clear()
+    tree.marker.unlink()
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        for _ in range(100):
+            w.insert([{"mode": "B"}])
+    w.flush()
+    assert [r.getMessage() for r in caplog.records] == [
+        "hamsci_sink: sink switch no longer reads off for psk-recorder: storing again"]
+    assert len(_stored(tree)) == 100
+    caplog.clear()
+    tree.marker.write_text("x\n")                      # back: drops and says so again
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        _put(w, [{"mode": "C"}])
+    assert len(caplog.records) == 1 and "reads off" in caplog.records[0].getMessage()
+    assert len(_stored(tree)) == 100
