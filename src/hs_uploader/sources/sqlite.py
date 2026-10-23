@@ -852,16 +852,58 @@ class SqliteSource:
         if self._start_at_cursor is not None:
             return self._start_at_cursor
         conn = self._connect()
+        self._start_at_cursor = self._present_position(conn, self._local_rows)
+        return self._start_at_cursor
+
+    def _present_position(
+        self, conn: sqlite3.Connection, local_rows: LocalRowFilter,
+    ) -> _Cursor:
+        """The highest ``id`` within this source's scope: the producer and
+        instance clauses and ``local = 0``.  0 on an empty queue."""
         scope_sql, scope_params = self._scope_clauses(conn)
-        scope_sql = scope_sql + self._local_rows.clause(conn)
+        scope_sql = scope_sql + local_rows.clause(conn)
         row = conn.execute(
             "SELECT COALESCE(MAX(id), 0) FROM pending_uploads "
             "WHERE target_db = ? AND target_table = ?"
             + "".join(f" AND {c}" for c in scope_sql),
             (self.database, self.table, *scope_params),
         ).fetchone()
-        self._start_at_cursor = _Cursor(last_id=int(row[0]))
-        return self._start_at_cursor
+        return _Cursor(last_id=int(row[0]))
+
+    def initial_cursor(self) -> Optional[bytes]:
+        """The send record the first pump would anchor at, in this source's
+        cursor encoding (spec sink-2b-part2 §3.5).  ``None`` when the source
+        anchors nowhere (``start_at`` unset: it ships from the start of the
+        queue) or has no sink configured.
+
+        An anchor a pump already fixed (``_start_at_cursor``) wins, so the
+        record is exactly what that pump would write.  Otherwise: the highest
+        ``id`` in scope now, or ``b"0"`` when the sink file or its queue
+        table does not exist yet, since every row then arrives later.
+
+        Safe to call on any thread between pumps: it reads through a
+        connection of its own and closes it, so it never touches the
+        connection the pump thread owns, and it never creates the sink file.
+        Raises on a database error.
+        """
+        if self._config is None or self.start_at is None:
+            return None
+        if self._start_at_cursor is not None:
+            return self._start_at_cursor.to_bytes()
+        if (self._connect_factory is _default_connect_factory
+                and not Path(self._config.path).exists()):
+            return _Cursor(last_id=0).to_bytes()
+        conn = self._connect_factory(self._config)
+        try:
+            has_table = conn.execute(
+                "SELECT name FROM sqlite_master "
+                "WHERE type='table' AND name='pending_uploads'"
+            ).fetchone() is not None
+            if not has_table:
+                return _Cursor(last_id=0).to_bytes()
+            return self._present_position(conn, LocalRowFilter()).to_bytes()
+        finally:
+            conn.close()
 
 
 # ---- helpers ---------------------------------------------------------------

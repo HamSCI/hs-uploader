@@ -38,6 +38,7 @@ import socket
 import threading
 import tomllib
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Any, Callable, Mapping, Optional
 
@@ -48,10 +49,12 @@ from .pipeline_factory import build_pipelines as build_generic_pipelines
 from .pipelines_d import (LEGACY, Layout, Refusal, load_layout,
                           pipelines_dir_for, pipelines_signature,
                           sinks_dir_for)
-from .sinkswitch import effective_state
+from .sinkswitch import effective_state, marker_path, marker_stands
 from .gate import SinkGate  # noqa: F401  (re-export: spec §11.2 finds hs_uploader.daemon.SinkGate)
+from .gate import exempt_rule
 from .transports.discard import wrap_if_discard
 from .wake import WakeListener
+from .watermark.base import Advance
 from .watermark.sqlite import SqliteWatermarkStore, default_path
 
 logger = logging.getLogger(__name__)
@@ -556,6 +559,61 @@ def split_refused(
     return runnable, refused
 
 
+# ---- the starting record (spec sink-2b-part2 §3.5) ---------------------------
+
+
+def _only_over_empty(new: bytes, stored: bytes) -> bool:
+    """``advance_cursor``'s order for a starting record: it lies after an
+    empty record and after nothing else, so it never moves a stored one."""
+    return not stored
+
+
+def write_starting_records(pipelines, store) -> list[str]:
+    """Give each governed pipeline whose source starts at now, and whose key
+    holds no send record, a starting record at the source's present position
+    (spec sink-2b-part2 §3.5).  Return the keys written, as
+    ``"source|destination|table"``, in the order of ``pipelines``.
+
+    "Governed" means the gate's rules 1 and 2 do not exempt it
+    (``gate.exempt_rule``).  "Starts at now" means the source offers
+    ``initial_cursor()`` and it returns bytes.  The record is what the
+    source's first pump would anchor at, written through
+    ``store.advance_cursor`` with an order under which it lies after an
+    empty record only, so an existing record stays exactly as it was.
+
+    The caller decides when: the daemon runs this while the marker stands.
+    A pipeline whose source or store fails is skipped with a WARNING (the
+    exception type and text; the caller runs this at a build or when the
+    marker appears, never per pump), and the rest are still written.
+    """
+    written: list[str] = []
+    for pipe in pipelines:
+        initial = getattr(pipe.source, "initial_cursor", None)
+        if not callable(initial) or exempt_rule(pipe):
+            continue
+        key = pipeline_key(pipe)
+        label = "|".join(key)
+        try:
+            if store.get_cursor(*key):
+                continue
+            cursor = initial()
+            if not cursor:
+                continue
+            result = store.advance_cursor(
+                *key, cursor=cursor,
+                last_ack=datetime.now(timezone.utc).isoformat(timespec="seconds"),
+                is_after=_only_over_empty)
+        except Exception as exc:  # noqa: BLE001 — one pipeline never stops the rest
+            logger.warning("daemon: no starting record for %s (%s): %s: %s",
+                           pipe.name, label, type(exc).__name__, exc)
+            continue
+        if result is Advance.WRITTEN:
+            written.append(label)
+            logger.info("daemon: starting record for %s (%s) at %r",
+                        pipe.name, label, cursor)
+    return written
+
+
 # ---- the running build, and the rebuild between pumps (spec sink-2b §3.4-§3.5)
 
 
@@ -575,7 +633,8 @@ class Rebuilder:
 
     def __init__(self, manifest_path: str | Path,
                  manifest: Mapping[str, Any],
-                 watermark: SqliteWatermarkStore):
+                 watermark: SqliteWatermarkStore,
+                 *, marker: Optional[Path] = None):
         self.manifest_path = Path(manifest_path)
         self.manifest = manifest
         self.watermark = watermark
@@ -588,6 +647,34 @@ class Rebuilder:
         self.running: list[Pipeline] = []
         self._rows: list[tuple[str, str, str]] = []
         self._once = _Once()
+        # The carry-over marker; None runs no starting-record pass.  The
+        # last reading of it, so marker_check() sees it appear (ruling X3;
+        # the gate itself keeps no cache, ruling 4).
+        self.marker = None if marker is None else Path(marker)
+        self._marker_seen = False
+
+    def _starting_pass(self, pipes: list[Pipeline]) -> list[str]:
+        """At each build: while the marker stands, write starting records."""
+        if self.marker is None:
+            return []
+        self._marker_seen = marker_stands(self.marker)
+        if not self._marker_seen:
+            return []
+        return write_starting_records(pipes, self.watermark)
+
+    def marker_check(self) -> list[str]:
+        """Before each pump: when the marker has appeared since the last
+        reading, run the starting-record pass over the running set, so it
+        lands before any held pump (plan ruling 4).  Returns the keys written."""
+        if self.marker is None:
+            return []
+        stands = marker_stands(self.marker)
+        appeared = stands and not self._marker_seen
+        self._marker_seen = stands
+        if not appeared:
+            return []
+        logger.info("daemon: carry-over marker %s appeared", self.marker)
+        return write_starting_records(self.running, self.watermark)
 
     def due(self) -> bool:
         """Whether ``pipelines.d/`` moved since the last build (ruling X5)."""
@@ -653,6 +740,7 @@ class Rebuilder:
         self.watermark.record_pipeline_states(rows, replace=True)
         self.build, self.running, self._rows = build, running, rows
         self.signature = signature
+        self._starting_pass(running)
         self.report_switches()
         return running, build.pipelines, build.refused
 
@@ -676,6 +764,7 @@ class Rebuilder:
                 raise
         self.build = build
         self.signature = signature
+        self._starting_pass(running)
         self.report_switches()
         pumped = {id(p) for p in uploader.pipelines}
         kept = {id(p) for p in build.pipelines}
@@ -749,7 +838,8 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     # start() writes pipeline_state, refusal rows included, before any early
     # return, so a refusal always leaves its reason (ruling C15).
     watermark = SqliteWatermarkStore(default_path())
-    rebuilder = Rebuilder(manifest_path, manifest, watermark)
+    rebuilder = Rebuilder(manifest_path, manifest, watermark,
+                          marker=marker_path())
     pipelines, built, file_refused = rebuilder.start()
     if not pipelines:
         if file_refused:
@@ -854,6 +944,12 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
                 logger.exception("daemon: rebuild failed; the running set "
                                  "stays, and the next pump tries again")
             last_failure = failure
+        # The marker may have appeared since the last pump: the starting
+        # records land before any held pump (spec §3.5, ruling X3).
+        try:
+            rebuilder.marker_check()
+        except Exception:
+            logger.exception("daemon: starting-record pass failed")
         try:
             uploader.pump()
         except Exception:

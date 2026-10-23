@@ -242,18 +242,8 @@ class WsprCycleSource:
             return ""
         # start_at == "now"
         if self._start_at_anchor is None:
-            # Anchor at the cycle BEFORE the current floor so the first
-            # complete cycle still gets shipped.  Mechanism: SQL filter
-            # is ``cycle > anchor AND cycle < floor``, strict on both
-            # ends.  Floor moves up to the next cycle on the next pump,
-            # at which point the previously-current cycle becomes
-            # complete and matches the now-widened range.
-            floor_dt = datetime.now(timezone.utc).replace(
-                second=0, microsecond=0,
-            )
-            floor_dt -= timedelta(minutes=floor_dt.minute % 2)
-            anchor_dt = floor_dt - timedelta(minutes=2)
-            self._start_at_anchor = anchor_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
+            floor_dt, self._start_at_anchor = _now_anchor(
+                datetime.now(timezone.utc))
             logger.info(
                 "WsprCycleSource: empty watermark + start_at='now' → "
                 "anchored at %s (first cycle to ship: %s on next pump)",
@@ -261,6 +251,23 @@ class WsprCycleSource:
                 floor_dt.strftime("%H:%M:%SZ"),
             )
         return self._start_at_anchor
+
+    def initial_cursor(self) -> Optional[bytes]:
+        """The send record the first pump would anchor at, encoded as
+        ``cursor_after`` is (spec sink-2b-part2 §3.5).  ``None`` for
+        ``start_at = "beginning"``, which anchors nowhere.
+
+        An anchor a pump already fixed wins; otherwise the anchor
+        ``_effective_cursor`` would fix now: the last complete cycle before
+        the current cycle floor, so the cycle in progress still ships.
+        Reads no database and changes no state.
+        """
+        if self.start_at == "beginning":
+            return None
+        anchor = self._start_at_anchor
+        if anchor is None:
+            _floor, anchor = _now_anchor(datetime.now(timezone.utc))
+        return _encode_cursor(anchor)
 
     def _connect(self) -> sqlite3.Connection:
         if self._conn is None:
@@ -423,6 +430,26 @@ class WsprCycleSource:
 
         return RecordBatch(
             records=tuple(records),
-            cursor_after=cycle_iso.encode("ascii"),
+            cursor_after=_encode_cursor(cycle_iso),
             commit_token=b"",  # commit() is a no-op
         )
+
+
+def _encode_cursor(cycle_iso: str) -> bytes:
+    """A send record: the cycle's ISO text, ASCII."""
+    return cycle_iso.encode("ascii")
+
+
+def _now_anchor(now: datetime) -> tuple[datetime, str]:
+    """(current cycle floor, anchor ISO) for ``start_at = "now"`` at ``now``.
+
+    Anchor at the cycle BEFORE the current floor so the first complete
+    cycle still gets shipped.  Mechanism: SQL filter is ``cycle > anchor
+    AND cycle < floor``, strict on both ends.  Floor moves up to the next
+    cycle on the next pump, at which point the previously-current cycle
+    becomes complete and matches the now-widened range.
+    """
+    floor_dt = now.replace(second=0, microsecond=0)
+    floor_dt -= timedelta(minutes=floor_dt.minute % 2)
+    anchor_dt = floor_dt - timedelta(minutes=2)
+    return floor_dt, anchor_dt.strftime("%Y-%m-%dT%H:%M:%SZ")

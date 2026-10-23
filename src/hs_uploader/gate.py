@@ -85,16 +85,15 @@ class SinkGate:
 
     def _decide(self, pipe) -> Decision:
         origin = pipe.origin
-        if not pipe.governed:
-            if origin == SINK_GATE_ORIGIN:
-                return Decision(True, 1, "ungoverned")
-            if self._first(("ungoverned", _key(pipe))):
-                log.warning(
-                    "pipeline %r (%s) says governed = false; only %s may "
-                    "say that, so its switches judge it",
-                    pipe.name, origin, SINK_GATE_ORIGIN)
-        if origin == LEGACY and (pipe.client == HEARTBEAT_CLIENT
-                                 or _is_heartbeat_transport(pipe.transport)):
+        exempt = exempt_rule(pipe)
+        if exempt == 1:
+            return Decision(True, 1, "ungoverned")
+        if not pipe.governed and self._first(("ungoverned", _key(pipe))):
+            log.warning(
+                "pipeline %r (%s) says governed = false; only %s may "
+                "say that, so its switches judge it",
+                pipe.name, origin, SINK_GATE_ORIGIN)
+        if exempt == 2:
             return Decision(True, 2, "legacy heartbeat")
         if not marker_stands(self.marker):
             return Decision(True, 3, "no carry-over marker")
@@ -142,6 +141,18 @@ class SinkGate:
                 return False
             self._said.add(key)
             return True
+
+
+def exempt_rule(pipe) -> int:
+    """1 or 2 when rule 1 or rule 2 lets ``pipe`` send whatever the switches
+    say; 0 when the switches govern it.  Logs nothing.  The starting-record
+    pass (spec §3.5) asks this, so it and the gate agree on "governed"."""
+    if not pipe.governed and pipe.origin == SINK_GATE_ORIGIN:
+        return 1
+    if pipe.origin == LEGACY and (pipe.client == HEARTBEAT_CLIENT
+                                  or _is_heartbeat_transport(pipe.transport)):
+        return 2
+    return 0
 
 
 def _key(pipe) -> tuple:

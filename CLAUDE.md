@@ -235,6 +235,17 @@ explicit even when no third-party deps are required.
   touches nothing and resumes where it stopped.  `gate=None` (the default,
   and every in-process shim) sends always.  A gate that raises holds the
   pipeline and logs at ERROR once per exception type (capped).
+- The starting record (spec sink-2b-part2 §3.5): while the carry-over marker
+  stands, `Rebuilder` runs `daemon.write_starting_records` at each build,
+  and `Rebuilder.marker_check()` runs it before the next pump when the marker
+  appears.  Each governed pipeline (`gate.exempt_rule` returns 0) whose key
+  holds no record and whose source's `initial_cursor()` returns bytes gets
+  that cursor through `advance_cursor`, with an order that never moves a
+  stored record.  `initial_cursor()` is the anchor the first pump would fix
+  (or already fixed): `SqliteSource`, the highest in-scope id, `b"0"` with
+  no sink or queue yet, `None` without `start_at`; `WsprCycleSource`, the
+  cycle before the current floor, `None` for `"beginning"`.  So a pipeline
+  held from its first pump ships its `fill` rows when raised.
 
 ## watermarks.db schema version (`hs-uploader migrate`)
 
