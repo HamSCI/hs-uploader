@@ -36,11 +36,14 @@ from __future__ import annotations
 import json
 import logging
 import sqlite3
+import time
 from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Iterator, Optional
 
+from .. import sinkswitch
 from ..core import Record, RecordBatch
+from ..sink.writer import infer_producer
 from ._local_rows import LocalRowFilter
 
 logger = logging.getLogger(__name__)
@@ -56,6 +59,12 @@ HEALTH_NOOP = "noop"
 # Treated as the primary_table for routing; this source covers both
 # wspr.spots and wspr.noise so neither would be quite right.
 _LOGICAL_TABLE = "wspr.cycle"
+
+# The psk rider gate (spec sink-2b-part2 §5).  Producers whose decision
+# is remembered for the once-per-change INFO line, and exception types
+# remembered for the once-per-6-h ERROR line, are each capped.
+_RIDER_CAP = 64
+_REMIND_S = 6 * 3600.0
 
 
 class WsprCycleSource:
@@ -81,6 +90,8 @@ class WsprCycleSource:
         expected_reporters: Optional[set] = None,
         backstop_sec: float = 90.0,
         include_psk: bool = False,
+        sinks_dir: Optional[Path | str] = None,
+        marker: Optional[Path | str] = None,
     ):
         """``db_path`` is the sink.db path (must be readable by the
         uploader's runtime user).  ``ship_buffer_sec`` is a defensive
@@ -106,6 +117,15 @@ class WsprCycleSource:
           historical row sitting in sink.db.
         * ``"beginning"``: ship every cycle in sink.db from the
           earliest row forward.  Useful for backfills.
+
+        ``sinks_dir`` and ``marker`` feed the psk rider gate (spec
+        sink-2b-part2 §5).  While the carry-over marker stands, a psk row
+        rides only when its producer's effective state reads ``upload``
+        when the cycle's batch is built.  ``None`` means the library's
+        defaults, ``sinkswitch.DEFAULT_SINKS_DIR`` and
+        ``sinkswitch.marker_path()``, read at each cycle.  The gate stays on
+        by default, so wspr-recorder's in-process shim, which passes
+        neither, filters too.  The daemon passes the paths it uses.
         """
         self.db_path = Path(db_path)
         self.ship_buffer_sec = int(ship_buffer_sec)
@@ -117,6 +137,15 @@ class WsprCycleSource:
         # wsprdaemon tar.  Default False so existing callers are
         # unaffected (no separate psk pipeline needed when True).
         self.include_psk = bool(include_psk)
+        self.sinks_dir = None if sinks_dir is None else Path(sinks_dir)
+        self.marker = None if marker is None else Path(marker)
+        # producer -> True while its psk rows are left out (capped).
+        self._left_out: dict[str, bool] = {}
+        self._cap_said = False
+        # exception type -> monotonic time of its last ERROR line (capped).
+        self._check_failed: dict[str, float] = {}
+        # `producer` column probe, once per connection: (conn, present).
+        self._producer_col: Optional[tuple[sqlite3.Connection, bool]] = None
         self._conn: Optional[sqlite3.Connection] = None
         # Cached at-first-pump anchor so the "now" mode is stable across
         # multiple iter_batches calls before the first cycle ships.
@@ -367,6 +396,7 @@ class WsprCycleSource:
         # records so they ship inside the per-cycle wsprdaemon tar.
         # Gated by include_psk; no separate psk pipeline needed.
         n_psk = 0
+        n_left_out = 0
         if self.include_psk:
             try:
                 next_cycle_dt = datetime.fromisoformat(
@@ -375,8 +405,11 @@ class WsprCycleSource:
                 next_cycle_iso = next_cycle_dt.strftime("%Y-%m-%dT%H:%M:%SZ")
             except (ValueError, AttributeError):
                 next_cycle_iso = cycle_iso
-            for (payload_json,) in conn.execute(
-                "SELECT payload_json FROM pending_uploads "
+            producer_sql = ("producer" if self._has_producer(conn)
+                            else "''")
+            riders: list[tuple[dict, str]] = []
+            for payload_json, producer in conn.execute(
+                f"SELECT payload_json, {producer_sql} FROM pending_uploads "
                 "WHERE target_db = 'psk' AND target_table = 'spots' "
                 + local_sql +
                 "  AND json_extract(payload_json, '$.time') >= ? "
@@ -391,6 +424,12 @@ class WsprCycleSource:
                         "WsprCycleSource: corrupt psk payload in cycle %s: %s",
                         cycle_iso, exc,
                     )
+                    continue
+                riders.append((payload, producer or ""))
+            for (payload, _producer), rides in zip(
+                    riders, self._judge_riders(riders)):
+                if not rides:
+                    n_left_out += 1
                     continue
                 try:
                     rec_time = datetime.fromisoformat(
@@ -413,19 +452,22 @@ class WsprCycleSource:
         if n_noise == 0 and n_spots > 0:
             logger.warning(
                 "WsprCycleSource: cycle %s shipping spots-only "
-                "(%d spots, 0 noise rows, %d psk) — noise unexpectedly missing",
-                cycle_iso, n_spots, n_psk,
+                "(%d spots, 0 noise rows, %d psk, %d psk left out) — noise "
+                "unexpectedly missing",
+                cycle_iso, n_spots, n_psk, n_left_out,
             )
         elif n_spots == 0 and n_noise > 0:
             logger.warning(
                 "WsprCycleSource: cycle %s shipping noise-only "
-                "(%d noise, 0 spot rows, %d psk) — spots unexpectedly missing",
-                cycle_iso, n_noise, n_psk,
+                "(%d noise, 0 spot rows, %d psk, %d psk left out) — spots "
+                "unexpectedly missing",
+                cycle_iso, n_noise, n_psk, n_left_out,
             )
         else:
             logger.info(
-                "WsprCycleSource: cycle %s ready (%d spots, %d noise, %d psk)",
-                cycle_iso, n_spots, n_noise, n_psk,
+                "WsprCycleSource: cycle %s ready (%d spots, %d noise, %d psk, "
+                "%d psk left out)",
+                cycle_iso, n_spots, n_noise, n_psk, n_left_out,
             )
 
         return RecordBatch(
@@ -433,6 +475,96 @@ class WsprCycleSource:
             cursor_after=_encode_cursor(cycle_iso),
             commit_token=b"",  # commit() is a no-op
         )
+
+    # -- the psk rider gate (spec sink-2b-part2 §5) -------------------------
+
+    def _has_producer(self, conn: sqlite3.Connection) -> bool:
+        """Whether ``pending_uploads`` has a ``producer`` column (v3.70+).
+
+        Probed once per connection.  A sink without it infers the
+        producer of every row."""
+        if self._producer_col is None or self._producer_col[0] is not conn:
+            cols = {r[1] for r in conn.execute(
+                "PRAGMA table_info(pending_uploads)")}
+            self._producer_col = (conn, "producer" in cols)
+        return self._producer_col[1]
+
+    def _judge_riders(self, riders: list[tuple[dict, str]]) -> list[bool]:
+        """For each (payload, producer column) a bool: does the row ride?
+
+        While the carry-over marker stands, a row rides only when its
+        producer's effective state reads ``upload`` now.  A missing or
+        broken client file, or a stricter site file, reads below
+        ``upload``, so the row stays out.  Without the marker every row
+        rides.  The producer is the row's ``producer`` column, or
+        ``infer_producer`` when that reads ``''``.
+
+        The marker and each switch file are read at every call, never
+        cached here, so a change counts at the next cycle built.  A check
+        that raises leaves every rider of the cycle out (they still reach
+        pskreporter.info through the producer's own pipeline) and logs
+        at ERROR once per exception type, then every 6 h.
+        """
+        if not riders:
+            return []
+        try:
+            marker = (self.marker if self.marker is not None
+                      else sinkswitch.marker_path())
+            enforced = sinkswitch.marker_stands(marker)
+            if not enforced and not any(self._left_out.values()):
+                return [True] * len(riders)
+            sinks_dir = (self.sinks_dir if self.sinks_dir is not None
+                         else sinkswitch.DEFAULT_SINKS_DIR)
+            verdict: dict[str, bool] = {}
+            out: list[bool] = []
+            for payload, producer in riders:
+                producer = producer or infer_producer("psk", "spots", payload)
+                rides = verdict.get(producer)
+                if rides is None:
+                    state = None
+                    if enforced:
+                        state = sinkswitch.effective_state(
+                            producer, sinks_dir=sinks_dir).state
+                    rides = verdict[producer] = state in (None, "upload")
+                    self._note_rider(producer, rides, state)
+                out.append(rides)
+            return out
+        except Exception as exc:  # noqa: BLE001 — the WSPR rows still ship
+            kind = type(exc).__name__
+            now = time.monotonic()
+            last = self._check_failed.get(kind)
+            if (last is None and len(self._check_failed) < _RIDER_CAP) or (
+                    last is not None and now - last >= _REMIND_S):
+                self._check_failed[kind] = now
+                logger.error(
+                    "WsprCycleSource: the psk rider check failed (%s); "
+                    "leaving every psk row out of the wsprdaemon tar", kind)
+            return [False] * len(riders)
+
+    def _note_rider(self, producer: str, rides: bool,
+                    state: Optional[str]) -> None:
+        """One INFO line when a producer's rider decision changes, never
+        per cycle or per row.  A producer rides until first left out."""
+        left_out = not rides
+        if self._left_out.get(producer, False) == left_out:
+            return
+        if producer not in self._left_out:
+            if len(self._left_out) >= _RIDER_CAP:
+                if not self._cap_said:
+                    self._cap_said = True
+                    logger.warning(
+                        "WsprCycleSource: %d psk producers tracked; further "
+                        "producers are judged but not logged", _RIDER_CAP)
+                return
+        self._left_out[producer] = left_out
+        if left_out:
+            logger.info(
+                "WsprCycleSource: psk rows from %s stay out of the wsprdaemon "
+                "tar: its sink switch reads %s, not upload", producer, state)
+        else:
+            logger.info(
+                "WsprCycleSource: psk rows from %s ride in the wsprdaemon tar "
+                "again", producer)
 
 
 def _encode_cursor(cycle_iso: str) -> bytes:

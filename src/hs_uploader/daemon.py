@@ -245,6 +245,16 @@ def _file_stat(signature: tuple, filename: str) -> Optional[tuple]:
     return None
 
 
+@dataclass(frozen=True)
+class SinkPaths:
+    """The ``sinks/`` directory and carry-over marker a build hands to each
+    ``wspr_cycle`` source's psk rider gate (spec sink-2b-part2 §5).  The
+    Rebuilder passes its own, the same the gate reads; ``None`` leaves the
+    library's defaults."""
+    sinks_dir: Optional[Path] = None
+    marker: Optional[Path] = None
+
+
 @dataclass
 class _Slot:
     """One entry and the pipelines it built: what a rebuild may reuse."""
@@ -301,19 +311,24 @@ def _naming_index(entry: Mapping[str, Any], i: int) -> Optional[int]:
 
 def _build_one(entry: Mapping[str, Any], origin: str, i: int, *,
                manifest: Mapping[str, Any],
-               watermark: SqliteWatermarkStore) -> list[Pipeline]:
+               watermark: SqliteWatermarkStore,
+               paths: Optional[SinkPaths] = None) -> list[Pipeline]:
     """Build one entry, generic or builder; raise on failure."""
     if entry.get("builder"):
         return _build_with_builder(entry, base_identity=_base_identity(manifest),
                                    watermark=watermark, origin=origin)
+    paths = paths or SinkPaths()
     return [build_entry(entry, base_identity=manifest.get("identity", {}) or {},
-                        watermark=watermark, origin=origin, index=i)]
+                        watermark=watermark, origin=origin, index=i,
+                        sinks_dir=paths.sinks_dir, marker=paths.marker)]
 
 
 def _build_legacy(entries: list[Mapping[str, Any]], *,
                   manifest: Mapping[str, Any],
                   watermark: SqliteWatermarkStore, pool: _Pool,
-                  strict: bool) -> tuple[list[_Slot], list[Pipeline]]:
+                  strict: bool,
+                  paths: Optional[SinkPaths] = None
+                  ) -> tuple[list[_Slot], list[Pipeline]]:
     """Build the legacy entries as v3.76 did: generic ones, then builders.
 
     A generic entry that fails raises when ``strict`` (the start, as v3.76),
@@ -329,7 +344,7 @@ def _build_legacy(entries: list[Mapping[str, Any]], *,
         if slot is None:
             try:
                 pipes = _build_one(entry, LEGACY, i, manifest=manifest,
-                                   watermark=watermark)
+                                   watermark=watermark, paths=paths)
             except Exception:
                 if strict:
                     _close_quietly(fresh)
@@ -348,7 +363,7 @@ def _build_legacy(entries: list[Mapping[str, Any]], *,
             spec = str(entry["builder"])
             try:
                 pipes = _build_one(entry, LEGACY, 0, manifest=manifest,
-                                   watermark=watermark)
+                                   watermark=watermark, paths=paths)
             except Exception:
                 logger.exception("daemon: builder %s failed for %s", spec,
                                  str(entry.get("name") or spec))
@@ -361,7 +376,8 @@ def _build_legacy(entries: list[Mapping[str, Any]], *,
 
 def _build_file(entries: list[Mapping[str, Any]], origin: str, *,
                 manifest: Mapping[str, Any], watermark: SqliteWatermarkStore,
-                pool: _Pool) -> tuple[list[_Slot], list[_Slot], list[Pipeline], str]:
+                pool: _Pool, paths: Optional[SinkPaths] = None,
+                ) -> tuple[list[_Slot], list[_Slot], list[Pipeline], str]:
     """Build one pipeline file whole, reusing unchanged entries.
 
     Returns (slots, the slots reused, the pipelines built fresh, "") or, when
@@ -381,7 +397,7 @@ def _build_file(entries: list[Mapping[str, Any]], origin: str, *,
         label = entry.get("name") or entry.get("builder") or f"entry {i + 1}"
         try:
             pipes = _build_one(entry, origin, i, manifest=manifest,
-                               watermark=watermark)
+                               watermark=watermark, paths=paths)
         except Exception as exc:
             _close_quietly(fresh)
             pool.give_back(taken)
@@ -409,7 +425,8 @@ def _admit(slots: list[_Slot], names: dict[str, Pipeline],
 
 def _assemble(layout: Layout, *, watermark: SqliteWatermarkStore,
               previous: Optional[Build] = None, strict: bool = False,
-              note: Callable[[tuple], bool] = _always) -> Build:
+              note: Callable[[tuple], bool] = _always,
+              paths: Optional[SinkPaths] = None) -> Build:
     """Build ``layout``, reusing every unchanged entry of ``previous``.
 
     Legacy entries build as v3.76 built them; a collision among them alone
@@ -430,7 +447,7 @@ def _assemble(layout: Layout, *, watermark: SqliteWatermarkStore,
     legacy = [e for e, origin in layout.entries if origin == LEGACY]
     legacy_slots, fresh = _build_legacy(legacy, manifest=manifest,
                                         watermark=watermark, pool=pool,
-                                        strict=strict)
+                                        strict=strict, paths=paths)
     names: dict[str, Pipeline] = {}
     keys: dict[tuple, Pipeline] = {}
     for p in (p for s in legacy_slots for p in s.pipes):
@@ -465,7 +482,7 @@ def _assemble(layout: Layout, *, watermark: SqliteWatermarkStore,
             entries = by_file[origin]
             slots, taken, new, reason = _build_file(
                 entries, origin, manifest=manifest, watermark=watermark,
-                pool=pool)
+                pool=pool, paths=paths)
             if not reason:
                 reason = _admit(slots, names, keys)
                 if reason:
@@ -482,7 +499,8 @@ def _assemble(layout: Layout, *, watermark: SqliteWatermarkStore,
             continue
         # §3.4 step 2: a file that now fails keeps what it last built.
         slots, taken, new, reason = _build_file(
-            last, origin, manifest=manifest, watermark=watermark, pool=pool)
+            last, origin, manifest=manifest, watermark=watermark, pool=pool,
+            paths=paths)
         if not reason:
             reason = _admit(slots, names, keys)
             if reason:
@@ -515,7 +533,8 @@ def _assemble(layout: Layout, *, watermark: SqliteWatermarkStore,
 
 
 def build_layout(
-    layout: Layout, *, watermark: SqliteWatermarkStore
+    layout: Layout, *, watermark: SqliteWatermarkStore,
+    paths: Optional[SinkPaths] = None,
 ) -> tuple[list[Pipeline], list[Refusal]]:
     """Build every entry of ``layout``; return (pipelines, every refused file).
 
@@ -524,7 +543,7 @@ def build_layout(
     builds whole or not at all (§3.2-§3.3).  The refusals returned include
     ``layout.refused``.
     """
-    build = _assemble(layout, watermark=watermark, strict=True)
+    build = _assemble(layout, watermark=watermark, strict=True, paths=paths)
     return build.pipelines, build.refused
 
 
@@ -698,7 +717,8 @@ class Rebuilder:
                                  note=self._once)
             build = _assemble(layout, watermark=self.watermark,
                               previous=previous, strict=strict,
-                              note=self._once)
+                              note=self._once,
+                              paths=SinkPaths(self.sdir, self.marker))
             running, store_refused = split_refused(
                 build.pipelines, self.watermark.refresh_schema_version(),
                 note=self._once)

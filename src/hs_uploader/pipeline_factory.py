@@ -77,7 +77,9 @@ def _identity(base: Mapping[str, Any], override: Optional[Mapping[str, Any]]) ->
 # ---- source builders --------------------------------------------------------
 
 
-def _build_source(spec: Mapping[str, Any], *, default_start_at: str = "now"):
+def _build_source(spec: Mapping[str, Any], *, default_start_at: str = "now",
+                  sinks_dir: Optional[Path] = None,
+                  marker: Optional[Path] = None):
     stype = str(spec.get("type", "")).strip().lower()
     if stype == "filetree":
         patterns = spec.get("patterns") or [spec.get("pattern", "*")]
@@ -126,6 +128,10 @@ def _build_source(spec: Mapping[str, Any], *, default_start_at: str = "now"):
             backstop_sec=float(spec.get("backstop_sec", 90.0)),
             include_psk=bool(spec.get("include_psk", False)),
             ship_buffer_sec=int(spec.get("ship_buffer_sec", 0)),
+            # The psk rider gate reads the daemon's sinks/ and marker
+            # (spec sink-2b-part2 §5); None reads the library's defaults.
+            sinks_dir=sinks_dir,
+            marker=marker,
         )
     raise ValueError(f"unknown source type: {stype!r}")
 
@@ -265,11 +271,18 @@ def build_entry(
     watermark: SqliteWatermarkStore,
     origin: str = "legacy",
     index: int = 0,
+    sinks_dir: Optional[Path] = None,
+    marker: Optional[Path] = None,
 ) -> Pipeline:
-    """Build one generic (``source`` + ``transport``) entry; raise on failure."""
+    """Build one generic (``source`` + ``transport``) entry; raise on failure.
+
+    ``sinks_dir`` and ``marker`` reach a ``wspr_cycle`` source's psk rider
+    gate; the daemon passes its own, ``None`` keeps the library's defaults.
+    """
     name = str(entry.get("name") or f"pipeline-{index}")
     source = _build_source(entry["source"],
-                           default_start_at=default_start_at(origin))
+                           default_start_at=default_start_at(origin),
+                           sinks_dir=sinks_dir, marker=marker)
     transport = wrap_if_discard(entry, _build_transport(entry["transport"]))
     identity = _identity(base_identity, entry.get("identity"))
     mrpp = entry.get("max_records_per_pump")
