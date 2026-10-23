@@ -54,7 +54,6 @@ from .gate import SinkGate  # noqa: F401  (re-export: spec §11.2 finds hs_uploa
 from .gate import exempt_rule
 from .transports.discard import wrap_if_discard
 from .wake import WakeListener
-from .watermark.base import Advance
 from .watermark.sqlite import SqliteWatermarkStore, default_path
 
 logger = logging.getLogger(__name__)
@@ -562,12 +561,6 @@ def split_refused(
 # ---- the starting record (spec sink-2b-part2 §3.5) ---------------------------
 
 
-def _only_over_empty(new: bytes, stored: bytes) -> bool:
-    """``advance_cursor``'s order for a starting record: it lies after an
-    empty record and after nothing else, so it never moves a stored one."""
-    return not stored
-
-
 def write_starting_records(pipelines, store) -> list[str]:
     """Give each governed pipeline whose source starts at now, and whose key
     holds no send record, a starting record at the source's present position
@@ -577,40 +570,42 @@ def write_starting_records(pipelines, store) -> list[str]:
     "Governed" means the gate's rules 1 and 2 do not exempt it
     (``gate.exempt_rule``).  "Starts at now" means the source offers
     ``initial_cursor()`` and it returns bytes.  The record is what the
-    source's first pump would anchor at, written through
-    ``store.advance_cursor`` with an order under which it lies after an
-    empty record only, so an existing record stays exactly as it was.
+    source's first pump would anchor at, written insert-only
+    (``store.start_cursor``): a key that holds any row, even one another
+    process wrote a moment ago, keeps its cursor and ``last_ack`` untouched.
 
     The caller decides when: the daemon runs this while the marker stands.
-    A pipeline whose source or store fails is skipped with a WARNING (the
-    exception type and text; the caller runs this at a build or when the
-    marker appears, never per pump), and the rest are still written.
+    Anything that fails for one pipeline (its key, the gate's rules, its
+    source or the store) skips that pipeline with a WARNING naming the
+    exception type and text, and the rest are still written; this never
+    raises.  The caller runs it at a build or when the marker appears,
+    never per pump.
     """
     written: list[str] = []
     for pipe in pipelines:
-        initial = getattr(pipe.source, "initial_cursor", None)
-        if not callable(initial) or exempt_rule(pipe):
-            continue
-        key = pipeline_key(pipe)
-        label = "|".join(key)
+        name = getattr(pipe, "name", "?")
         try:
+            initial = getattr(pipe.source, "initial_cursor", None)
+            if not callable(initial) or exempt_rule(pipe):
+                continue
+            key = pipeline_key(pipe)
             if store.get_cursor(*key):
                 continue
             cursor = initial()
             if not cursor:
                 continue
-            result = store.advance_cursor(
+            wrote = store.start_cursor(
                 *key, cursor=cursor,
-                last_ack=datetime.now(timezone.utc).isoformat(timespec="seconds"),
-                is_after=_only_over_empty)
+                last_ack=datetime.now(timezone.utc).isoformat(timespec="seconds"))
         except Exception as exc:  # noqa: BLE001 — one pipeline never stops the rest
-            logger.warning("daemon: no starting record for %s (%s): %s: %s",
-                           pipe.name, label, type(exc).__name__, exc)
+            logger.warning("daemon: no starting record for %s: %s: %s",
+                           name, type(exc).__name__, exc)
             continue
-        if result is Advance.WRITTEN:
+        if wrote:
+            label = "|".join(key)
             written.append(label)
             logger.info("daemon: starting record for %s (%s) at %r",
-                        pipe.name, label, cursor)
+                        name, label, cursor)
     return written
 
 

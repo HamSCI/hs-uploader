@@ -878,8 +878,9 @@ class SqliteSource:
 
         An anchor a pump already fixed (``_start_at_cursor``) wins, so the
         record is exactly what that pump would write.  Otherwise: the highest
-        ``id`` in scope now, or ``b"0"`` when the sink file or its queue
-        table does not exist yet, since every row then arrives later.
+        ``id`` in scope now, or ``b"0"`` when no sink file exists at the
+        configured path, or the file holds no queue table yet (sigmond's
+        installer creates an empty file), since every row then arrives later.
 
         Safe to call on any thread between pumps: it reads through a
         connection of its own and closes it, so it never touches the

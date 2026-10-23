@@ -308,6 +308,31 @@ class SqliteWatermarkStore:
             (source_id, dest_id, table, cursor, last_ack),
         )
 
+    def start_cursor(
+        self,
+        source_id: str,
+        dest_id: str,
+        table: str,
+        *,
+        cursor: bytes,
+        last_ack: str,
+    ) -> bool:
+        """Write a starting record only where the key holds no row at all
+        (spec sink-2b-part2 §3.5).  Return whether it wrote.
+
+        Insert-only: ``ON CONFLICT DO NOTHING``.  An existing row, its cursor
+        (readable or not, empty or not) and its ``last_ack`` stay exactly as
+        they were, even when another connection wrote the key a moment ago.
+        """
+        with self._lock, self._conn:
+            cur = self._conn.execute(
+                "INSERT INTO watermarks(source_id, dest_id, table_name, "
+                "cursor, last_ack) VALUES(?,?,?,?,?) "
+                "ON CONFLICT(source_id, dest_id, table_name) DO NOTHING",
+                (source_id, dest_id, table, cursor, last_ack),
+            )
+            return cur.rowcount == 1
+
     def advance_cursor(
         self,
         source_id: str,

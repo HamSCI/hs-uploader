@@ -239,12 +239,16 @@ explicit even when no third-party deps are required.
   stands, `Rebuilder` runs `daemon.write_starting_records` at each build,
   and `Rebuilder.marker_check()` runs it before the next pump when the marker
   appears.  Each governed pipeline (`gate.exempt_rule` returns 0) whose key
-  holds no record and whose source's `initial_cursor()` returns bytes gets
-  that cursor through `advance_cursor`, with an order that never moves a
-  stored record.  `initial_cursor()` is the anchor the first pump would fix
-  (or already fixed): `SqliteSource`, the highest in-scope id, `b"0"` with
-  no sink or queue yet, `None` without `start_at`; `WsprCycleSource`, the
-  cycle before the current floor, `None` for `"beginning"`.  So a pipeline
+  holds no row and whose source's `initial_cursor()` returns bytes gets
+  that cursor through `SqliteWatermarkStore.start_cursor`, an insert that
+  does nothing when the key holds a row, so an existing record and its
+  `last_ack` stay untouched.  `initial_cursor()` is the anchor the first
+  pump would fix (or already fixed): `SqliteSource`, the highest in-scope
+  id, `b"0"` when no sink file exists at the configured path or the file
+  holds no queue table yet (sigmond's installer creates an empty file),
+  `None` without `start_at` or with no sink path configured;
+  `WsprCycleSource`, the cycle before the current floor, `None` for
+  `"beginning"`.  So a pipeline
   held from its first pump ships its `fill` rows when raised.
 
 ## watermarks.db schema version (`hs-uploader migrate`)

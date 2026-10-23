@@ -191,6 +191,40 @@ def test_wspr_initial_cursor_equals_a_part1_pump_cursor(tmp_path, monkeypatch):
     assert WsprCycleSource(db_path=sink, start_at="beginning").initial_cursor() is None
 
 
+def test_wspr_initial_cursor_keeps_an_anchor_a_pump_already_fixed(
+        tmp_path, monkeypatch):
+    monkeypatch.setattr(wspr_cycle, "datetime", _Frozen)
+    sink, wm = tmp_path / "sink.db", tmp_path / "wm.db"
+    _make_sink(sink)
+    src = WsprCycleSource(db_path=sink, start_at="now")
+    p = _pipe(src, SqliteWatermarkStore(wm),
+              transport=_transport("wspr.spots", "wspr.noise"))
+    Uploader([p]).pump()                     # anchors at 12:02, ships nothing
+    assert _shipped(p.transport) == []
+
+    class Later(_Frozen):
+        FIXED = datetime(2026, 10, 23, 12, 9, 30, tzinfo=timezone.utc)
+
+    monkeypatch.setattr(wspr_cycle, "datetime", Later)
+    assert src.initial_cursor() == b"2026-10-23T12:02:00Z"
+    # Control: a source that never pumped anchors at the later clock.
+    assert (WsprCycleSource(db_path=sink, start_at="now").initial_cursor()
+            == b"2026-10-23T12:06:00Z")
+
+
+def test_sqlite_initial_cursor_on_an_empty_file_with_no_table(tmp_path):
+    # sigmond's install.sh creates sink.db as an empty file; the writer
+    # makes the table later.
+    sink = tmp_path / "sink.db"
+    sink.touch()
+    assert sink.stat().st_size == 0
+    assert _psk_source(sink).initial_cursor() == b"0"
+    assert _psk_source(sink, start_at=None).initial_cursor() is None
+    _make_sink(sink)                         # control: the table, then a row
+    _put(sink, 1)
+    assert _psk_source(sink).initial_cursor() == b"1"
+
+
 # ---- write_starting_records ----------------------------------------------------
 
 
@@ -244,7 +278,7 @@ def test_a_record_written_after_the_check_still_stays(tmp_path):
     store = Racing(wm)
     p = _pipe(_psk_source(sink), store)
     assert daemon.write_starting_records([p], store) == []
-    assert _raw(wm, _key(p))[0] == b"2"
+    assert _raw(wm, _key(p)) == (b"2", "other")   # cursor AND last_ack
     # Positive control: without the race the same call writes.
     q = _pipe(_psk_source(sink), SqliteWatermarkStore(tmp_path / "wm2.db"))
     assert daemon.write_starting_records([q], q.watermark) != []
@@ -290,6 +324,34 @@ def test_a_failing_source_is_skipped_and_the_rest_written(tmp_path, caplog):
     assert daemon.write_starting_records([bad, good], store) == [
         "|".join(_key(good))]
     assert "ZeroDivisionError" in caplog.text
+
+
+def test_a_pipeline_whose_key_or_rules_raise_is_skipped(tmp_path, caplog):
+    sink, wm = tmp_path / "sink.db", tmp_path / "wm.db"
+    _make_sink(sink)
+    _put(sink, 1)
+    store = SqliteWatermarkStore(wm)
+    badkey = _pipe(_psk_source(sink), store, name="badkey")
+    badkey.source.source_id = lambda: 1 / 0          # pipeline_key raises
+
+    class Exploding:
+        def __get__(self, obj, objtype=None):
+            raise KeyError("governed")
+
+        def __set__(self, obj, value):
+            pass
+
+    class BadRules(Pipeline):
+        governed = Exploding()                       # exempt_rule raises
+
+    badrules = BadRules.__new__(BadRules)
+    badrules.__dict__.update(_pipe(_psk_source(sink), store, name="badrules").__dict__)
+    badrules.transport.name = "mem-badrules"
+    good = _pipe(_psk_source(sink), store, name="good")
+    good.transport.name = "mem-good"
+    assert daemon.write_starting_records([badkey, badrules, good], store) == [
+        "|".join(_key(good))]
+    assert "ZeroDivisionError" in caplog.text and "KeyError" in caplog.text
 
 
 # ---- the daemon: the pass at each build, and when the marker appears ----------------
@@ -452,6 +514,46 @@ def test_a_rebuild_writes_the_record_for_a_pipeline_it_adds(station):
     r.rebuild(up)
     assert [p.name for p in up.pipelines] == ["psk"]
     assert store.get_cursor(*_key(up.pipelines[0])) == b"1"
+
+
+def test_fresh_station_empty_sink_file_walk(station):
+    # sigmond's installer leaves sink.db as an empty file with no table.
+    station.sink.unlink()
+    station.sink.touch()
+    station.switch("site", "upload")
+    station.switch(CLIENT, "off")
+    station.mark()
+    r, store = _rebuilder(station)
+    running, _b, _r = r.start()
+    assert store.get_cursor(*_key(running[0])) == b"0"
+    gate = SinkGate(r.sdir, station.marker)
+    up = Uploader(running, inline_single=False, gate=gate.may_send)
+    t = TRANSPORTS["psk"]
+    up.pump_until_idle()                     # off
+    station.switch(CLIENT, "fill")
+    _make_sink(station.sink)                 # the writer creates the table
+    for n in (1, 2, 3):
+        _put(station.sink, n)
+    up.pump_until_idle()
+    assert t.shipped == []                   # held under fill
+    station.switch(CLIENT, "upload")
+    up.pump_until_idle()
+    assert _shipped(t) == [1, 2, 3]
+
+
+def test_marker_check_logs_once_over_100_pumps(station, caplog):
+    r, store = _rebuilder(station)
+    running, _b, _r = r.start()              # no marker: no pass yet
+    running[0].source.initial_cursor = lambda: 1 / 0
+    station.mark()
+    caplog.set_level("INFO", logger="hs_uploader.daemon")
+    for _ in range(100):
+        r.marker_check()
+    appeared = [x for x in caplog.records if "appeared" in x.getMessage()]
+    warned = [x for x in caplog.records
+              if x.levelname == "WARNING" and "starting record" in x.getMessage()]
+    assert len(appeared) == 1
+    assert len(warned) == 1
 
 
 @pytest.fixture
