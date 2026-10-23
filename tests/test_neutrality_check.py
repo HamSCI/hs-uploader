@@ -191,6 +191,17 @@ def _section(out: str, name: str) -> str:
     return "\n".join(lines[start:start + 5])
 
 
+def _final(out: str) -> str:
+    """The RESULT line."""
+    return out.rstrip().splitlines()[-1]
+
+
+def _untallied(out: str) -> str:
+    """The RESULT line without its verdict counts, so a check on the reason
+    reads the reason alone."""
+    return re.sub(r"\(\d+ AGREE, \d+ HELD, \d+ DISAGREE(; )?", "(", _final(out))
+
+
 def _changed_tree(tmp_path: Path, module: str, old: str, new: str,
                   name: str = "new-src") -> Path:
     """A copy of this tree with one line of one module changed."""
@@ -230,8 +241,8 @@ def test_one_tree_against_itself_agrees(tmp_path, capsys):
     assert beat.startswith("heartbeat: AGREE")
     assert "1 record, cursor (empty) -> <delete-on-ack>" in beat
 
-    assert "4 pipelines: 4 agree, 0 disagree" in out
-    assert out.rstrip().endswith("RESULT: AGREE")
+    assert "4 pipelines: 4 agree, 0 held, 0 disagree" in out
+    assert _final(out).startswith("RESULT: PASS (")
 
 
 def test_it_writes_nothing_it_was_given(tmp_path, capsys):
@@ -272,8 +283,8 @@ def test_a_changed_source_id_disagrees(tmp_path, capsys):
     # WsprCycleSource and the heartbeat form their keys elsewhere.
     assert _section(out, "wspr-wsprdaemon").startswith("wspr-wsprdaemon: AGREE")
     assert _section(out, "heartbeat").startswith("heartbeat: AGREE")
-    assert "4 pipelines: 2 agree, 2 disagree" in out
-    assert out.rstrip().endswith("RESULT: DISAGREE")
+    assert "4 pipelines: 2 agree, 0 held, 2 disagree" in out
+    assert _final(out).startswith("RESULT: DISAGREE (")
 
 
 def test_a_changed_row_selection_disagrees_under_the_same_key(tmp_path, capsys):
@@ -391,7 +402,7 @@ def test_a_text_cursor_shows_the_same_error_in_both_trees(tmp_path, capsys):
     assert "  OLD next error TypeError: " in psk
     assert ("An error stopped these pipelines, so the check shows nothing of "
             "what they send: psk-pskreporter") in out
-    assert out.rstrip().endswith(
+    assert _untallied(out).endswith(
         "RESULT: INCONCLUSIVE (1 raised an error; see above)")
 
 
@@ -516,7 +527,7 @@ def test_a_batch_that_differs_alone_disagrees(tmp_path, capsys, old, new):
     # The cycle source and the heartbeat build their batches elsewhere.
     assert _section(out, "wspr-wsprdaemon").startswith("wspr-wsprdaemon: AGREE")
     assert _section(out, "heartbeat").startswith("heartbeat: AGREE")
-    assert out.rstrip().endswith("RESULT: DISAGREE")
+    assert _final(out).startswith("RESULT: DISAGREE (")
     assert "psk-pskreporter: OLD and NEW differ in: batch" in err
 
 
@@ -632,7 +643,7 @@ def test_an_error_in_one_tree_only_disagrees(tmp_path, capsys):
     assert psk.startswith("psk-pskreporter: DISAGREE")
     assert "  OLD next 3 records, rows 2..4" in psk
     assert "  NEW next error RuntimeError: boom" in psk
-    assert out.rstrip().endswith("RESULT: DISAGREE (2 raised an error; see above)")
+    assert _untallied(out).endswith("RESULT: DISAGREE (2 raised an error; see above)")
 
 
 def test_a_changed_batch_cap_disagrees_though_the_backlog_is_small(tmp_path, capsys):
@@ -665,8 +676,8 @@ def test_a_manifest_without_pipelines_is_inconclusive(tmp_path, capsys):
         tmp_path, '[identity]\ncall = "AC0G/T"\n')
     code, out, _ = _run(capsys, manifest, sink, watermarks)
     assert code == 1
-    assert "0 pipelines: 0 agree, 0 disagree" in out
-    assert out.rstrip().endswith("RESULT: INCONCLUSIVE (no pipeline was compared)")
+    assert "0 pipelines: 0 agree, 0 held, 0 disagree" in out
+    assert _untallied(out).endswith("RESULT: INCONCLUSIVE (no pipeline was compared)")
 
 
 def test_a_pipeline_neither_tree_built_is_inconclusive(tmp_path, capsys):
@@ -675,8 +686,8 @@ def test_a_pipeline_neither_tree_built_is_inconclusive(tmp_path, capsys):
     assert code == 1
     assert "OLD built no pipeline for: client-built" in out
     assert "NEW built no pipeline for: client-built" in out
-    assert "4 pipelines: 4 agree, 0 disagree" in out
-    assert out.rstrip().endswith("RESULT: INCONCLUSIVE (1 not built; see above)")
+    assert "4 pipelines: 4 agree, 0 held, 0 disagree" in out
+    assert _untallied(out).endswith("RESULT: INCONCLUSIVE (1 not built; see above)")
 
 
 def test_a_tree_that_builds_one_pipeline_fewer_disagrees(tmp_path, capsys):
@@ -692,7 +703,7 @@ def test_a_tree_that_builds_one_pipeline_fewer_disagrees(tmp_path, capsys):
     assert code == 1
     assert _section(out, "heartbeat").startswith("heartbeat: DISAGREE")
     assert "  NEW key  (not built)" in _section(out, "heartbeat")
-    assert out.rstrip().endswith("RESULT: DISAGREE")
+    assert _final(out).startswith("RESULT: DISAGREE (")
 
 
 def test_two_pipelines_with_one_name_both_appear(tmp_path, capsys):
@@ -714,7 +725,7 @@ host = "hb2.example.org"
     assert code == 0
     assert _section(out, "heartbeat#2").startswith("heartbeat#2: AGREE")
     assert "heartbeat-sftp:hb2.example.org" in _section(out, "heartbeat#2")
-    assert "5 pipelines: 5 agree, 0 disagree" in out
+    assert "5 pipelines: 5 agree, 0 held, 0 disagree" in out
 
 
 def test_a_manifest_that_builds_nowhere_stops_the_check(tmp_path, capsys):
@@ -754,7 +765,7 @@ def test_a_clock_that_cannot_freeze_is_an_error_not_a_skip(tmp_path, capsys):
     for tree_label in ("OLD", "NEW"):
         assert (f"  {tree_label} next error RuntimeError: cannot freeze the "
                 "clock of hs_uploader.sources.wspr_completion") in out
-    assert out.rstrip().endswith(
+    assert _untallied(out).endswith(
         "RESULT: INCONCLUSIVE (4 raised an error; see above)")
 
 
@@ -1010,7 +1021,7 @@ def test_the_report_names_a_pipeline_that_only_new_built(capsys):
     out = capsys.readouterr().out
     assert "b: DISAGREE" in out
     assert "  OLD key  (not built)" in out
-    assert out.rstrip().endswith("RESULT: DISAGREE")
+    assert _final(out).startswith("RESULT: DISAGREE (")
 
 
 def test_the_report_counts_an_error_in_one_tree_only(capsys):
@@ -1019,7 +1030,7 @@ def test_the_report_counts_an_error_in_one_tree_only(capsys):
     assert nc._report(old, new) == 1
     out = capsys.readouterr().out
     assert "a: DISAGREE" in out
-    assert out.rstrip().endswith("RESULT: DISAGREE (1 raised an error; see above)")
+    assert _untallied(out).endswith("RESULT: DISAGREE (1 raised an error; see above)")
 
 
 def test_the_report_calls_different_unbuilt_lists_a_disagreement(capsys):
@@ -1028,7 +1039,7 @@ def test_the_report_calls_different_unbuilt_lists_a_disagreement(capsys):
     assert nc._report(old, new) == 1
     out = capsys.readouterr().out
     assert "OLD built no pipeline for: x" in out
-    assert out.rstrip().endswith("RESULT: DISAGREE")
+    assert _final(out).startswith("RESULT: DISAGREE (")
 
 
 def test_the_report_gives_every_reason_for_an_inconclusive_result(capsys):
@@ -1036,14 +1047,14 @@ def test_the_report_gives_every_reason_for_an_inconclusive_result(capsys):
     new = _result({"a": _entry(error="E: x")}, unbuilt=["x"])
     assert nc._report(old, new) == 1
     out = capsys.readouterr().out
-    assert out.rstrip().endswith(
+    assert _untallied(out).endswith(
         "RESULT: INCONCLUSIVE (1 not built; see above; 1 raised an error; see above)")
 
 
 def test_the_report_agrees_only_when_nothing_is_in_doubt(capsys):
     both = {"a": _entry(), "b": _entry()}
     assert nc._report(_result(both), _result(dict(both))) == 0
-    assert capsys.readouterr().out.rstrip().endswith("RESULT: AGREE")
+    assert _final(capsys.readouterr().out).startswith("RESULT: PASS (")
 
 
 # ---- sink control step 2b: the tool reads pipelines.d (spec §8.3, test 22) ----
@@ -1095,8 +1106,8 @@ def test_the_same_pipelines_from_pipelines_d_agree(tmp_path, capsys):
     manifest, legacy, pdir, sink, watermarks = _split_station(tmp_path)
     assert nc.main(_split_args(manifest, legacy, pdir, sink, watermarks)) == 0
     out = capsys.readouterr().out
-    assert "4 pipelines: 4 agree, 0 disagree" in out
-    assert out.rstrip().endswith("RESULT: AGREE")
+    assert "4 pipelines: 4 agree, 0 held, 0 disagree" in out
+    assert _final(out).startswith("RESULT: PASS (")
 
 
 def test_a_planted_difference_in_pipelines_d_disagrees(tmp_path, capsys):
@@ -1108,14 +1119,14 @@ def test_a_planted_difference_in_pipelines_d_disagrees(tmp_path, capsys):
     out = capsys.readouterr().out
     assert code == 1
     assert _section(out, "psk-pskreporter").startswith("psk-pskreporter: DISAGREE")
-    assert out.rstrip().endswith("RESULT: DISAGREE")
+    assert _final(out).startswith("RESULT: DISAGREE (")
 
 
 def test_a_stale_legacy_copy_loses_to_the_file(tmp_path, capsys):
     manifest, legacy, pdir, sink, watermarks = _split_station(
         tmp_path, legacy_limit=2)
     assert nc.main(_split_args(manifest, legacy, pdir, sink, watermarks)) == 0
-    assert capsys.readouterr().out.rstrip().endswith("RESULT: AGREE")
+    assert _final(capsys.readouterr().out).startswith("RESULT: PASS (")
 
 
 def test_a_refused_file_never_ends_agree_and_the_report_lists_it(tmp_path, capsys):
@@ -1127,8 +1138,8 @@ def test_a_refused_file_never_ends_agree_and_the_report_lists_it(tmp_path, capsy
     assert code == 1
     assert "NEW refused pipelines.d/broken.toml" in out
     assert "NEW refused pipelines.d/Bad_Name.toml" in out
-    assert "RESULT: AGREE" not in out
-    assert out.rstrip().endswith("RESULT: INCONCLUSIVE (2 refused files; see above)")
+    assert "RESULT: PASS" not in out
+    assert _untallied(out).endswith("RESULT: INCONCLUSIVE (2 refused files; see above)")
 
 
 def test_the_default_for_each_side_is_manifest_and_no_directory(tmp_path, capsys):
@@ -1136,7 +1147,7 @@ def test_the_default_for_each_side_is_manifest_and_no_directory(tmp_path, capsys
     # A directory beside the given manifest is not read unless a flag names it.
     code, out, _ = _run(capsys, legacy, sink, watermarks)
     assert code == 0
-    assert out.rstrip().endswith("RESULT: AGREE")
+    assert _final(out).startswith("RESULT: PASS (")
 
 
 def test_the_given_pipelines_d_is_left_alone(tmp_path, capsys):
@@ -1163,7 +1174,7 @@ def test_the_report_lists_refused_files_and_never_agrees_beside_one(capsys):
     assert nc._report(old, new) == 1
     out = capsys.readouterr().out
     assert "NEW refused pipelines.d/x.toml: no good" in out
-    assert out.rstrip().endswith("RESULT: INCONCLUSIVE (1 refused file; see above)")
+    assert _untallied(out).endswith("RESULT: INCONCLUSIVE (1 refused file; see above)")
 
 
 # ---- fix round 1 -------------------------------------------------------------
@@ -1194,8 +1205,8 @@ def test_a_tree_without_a_loader_never_agrees_on_a_directory_it_was_given(
     out = capsys.readouterr().out
     assert code == 1
     assert "NEW refused pipelines.d/(directory): this tree has no pipelines.d loader" in out
-    assert "RESULT: AGREE" not in out
-    assert "INCONCLUSIVE (1 refused file; see above)" in out
+    assert "RESULT: PASS" not in out
+    assert _untallied(out).endswith("INCONCLUSIVE (1 refused file; see above)")
 
 
 def test_a_refused_file_beside_a_real_difference_is_a_disagreement(tmp_path, capsys):
@@ -1206,7 +1217,7 @@ def test_a_refused_file_beside_a_real_difference_is_a_disagreement(tmp_path, cap
     out = capsys.readouterr().out
     assert code == 1
     assert "NEW refused pipelines.d/broken.toml" in out
-    assert out.rstrip().endswith("RESULT: DISAGREE")
+    assert _final(out).startswith("RESULT: DISAGREE (")
 
 
 def test_a_refusal_on_the_old_side_alone_is_not_agree(tmp_path, capsys):
@@ -1221,4 +1232,553 @@ def test_a_refusal_on_the_old_side_alone_is_not_agree(tmp_path, capsys):
     assert code == 1
     assert "OLD refused pipelines.d/broken.toml" in out
     assert "NEW refused" not in out
-    assert out.rstrip().endswith("RESULT: INCONCLUSIVE (1 refused file; see above)")
+    assert _untallied(out).endswith("RESULT: INCONCLUSIVE (1 refused file; see above)")
+
+
+# ---- sink-2b part 2: --sinks, --marker, HELD (spec §11.2, Ruling 15) ---------
+#
+# The legacy manifest as a part 1 render leaves it: each entry names its
+# client, and the heartbeat names sigmond (gate rule 2).
+
+GATED = (MANIFEST
+         .replace('name = "psk-pskreporter"\n',
+                  'name = "psk-pskreporter"\nclient = "psk-recorder"\n')
+         .replace('name = "wspr-wsprdaemon"\n',
+                  'name = "wspr-wsprdaemon"\nclient = "wspr-recorder"\n')
+         .replace('name = "wspr-wsprnet"\n',
+                  'name = "wspr-wsprnet"\nclient = "wspr-recorder"\n')
+         .replace('name = "heartbeat"\n',
+                  'name = "heartbeat"\nclient = "sigmond"\n'))
+assert GATED.count("client = ") == 4
+
+CLIENTS = ("psk-recorder", "wspr-recorder", "meteor-scatter")
+
+
+def _switches(tmp_path: Path, *, site="upload", **states) -> Path:
+    """A sinks/ directory: site.toml and one file per governed client, each
+    at upload unless named.  None leaves a file out."""
+    sinks = tmp_path / "sinks"
+    sinks.mkdir()
+    wanted = {c: "upload" for c in CLIENTS}
+    wanted.update({k.replace("_", "-"): v for k, v in states.items()})
+    wanted["site"] = site
+    for client, state in wanted.items():
+        if state is not None:
+            (sinks / f"{client}.toml").write_text(
+                f'state = "{state}"\nset_at = "2026-10-23T00:00:00Z"\n')
+    return sinks
+
+
+def _marker(tmp_path: Path) -> Path:
+    marker = tmp_path / "carry-over-v1.done"
+    marker.write_text("carried over\n")
+    return marker
+
+
+def _gated(capsys, tmp_path, *, sinks=None, marker=None, new=SRC, old=SRC,
+           manifest_text=GATED, extra=()):
+    manifest, sink, watermarks, _ = _station(tmp_path, manifest_text)
+    args = _args(manifest, sink, watermarks, old=old, new=new)
+    if sinks is not None:
+        args += ["--sinks", str(sinks)]
+    if marker is not None:
+        args += ["--marker", str(marker)]
+    code = nc.main([*args, *extra])
+    captured = capsys.readouterr()
+    return code, captured.out, captured.err
+
+
+def test_every_switch_at_upload_with_the_marker_agrees(tmp_path, capsys):
+    code, out, _ = _gated(capsys, tmp_path, sinks=_switches(tmp_path),
+                          marker=_marker(tmp_path))
+    assert code == 0
+    for name in ("psk-pskreporter", "wspr-wsprdaemon", "wspr-wsprnet", "heartbeat"):
+        assert _section(out, name).startswith(f"{name}: AGREE"), out
+    assert "4 pipelines: 4 agree, 0 held, 0 disagree" in out
+    assert _final(out) == "RESULT: PASS (4 AGREE, 0 HELD, 0 DISAGREE)"
+    assert "NEW wrote no starting record" in out
+
+
+@pytest.mark.parametrize("state", ["fill", "off"])
+def test_one_client_held_holds_its_pipelines_alone(tmp_path, capsys, state):
+    code, out, _ = _gated(capsys, tmp_path,
+                          sinks=_switches(tmp_path, wspr_recorder=state),
+                          marker=_marker(tmp_path))
+    assert code == 0, out
+    for name in ("wspr-wsprdaemon", "wspr-wsprnet"):
+        sec = _section(out, name)
+        assert sec.startswith(f"{name}: HELD (wspr-recorder reads {state})"), sec
+        assert "  NEW key  (not read: held)" in sec
+        assert "  NEW next held: no batch, no retry popped, no record written" in sec
+    for name in ("psk-pskreporter", "heartbeat"):
+        assert _section(out, name).startswith(f"{name}: AGREE"), out
+    assert _final(out) == "RESULT: PASS (2 AGREE, 2 HELD, 0 DISAGREE)"
+
+
+def test_psk_recorder_held_leaves_its_rows_out_of_the_tar(tmp_path, capsys):
+    code, out, _ = _gated(capsys, tmp_path,
+                          sinks=_switches(tmp_path, psk_recorder="fill"),
+                          marker=_marker(tmp_path))
+    assert code == 0, out
+    assert _section(out, "psk-pskreporter").startswith(
+        "psk-pskreporter: HELD (psk-recorder reads fill)")
+    cycle = _section(out, "wspr-wsprdaemon")
+    # OLD ships both psk rows of the 12:02 cycle (FT4, FT8: psk-recorder's);
+    # NEW leaves them out, and the tool expected exactly that.
+    assert cycle.startswith(
+        "wspr-wsprdaemon: AGREE (2 psk rows left out, as expected)"), cycle
+    assert "  OLD next 5 records," in cycle
+    assert "  NEW next 3 records," in cycle
+    assert _final(out) == "RESULT: PASS (3 AGREE, 1 HELD, 0 DISAGREE)"
+
+
+def test_meteor_scatter_held_leaves_only_its_rows_out(tmp_path, capsys):
+    manifest_text = GATED
+    tmp = tmp_path
+    manifest, sink, watermarks, _ = _station(tmp, manifest_text)
+    # An MSK144 row in the 12:02 cycle, stored by a writer that named no
+    # producer: the tool's own D12 rule gives it to meteor-scatter.
+    _add_sink_row(sink, "psk", "spots",
+                  {"time": "2026-10-07T12:03:00Z", "mode": " MSK144 ",
+                   "tx_call": "K6FGH", "forward_to_pskreporter": 1},
+                  "2026-10-07T12:03:00Z")
+    args = _args(manifest, sink, watermarks) + [
+        "--sinks", str(_switches(tmp, meteor_scatter="off")),
+        "--marker", str(_marker(tmp))]
+    code = nc.main(args)
+    out = capsys.readouterr().out
+    assert code == 0, out
+    cycle = _section(out, "wspr-wsprdaemon")
+    assert cycle.startswith(
+        "wspr-wsprdaemon: AGREE (1 psk row left out, as expected)"), cycle
+    assert "  OLD next 6 records," in cycle
+    assert "  NEW next 5 records," in cycle
+
+
+def test_no_marker_holds_nothing_whatever_the_switches_say(tmp_path, capsys):
+    # Rule 3: before the carry-over the legacy render's policy governs, and
+    # it reads the same on both sides.
+    code, out, _ = _gated(capsys, tmp_path,
+                          sinks=_switches(tmp_path, site="off"))
+    assert code == 0, out
+    assert _final(out) == "RESULT: PASS (4 AGREE, 0 HELD, 0 DISAGREE)"
+    assert "  NEW next 5 records," in _section(out, "wspr-wsprdaemon")
+
+
+def test_a_pipeline_that_names_no_client_is_never_held(tmp_path, capsys):
+    # Rule 4: a v3.69-v3.72 render names no client.
+    code, out, _ = _gated(capsys, tmp_path, manifest_text=MANIFEST,
+                          sinks=_switches(tmp_path, site="off"),
+                          marker=_marker(tmp_path))
+    assert code == 0, out
+    assert _final(out) == "RESULT: PASS (4 AGREE, 0 HELD, 0 DISAGREE)"
+
+
+@pytest.mark.parametrize("case", ["no-sinks", "broken-site", "bad-state",
+                                  "missing-client"])
+def test_the_switches_fail_closed(tmp_path, capsys, case):
+    sinks = None
+    if case == "broken-site":
+        sinks = _switches(tmp_path)
+        (sinks / "site.toml").write_text("state = [not toml")
+    elif case == "bad-state":
+        sinks = _switches(tmp_path, site="paused")
+    elif case == "missing-client":
+        sinks = _switches(tmp_path, wspr_recorder=None)
+    code, out, _ = _gated(capsys, tmp_path, sinks=sinks,
+                          marker=_marker(tmp_path))
+    assert code == 0, out
+    held = ["wspr-wsprdaemon", "wspr-wsprnet"]
+    if case != "missing-client":
+        held.append("psk-pskreporter")
+    for name in held:
+        assert _section(out, name).startswith(f"{name}: HELD ("), out
+    assert _section(out, "heartbeat").startswith("heartbeat: AGREE")
+    assert _final(out) == (f"RESULT: PASS ({4 - len(held)} AGREE, "
+                           f"{len(held)} HELD, 0 DISAGREE)")
+
+
+SIGMOND_FILE = """\
+[[pipeline]]
+name = "heartbeat"
+governed = false
+[pipeline.source]
+type = "filetree"
+root = "{heartbeat}"
+patterns = ["*.json"]
+table = "station.heartbeat"
+retention = "delete_on_ack"
+[pipeline.transport]
+type = "heartbeat_sftp"
+host = "hb.example.org"
+"""
+
+
+def test_only_sigmond_toml_may_say_governed_false(tmp_path, capsys):
+    """The heartbeat from pipelines.d/sigmond.toml sends with the site off
+    (rule 1).  A client file that says governed = false is held anyway
+    (Ruling 2)."""
+    manifest, sink, watermarks, _ = _station(tmp_path, GATED)
+    split = tmp_path / "split"
+    pdir = split / "pipelines.d"
+    pdir.mkdir(parents=True)
+    legacy = split / "pipelines.toml"
+    # The legacy heartbeat leaves the manifest when sigmond.toml carries it.
+    legacy.write_text(GATED.split("[[pipeline]]\nname = \"heartbeat\"")[0])
+    (pdir / "sigmond.toml").write_text(
+        SIGMOND_FILE.format(heartbeat=tmp_path / "heartbeat"))
+    (pdir / "psk-recorder.toml").write_text(
+        PSK_FILE.format(limit=500).replace(
+            'batch_limit = 500\n', 'batch_limit = 500\ngoverned = false\n'))
+    args = ["--old-manifest", str(manifest), "--new-manifest", str(legacy),
+            "--new-pipelines-d", str(pdir), "--sink", str(sink),
+            "--watermarks", str(watermarks), "--old", str(SRC),
+            "--new", str(SRC), "--now", NOW,
+            "--sinks", str(_switches(tmp_path, site="off")),
+            "--marker", str(_marker(tmp_path))]
+    code = nc.main(args)
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert _section(out, "heartbeat").startswith("heartbeat: AGREE")
+    assert _section(out, "psk-pskreporter").startswith(
+        "psk-pskreporter: HELD (psk-recorder reads off)")
+    assert _final(out) == "RESULT: PASS (1 AGREE, 3 HELD, 0 DISAGREE)"
+
+
+# The trees that must fail.  Each NEW tree breaks one thing the switches
+# rely on, and the tool must end DISAGREE (spec §11.3 run 7).
+
+def test_a_gate_that_holds_what_the_switches_allow_disagrees(tmp_path, capsys):
+    tree = _changed_tree(tmp_path, "gate.py",
+                         'return Decision(True, 5, "sink uploading")',
+                         'return Decision(False, 5, "sink uploading")')
+    code, out, err = _gated(capsys, tmp_path, sinks=_switches(tmp_path),
+                            marker=_marker(tmp_path), new=tree)
+    assert code == 1
+    for name in ("psk-pskreporter", "wspr-wsprdaemon", "wspr-wsprnet"):
+        sec = _section(out, name)
+        assert sec.startswith(
+            f"{name}: DISAGREE (NEW held it; the switches let it send)"), sec
+    assert _section(out, "heartbeat").startswith("heartbeat: AGREE")
+    assert _final(out) == "RESULT: DISAGREE (1 AGREE, 0 HELD, 3 DISAGREE)"
+    assert "HELD" not in _final(out).split("(")[0]
+
+
+def test_a_tree_without_the_gate_disagrees_when_a_client_fills(tmp_path, capsys):
+    tree = _changed_tree(tmp_path, "core.py",
+                         "if self._gate is None:", "if True:")
+    code, out, _ = _gated(capsys, tmp_path,
+                          sinks=_switches(tmp_path, wspr_recorder="fill"),
+                          marker=_marker(tmp_path), new=tree)
+    assert code == 1
+    for name in ("wspr-wsprdaemon", "wspr-wsprnet"):
+        sec = _section(out, name)
+        assert sec.startswith(
+            f"{name}: DISAGREE (the switches hold it: wspr-recorder reads "
+            f"fill; NEW read its send record, produced a batch, asked for a "
+            f"retry)"), sec
+    assert _final(out) == "RESULT: DISAGREE (2 AGREE, 0 HELD, 2 DISAGREE)"
+
+
+def test_a_tree_without_the_rider_gate_disagrees(tmp_path, capsys):
+    tree = _changed_tree(tmp_path, "sources/wspr_cycle.py",
+                         'rides = verdict[producer] = state in (None, "upload")',
+                         'rides = verdict[producer] = True')
+    code, out, err = _gated(capsys, tmp_path,
+                            sinks=_switches(tmp_path, psk_recorder="fill"),
+                            marker=_marker(tmp_path), new=tree)
+    assert code == 1
+    assert _section(out, "psk-pskreporter").startswith("psk-pskreporter: HELD")
+    cycle = _section(out, "wspr-wsprdaemon")
+    assert cycle.startswith(
+        "wspr-wsprdaemon: DISAGREE (expected 2 psk rows left out)"), cycle
+    assert "  NEW next 5 records," in cycle
+    assert "wspr-wsprdaemon: OLD and NEW differ in: batch" in err
+    assert _final(out) == "RESULT: DISAGREE (2 AGREE, 1 HELD, 1 DISAGREE)"
+
+
+def test_a_tree_that_misreads_the_switches_is_caught_by_the_tools_own_reader(
+        tmp_path, capsys):
+    """Ruling 15: the library reads fill as upload, and the tool, which
+    never asks the library, still expects the hold."""
+    tree = _changed_tree(
+        tmp_path, "sinkswitch.py",
+        "state = STATES[min(STATES.index(c.state), STATES.index(s.state))]",
+        "state = STATES[max(STATES.index(c.state), STATES.index(s.state))]")
+    code, out, _ = _gated(capsys, tmp_path,
+                          sinks=_switches(tmp_path, psk_recorder="fill"),
+                          marker=_marker(tmp_path), new=tree)
+    assert code == 1
+    assert _section(out, "psk-pskreporter").startswith(
+        "psk-pskreporter: DISAGREE (the switches hold it: psk-recorder reads fill")
+    assert _section(out, "wspr-wsprdaemon").startswith(
+        "wspr-wsprdaemon: DISAGREE (expected 2 psk rows left out)")
+    assert _final(out).startswith("RESULT: DISAGREE")
+
+
+def test_the_tool_never_imports_the_switch_library():
+    """Ruling 15, statically: no import of the switch reader or the writer's
+    D12 rule, and no call of either.  (The mutation in the commit body
+    shows the runtime side.)"""
+    text = (ROOT / "tools" / "neutrality_check.py").read_text()
+    for word in ("sinkswitch", "infer_producer", "effective_state(",
+                 "hs_uploader.sink"):
+        assert word not in text, word
+
+
+def _part1_tree(tmp_path: Path) -> Path:
+    """hs-uploader 29a0806, part 1: pipelines.d, switch files, no gate."""
+    import subprocess
+    tree = tmp_path / "part1"
+    tree.mkdir()
+    git = subprocess.run(
+        f"git -C {ROOT} archive 29a0806 src | tar -x -C {tree}",
+        shell=True, capture_output=True)
+    if git.returncode != 0 or not (tree / "src" / "hs_uploader").is_dir():
+        pytest.skip("commit 29a0806 is not in this checkout")
+    assert not (tree / "src" / "hs_uploader" / "gate.py").exists()
+    return tree / "src"
+
+
+def test_a_tree_without_a_sink_gate_runs_as_before(tmp_path, capsys):
+    part1 = _part1_tree(tmp_path)
+    code, out, _ = _gated(capsys, tmp_path, old=part1, new=part1)
+    assert code == 0, out
+    assert _final(out) == "RESULT: PASS (4 AGREE, 0 HELD, 0 DISAGREE)"
+    assert "  NEW next 5 records," in _section(out, "wspr-wsprdaemon")
+
+
+def test_part1_against_part2_at_upload_with_the_marker_passes(tmp_path, capsys):
+    """Spec §11.3 run 3, in small: OLD part 1, NEW this tree."""
+    part1 = _part1_tree(tmp_path)
+    code, out, _ = _gated(capsys, tmp_path, old=part1,
+                          sinks=_switches(tmp_path), marker=_marker(tmp_path))
+    assert code == 0, out
+    assert _final(out) == "RESULT: PASS (4 AGREE, 0 HELD, 0 DISAGREE)"
+
+
+def test_part1_against_part2_with_psk_held(tmp_path, capsys):
+    part1 = _part1_tree(tmp_path)
+    code, out, _ = _gated(capsys, tmp_path, old=part1,
+                          sinks=_switches(tmp_path, psk_recorder="off"),
+                          marker=_marker(tmp_path))
+    assert code == 0, out
+    assert _section(out, "wspr-wsprdaemon").startswith(
+        "wspr-wsprdaemon: AGREE (2 psk rows left out, as expected)")
+    assert _final(out) == "RESULT: PASS (3 AGREE, 1 HELD, 0 DISAGREE)"
+
+
+def test_a_starting_record_is_reported_and_a_held_pump_writes_nothing(
+        tmp_path, capsys):
+    """X9: the tool runs NEW's starting-record pass while the marker stands
+    and names each key it wrote; the held pump itself writes nothing."""
+    manifest, sink, watermarks, _ = _station(tmp_path, GATED)
+    watermarks.chmod(0o644)
+    conn = sqlite3.connect(watermarks)
+    conn.execute("DELETE FROM watermarks WHERE source_id = ?", (PSK_KEY[0],))
+    conn.commit()
+    conn.close()
+    watermarks.chmod(0o444)
+    args = _args(manifest, sink, watermarks) + [
+        "--sinks", str(_switches(tmp_path, psk_recorder="fill")),
+        "--marker", str(_marker(tmp_path))]
+    code = nc.main(args)
+    out = capsys.readouterr().out
+    assert "NEW wrote starting records: " + "|".join(PSK_KEY) in out
+    assert _section(out, "psk-pskreporter").startswith(
+        "psk-pskreporter: HELD (psk-recorder reads fill)")
+    assert code == 0, out
+
+
+def test_the_given_sinks_and_marker_are_left_alone(tmp_path, capsys):
+    sinks = _switches(tmp_path, psk_recorder="fill")
+    marker = _marker(tmp_path)
+    before = {p.name: p.read_bytes() for p in sinks.iterdir()}
+    _gated(capsys, tmp_path, sinks=sinks, marker=marker)
+    assert {p.name: p.read_bytes() for p in sinks.iterdir()} == before
+    assert marker.read_text() == "carried over\n"
+
+
+def test_sinks_that_is_no_directory_is_a_usage_error(tmp_path, capsys):
+    with pytest.raises(SystemExit) as exc:
+        _gated(capsys, tmp_path, sinks=tmp_path / "nowhere")
+    assert exc.value.code == 2
+    assert "--sinks" in capsys.readouterr().err
+
+
+# ---- the tool's own reader (Ruling 15) and its own D12 rule ------------------
+
+
+def _write(d: Path, name: str, text: str) -> None:
+    (d / name).write_text(text)
+
+
+@pytest.mark.parametrize("client_text,site_text,want", [
+    ('state = "upload"', None, "upload"),            # no site file: no limit
+    ('state = "fill"', None, "fill"),
+    (None, 'state = "upload"', "off"),               # no client file: off
+    ('state = "upload"', 'state = "fill"', "fill"),  # stricter of the two
+    ('state = "fill"', 'state = "upload"', "fill"),
+    ('state = "upload"', 'state = "off"', "off"),
+    ('state = "off"', 'state = "upload"', "off"),
+    ('state = "upload"', 'state = "upload"', "upload"),
+    ('state = [broken', 'state = "upload"', "off"),  # parse error: off
+    ('state = "upload"', 'state = [broken', "off"),
+    ('state = "paused"', 'state = "upload"', "off"),  # bad state: off
+    ('state = "upload"', 'state = "paused"', "off"),
+    ('nothing = 1', None, "off"),
+    ('state = "upload"', 'nothing = 1', "off"),
+    (b'\xff\xfe', None, "off"),                       # not UTF-8: off
+])
+def test_the_tools_reader(tmp_path, client_text, site_text, want):
+    for name, text in (("psk-recorder.toml", client_text),
+                       ("site.toml", site_text)):
+        if isinstance(text, bytes):
+            (tmp_path / name).write_bytes(text)
+        elif text is not None:
+            _write(tmp_path, name, text)
+    assert nc._own_effective("psk-recorder", tmp_path) == want
+
+
+def test_the_tools_reader_fails_closed_on_names_and_files(tmp_path):
+    _write(tmp_path, "site.toml", 'state = "upload"')
+    for bad in ("", "site", "Psk", "../x", "-x", "a b"):
+        assert nc._own_effective(bad, tmp_path) == "off"
+    # No sinks/ at all, and a switch file that is a directory.
+    assert nc._own_effective("psk-recorder", None) == "off"
+    assert nc._own_effective("psk-recorder", tmp_path / "nowhere") == "off"
+    (tmp_path / "psk-recorder.toml").mkdir()
+    assert nc._own_effective("psk-recorder", tmp_path) == "off"
+
+
+def test_the_tools_reader_reads_an_unreadable_file_as_off(tmp_path):
+    _write(tmp_path, "psk-recorder.toml", 'state = "upload"')
+    (tmp_path / "psk-recorder.toml").chmod(0)
+    try:
+        if os.access(tmp_path / "psk-recorder.toml", os.R_OK):
+            pytest.skip("running as root")
+        assert nc._own_effective("psk-recorder", tmp_path) == "off"
+    finally:
+        (tmp_path / "psk-recorder.toml").chmod(0o644)
+
+
+@pytest.mark.parametrize("payload,want", [
+    ({"mode": "msk144"}, "meteor-scatter"),
+    ({"mode": " MSK144 "}, "meteor-scatter"),
+    ({"mode": "ft8"}, "psk-recorder"),
+    ({"mode": None}, "psk-recorder"),
+    ({}, "psk-recorder"),
+    ("not a dict", "psk-recorder"),
+])
+def test_the_tools_own_d12_rule(payload, want):
+    assert nc._own_psk_producer(payload) == want
+
+
+def test_the_marker_counts_by_presence_alone(tmp_path):
+    assert not nc._own_marker_stands(None)
+    assert not nc._own_marker_stands(tmp_path / "absent")
+    link = tmp_path / "link"
+    link.symlink_to(tmp_path / "nowhere")
+    assert nc._own_marker_stands(link)     # a dangling link stands
+    (tmp_path / "f").write_text("")
+    assert nc._own_marker_stands(tmp_path / "f")
+
+
+# ---- the verdicts, on hand-built results -------------------------------------
+
+
+def _batch(records: int, digest: str) -> dict:
+    return {"records": records, "first_id": None, "last_id": None,
+            "cursor_after": "c", "commit_token": "", "digest": digest}
+
+
+def _held_entry():
+    return _entry(key=None, stored=None, batch=None, sent=False, pops=0,
+                  wrote=False)
+
+
+def _expect(hold: bool, why: str = "c reads fill"):
+    return {"a": {"hold": hold, "why": why, "rider": None}}
+
+
+def test_an_expected_hold_is_held(capsys):
+    old, new = _result({"a": _entry()}), _result({"a": _held_entry()})
+    assert nc._report(old, new, _expect(True)) == 0
+    out = capsys.readouterr().out
+    assert "a: HELD (c reads fill)" in out
+    assert _final(out) == "RESULT: PASS (0 AGREE, 1 HELD, 0 DISAGREE)"
+
+
+@pytest.mark.parametrize("over,what", [
+    ({"key": ["s", "d", "t"]}, "read its send record"),
+    ({"batch": _batch(1, "x")}, "produced a batch"),
+    ({"sent": True}, "sent"),
+    ({"pops": 1}, "asked for a retry"),
+    ({"wrote": True}, "wrote the store"),
+    ({"error": "E: x"}, "raised E: x"),
+])
+def test_an_expected_hold_that_did_anything_disagrees(capsys, over, what):
+    new = _held_entry()
+    new.update(over)
+    assert nc._report(_result({"a": _entry()}), _result({"a": new}),
+                      _expect(True)) == 1
+    out = capsys.readouterr().out
+    assert f"a: DISAGREE (the switches hold it: c reads fill; NEW {what}" in out
+    assert "HELD" not in out.split("RESULT")[1].split("(")[0]
+    assert _final(out).startswith("RESULT: DISAGREE (0 AGREE, 0 HELD, 1 DISAGREE")
+
+
+def test_an_unexpected_hold_disagrees(capsys):
+    old, new = _result({"a": _entry()}), _result({"a": _held_entry()})
+    assert nc._report(old, new, _expect(False, "upload")) == 1
+    out = capsys.readouterr().out
+    assert "a: DISAGREE (NEW held it; the switches let it send)" in out
+    assert _final(out) == "RESULT: DISAGREE (0 AGREE, 0 HELD, 1 DISAGREE)"
+
+
+def test_an_unexpected_hold_disagrees_without_expectations(capsys):
+    # With no expectation at all (an old caller), nothing is expected held.
+    old, new = _result({"a": _entry()}), _result({"a": _held_entry()})
+    assert nc._report(old, new) == 1
+    assert _final(capsys.readouterr().out).startswith("RESULT: DISAGREE")
+
+
+def test_a_hold_on_one_side_only_built_disagrees(capsys):
+    assert nc._report(_result({}), _result({"a": _held_entry()}),
+                      _expect(True)) == 1
+    assert _final(capsys.readouterr().out).startswith("RESULT: DISAGREE")
+
+
+def test_a_rider_batch_other_than_expected_disagrees(capsys):
+    expected = _batch(3, "want")
+    expect = {"a": {"hold": False, "why": "", "rider": {
+        "batch": expected, "left_out": 2}}}
+    old = _result({"a": _entry(batch=_batch(5, "old"))})
+    good = _result({"a": _entry(batch=expected)})
+    assert nc._report(old, good, expect) == 0
+    assert "a: AGREE (2 psk rows left out, as expected)" in capsys.readouterr().out
+    for other in (_batch(5, "old"), _batch(3, "x")):
+        bad = _result({"a": _entry(batch=other)})
+        assert nc._report(old, bad, expect) == 1
+        out = capsys.readouterr().out
+        assert "a: DISAGREE (expected 2 psk rows left out)" in out
+
+
+def test_a_held_pump_that_writes_its_store_is_no_hold(tmp_path, capsys):
+    """The positive control for "wrote no record": a NEW tree whose held
+    pump writes one send record ends DISAGREE, not HELD."""
+    tree = _changed_tree(
+        tmp_path, "core.py",
+        'transitions.\n        """\n        if not self._may_send(pipe):\n'
+        '            return False\n',
+        'transitions.\n        """\n        if not self._may_send(pipe):\n'
+        '            pipe.watermark._write_cursor("x", "y", "z", cursor=b"1", '
+        'last_ack="t")\n            return False\n')
+    code, out, _ = _gated(capsys, tmp_path,
+                          sinks=_switches(tmp_path, psk_recorder="fill"),
+                          marker=_marker(tmp_path), new=tree)
+    assert code == 1
+    assert _section(out, "psk-pskreporter").startswith(
+        "psk-pskreporter: DISAGREE (the switches hold it: psk-recorder reads "
+        "fill; NEW wrote the store)"), out
+    assert "HELD" not in _final(out).split("(")[0]

@@ -23,10 +23,38 @@ Usage, from an hs-uploader checkout:
 
     .venv/bin/python tools/neutrality_check.py \\
         --manifest pipelines.toml --sink sink.db --watermarks watermarks.db \\
-        --old OLD/src --new NEW/src [--now 2026-10-07T15:51:00Z]
+        --old OLD/src --new NEW/src [--now 2026-10-07T15:51:00Z] \\
+        [--sinks sinks/ --marker carry-over-v1.done]
 
 --old and --new each name a directory that holds the hs_uploader package,
 for example the src/ of `git archive <sha> | tar -x -C DIR`.
+
+--sinks and --marker give NEW the station's switch files and carry-over
+marker (sink-2b part 2, spec §11.2); OLD never sees them.  The worker
+builds each Uploader with the tree's own SinkGate when the tree has one,
+and passes the same paths to the tree's build (the psk rider gate).  A
+tree without a gate (part 1 or older) runs as it always ran.  While the
+marker stands, NEW's starting-record pass runs before any pump, as the
+daemon runs it, and the report names each key it wrote.
+
+The tool predicts which pipelines the switches hold with its own small
+reader (tomllib; the stricter of the client's file and site.toml; a
+missing client file, a bad name, no sinks/, or any read, parse or state
+fault reads off; a missing site.toml sets no limit), never through
+hs_uploader's (Ruling 15).  For a WSPR tar that carries psk rows it works
+out NEW's expected batch: OLD's batch less each psk row whose producer
+(the row's column, else the tool's own copy of D12's rule) does not read
+upload.  Each pipeline then ends in one of three verdicts:
+
+  AGREE      both trees produced the same key, record, retries, limits and
+             batch (for a WSPR tar with psk rows, NEW's batch is the
+             expected one);
+  HELD       the tool's reader says the switches hold it, and NEW read no
+             send record, produced no batch, sent nothing, asked for no
+             retry and wrote nothing to its store;
+  DISAGREE   anything else: an unexpected hold, an expected hold that did
+             anything, a tar other than the expected one.  HELD never
+             stands in for a DISAGREE.
 
 Nothing leaves the host, and nothing writes to the given files:
 
@@ -51,20 +79,24 @@ both trees judge at the same instant which WSPR cycles have closed.  It
 defaults to the current UTC time, read once and handed to both trees.
 Pass the snapshot's time to judge cycles as the station saw them.
 
-The last line reads one of:
+The last line counts each verdict, as (<a> AGREE, <h> HELD, <d> DISAGREE),
+and reads one of:
 
-  RESULT: AGREE                       every pipeline agrees, and the check
-                                      saw something: at least one pipeline,
-                                      all of them built by both trees, none
-                                      raising an error;
-  RESULT: DISAGREE                    the trees differ in some pipeline;
-  RESULT: INCONCLUSIVE (<reason>)     no difference found, but the check
-                                      compared nothing, or a pipeline did not
-                                      build, or a pipeline raised an error.
-                                      An error stops the check short of the
-                                      source, so it proves nothing.
+  RESULT: PASS (<counts>)             no DISAGREE, every HELD expected, and
+                                      the check saw something: at least one
+                                      pipeline, all of them built by both
+                                      trees, none raising an error;
+  RESULT: DISAGREE (<counts>)         some pipeline ends DISAGREE, or the
+                                      trees built different pipelines;
+  RESULT: INCONCLUSIVE (<counts>; <reason>)
+                                      no DISAGREE, but the check compared
+                                      nothing, or a pipeline did not build,
+                                      or a pipeline raised an error, or a
+                                      file was refused.  An error stops the
+                                      check short of the source, so it
+                                      proves nothing.
 
-Exit status: 0 only on RESULT: AGREE; 1 on DISAGREE, INCONCLUSIVE, a tree
+Exit status: 0 only on RESULT: PASS; 1 on DISAGREE, INCONCLUSIVE, a tree
 that fails to build, a worker that crashes, a copy that is not a usable
 database, or a given file that changed; 2 on a usage error.
 """
@@ -76,10 +108,12 @@ import errno
 import hashlib
 import json
 import os
+import re
 import shutil
 import subprocess
 import sys
 import tempfile
+import tomllib
 from datetime import datetime, timezone
 from pathlib import Path
 from urllib.parse import unquote, urlparse
@@ -116,6 +150,7 @@ class _Recorder:
         self.name = inner.name
         self.ACCEPTS = getattr(inner, "ACCEPTS", {})
         self.batch = None
+        self.sent = False
 
     def primary_table(self):
         return self.inner.primary_table()
@@ -125,12 +160,15 @@ class _Recorder:
 
     def ship(self, batch, identity):
         self.batch = batch
+        self.sent = True
         raise _Captured()
 
     def serialize_for_retry(self, batch, identity):
+        self.sent = True
         raise _Captured()
 
     def replay(self, payload_blob, identity):
+        self.sent = True
         raise _Captured()
 
 
@@ -142,27 +180,37 @@ def _text(cursor) -> str | None:
     return str(cursor)
 
 
-def _describe(batch, ids: list) -> dict:
-    """The next batch, as the check compares it.  The digest covers every
-    record in order (table, time, columns, payload path, dedup key) and the
-    batch's commit token: the token tells the source what to delete once the
-    transport acks."""
-    records = [
+def _records(batch) -> list:
+    """Each record of a batch as the digest covers it: table, time, columns,
+    payload path, dedup key."""
+    return [
         [r.table, r.time.isoformat(), dict(r.columns),
          str(r.payload_path) if r.payload_path else None,
          _text(getattr(r, "dedup_key", None))]
         for r in batch.records
     ]
-    token = _text(batch.commit_token)
+
+
+def _digest(records: list, token) -> str:
     blob = json.dumps({"records": records, "commit_token": token},
                       sort_keys=True, default=str).encode("utf-8")
+    return hashlib.sha256(blob).hexdigest()
+
+
+def _describe(batch, ids: list) -> dict:
+    """The next batch, as the check compares it.  The digest covers every
+    record in order (table, time, columns, payload path, dedup key) and the
+    batch's commit token: the token tells the source what to delete once the
+    transport acks."""
+    records = _records(batch)
+    token = _text(batch.commit_token)
     return {
         "records": len(records),
         "first_id": ids[0] if ids else None,
         "last_id": ids[-1] if ids else None,
         "cursor_after": _text(batch.cursor_after),
         "commit_token": token,
-        "digest": hashlib.sha256(blob).hexdigest(),
+        "digest": _digest(records, token),
     }
 
 
@@ -276,8 +324,80 @@ def _freeze_clock(now: datetime) -> None:
         mod.datetime = _FrozenDatetime
 
 
+def _store_print(path: Path) -> str:
+    """A digest of the store copy's bytes (the file, and any -wal or
+    -journal beside it), so the check sees any write a pump makes."""
+    h = hashlib.sha256()
+    for suffix in ("", "-wal", "-journal"):
+        f = Path(f"{path}{suffix}")
+        h.update(suffix.encode("ascii"))
+        if f.exists():
+            h.update(f.read_bytes())
+    return h.hexdigest()
+
+
+def _rider_producers(sqlite3, sink: Path, records: list) -> list:
+    """For each psk.spots record of a cycle batch, the `producer` column of
+    the sink row it came from ('' when the column reads '' or the sink has
+    none); None for every other record.  Rows match by payload, in id
+    order, as the cycle source reads them.  The parent judges the producer;
+    this only reads the column."""
+    times = sorted({str(r[2].get("time")) for r in records
+                    if r[0] == "psk.spots" and isinstance(r[2], dict)})
+    pool: dict = {}
+    if times:
+        conn = sqlite3.connect(sink)
+        try:
+            cols = {row[1] for row in
+                    conn.execute("PRAGMA table_info(pending_uploads)")}
+            producer = "producer" if "producer" in cols else "''"
+            local = " AND local = 0" if "local" in cols else ""
+            marks = ",".join("?" * len(times))
+            for payload_json, made_by in conn.execute(
+                    f"SELECT payload_json, {producer} FROM pending_uploads "
+                    f"WHERE target_db = 'psk' AND target_table = 'spots'{local} "
+                    f"AND json_extract(payload_json, '$.time') IN ({marks}) "
+                    f"ORDER BY id ASC", times):
+                try:
+                    payload = json.loads(payload_json)
+                except json.JSONDecodeError:
+                    continue
+                pool.setdefault(json.dumps(payload, sort_keys=True),
+                                []).append(made_by or "")
+        finally:
+            conn.close()
+    out = []
+    for r in records:
+        if r[0] != "psk.spots":
+            out.append(None)
+            continue
+        queue = pool.get(json.dumps(r[2], sort_keys=True, default=str))
+        out.append(queue.pop(0) if queue else "")
+    return out
+
+
+def _attrs(pipe) -> dict:
+    """What the tree built: the fields the gate's rules read, as plain data.
+    The parent prefers its own read of the manifest (_own_layout) and uses
+    these only for a pipeline it cannot find there (a builder entry)."""
+    transport = pipe.transport
+    while type(transport).__name__ == "DiscardTransport":
+        transport = transport.inner
+    source = pipe.source
+    return {
+        "client": str(getattr(pipe, "client", "") or ""),
+        "origin": str(getattr(pipe, "origin", "legacy") or "legacy"),
+        "governed": bool(getattr(pipe, "governed", True)),
+        "heartbeat": type(transport).__name__ == "HeartbeatSftp",
+        "rider": (type(source).__name__ == "WsprCycleSource"
+                  and bool(getattr(source, "include_psk", False))),
+    }
+
+
 def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
-            now_iso: str, out: Path) -> int:
+            now_iso: str, out: Path, sinks_dir: Path | None = None,
+            marker: Path | None = None) -> int:
+    import inspect
     import logging
     import sqlite3
 
@@ -301,9 +421,24 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
     except Exception as exc:  # noqa: BLE001 - reported on every pipeline
         freeze_error = f"{type(exc).__name__}: {exc}"
 
+    import hs_uploader.daemon as daemon_mod
     from hs_uploader.core import Uploader
     from hs_uploader.daemon import build_all_pipelines, load_manifest
     from hs_uploader.watermark.sqlite import SqliteWatermarkStore
+
+    # The daemon's own gate, when the tree has one (spec §11.2).  A tree
+    # from before it (part 1 or older) runs as it always ran.
+    try:
+        from hs_uploader.gate import SinkGate
+    except ModuleNotFoundError as exc:
+        if exc.name != "hs_uploader.gate":
+            raise
+        SinkGate = None
+    sink_paths = getattr(daemon_mod, "SinkPaths", None)
+    gate = None
+    if (SinkGate is not None and sinks_dir is not None and marker is not None
+            and "gate" in inspect.signature(Uploader).parameters):
+        gate = SinkGate(sinks_dir, marker)
 
     # A tree from before pipelines.d has no loader; it reads the legacy
     # manifest alone, as it always did.
@@ -331,6 +466,8 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
             return cursor
 
         def pop_due_deliverable(self, pipeline, *, now):
+            # Counted, never popped: a held pipeline must not ask at all.
+            self.pops = getattr(self, "pops", 0) + 1
             return None
 
         def deliverable_count(self, pipeline=None):
@@ -356,7 +493,8 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
 
     store = _TapStore(watermarks)
     result: dict = {"tree": str(pkg), "pipelines": {}, "unbuilt": [],
-                    "refused": []}
+                    "refused": [], "gate": gate is not None,
+                    "starting_records": None}
 
     def finish() -> int:
         result["opened"] = sorted(opened)
@@ -372,7 +510,12 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
                       "was not read"})
     try:
         if layout is not None:
-            pipelines, refused = build_layout(layout, watermark=store)
+            build_kw = {}
+            if (sink_paths is not None and sinks_dir is not None
+                    and "paths" in inspect.signature(build_layout).parameters):
+                build_kw["paths"] = sink_paths(sinks_dir, marker)
+            pipelines, refused = build_layout(layout, watermark=store,
+                                              **build_kw)
             result["refused"] = [
                 {"file": r.file, "client": r.client, "reason": r.reason}
                 for r in refused]
@@ -384,6 +527,13 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
 
     built = [p.name for p in pipelines]
     result["unbuilt"] = [n for n in named if n not in built]
+    # The daemon's starting-record pass (spec §3.5, ruling X9): while the
+    # marker stands, before any pump, as the daemon runs it at its build.
+    write_start = getattr(daemon_mod, "write_starting_records", None)
+    if gate is not None and write_start is not None and not freeze_error:
+        if os.path.lexists(marker):
+            result["starting_records"] = list(write_start(pipelines, store))
+            store.reads.clear()
     for pipe in pipelines:
         label, n = pipe.name, 2
         while label in result["pipelines"]:
@@ -394,31 +544,233 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
         store.reads.clear()
         ids.clear()
         entry = {"key": None, "stored": None, "queued": None,
-                 "limits": limits, "batch": None, "error": None}
+                 "limits": limits, "batch": None, "error": None,
+                 "sent": False, "pops": 0, "wrote": False,
+                 "attrs": _attrs(pipe)}
         if freeze_error:
             # Pumping now would run on the real clock.  Say so, and stop.
             entry["error"] = freeze_error
             result["pipelines"][label] = entry
             continue
+        store.pops = 0
         try:
             entry["queued"] = store.queued(pipe.name)
-            uploader = Uploader([pipe], now_fn=now.timestamp)
+            kw = {} if gate is None else {"gate": gate.may_send}
+            before = _store_print(watermarks)
+            uploader = Uploader([pipe], now_fn=now.timestamp, **kw)
             try:
                 uploader.pump()
             except _Captured:
                 pass
             finally:
                 uploader.close()
+                entry["wrote"] = _store_print(watermarks) != before
         except Exception as exc:  # noqa: BLE001 - reported per pipeline
             entry["error"] = f"{type(exc).__name__}: {exc}"
+        entry["sent"] = recorder.sent
+        entry["pops"] = store.pops
         if store.reads:
             key, cursor = store.reads[0]
             entry["key"] = list(key)
             entry["stored"] = _text(cursor)
         if recorder.batch is not None:
             entry["batch"] = _describe(recorder.batch, list(ids))
+            records = _records(recorder.batch)
+            if entry["attrs"]["rider"] and any(
+                    r[0] == "psk.spots" for r in records):
+                # What the parent needs to work out the expected NEW batch
+                # (spec §11.2): every record, and each rider's producer.
+                entry["rider_records"] = records
+                entry["rider_producers"] = _rider_producers(
+                    sqlite3, sink, records)
         result["pipelines"][label] = entry
     return finish()
+
+
+# ---- the tool's own reading of the switches (Ruling 15) ----------------------
+#
+# The tool predicts which pipelines NEW must hold, and which psk rows NEW
+# must leave out of a WSPR tar, without asking the library it tests.  Were
+# it to ask hs_uploader's switch reader or its D12 inference, a defect there
+# would shape NEW and the prediction alike, and hide itself.  These lines
+# restate spec §3.1 and §5 (design §3.4) from their text, with tomllib.
+
+_STATES = ("off", "fill", "upload")       # strictest first
+_CLIENT_NAME = re.compile(r"[a-z0-9][a-z0-9-]*")
+_SIGMOND_ORIGIN = "pipelines.d/sigmond.toml"
+_MARKER_NAME = "carry-over-v1.done"
+
+
+def _own_switch(path: Path) -> tuple:
+    """("missing", None), ("bad", None) or ("ok", state) for one file."""
+    try:
+        raw = path.read_bytes()
+    except FileNotFoundError:
+        return "missing", None
+    except OSError:            # unreadable, a directory, sinks/ not a directory
+        return "bad", None
+    try:
+        data = tomllib.loads(raw.decode("utf-8"))
+    except (UnicodeDecodeError, tomllib.TOMLDecodeError):
+        return "bad", None
+    state = data.get("state")
+    if state not in _STATES:
+        return "bad", None
+    return "ok", state
+
+
+def _own_effective(client, sinks_dir) -> str:
+    """The client's effective state: the stricter of its own file and
+    site.toml, in the order off < fill < upload.  It fails closed: a bad
+    client name, no sinks/ directory, a missing client file, and any read,
+    parse or state fault in either file all read off.  A missing site.toml
+    sets no limit."""
+    if (not isinstance(client, str) or client == "site"
+            or not _CLIENT_NAME.fullmatch(client)):
+        return "off"
+    if sinks_dir is None:
+        return "off"
+    c_how, c_state = _own_switch(Path(sinks_dir) / f"{client}.toml")
+    s_how, s_state = _own_switch(Path(sinks_dir) / "site.toml")
+    if c_how != "ok" or s_how == "bad":
+        return "off"
+    if s_how == "missing":
+        return c_state
+    return _STATES[min(_STATES.index(c_state), _STATES.index(s_state))]
+
+
+def _own_marker_stands(marker) -> bool:
+    """Anything at the path stands, a dangling link included.  An error
+    other than "no such file" reads as standing: the switches then govern."""
+    if marker is None:
+        return False
+    try:
+        os.lstat(marker)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError:
+        return True
+    return True
+
+
+def _own_psk_producer(payload) -> str:
+    """D12 for a psk row stored with producer '': MSK144 rows belong to
+    meteor-scatter, every other psk row to psk-recorder."""
+    mode = payload.get("mode") if isinstance(payload, dict) else None
+    if isinstance(mode, str) and mode.strip().lower() == "msk144":
+        return "meteor-scatter"
+    return "psk-recorder"
+
+
+def _own_layout(manifest: Path, pdir) -> dict:
+    """pipeline name -> the fields the gate's rules read, from the tool's
+    own read of the manifest and pipelines.d/.  A file present in
+    pipelines.d/ silences its client's legacy entries; a file's client is
+    its name.  A file that does not parse adds nothing (NEW refuses it)."""
+    def fields(entry, client, origin):
+        source = entry.get("source") or {}
+        transport = entry.get("transport") or {}
+        return {
+            "client": client,
+            "origin": origin,
+            "governed": entry.get("governed", True) is not False,
+            "heartbeat": str(transport.get("type", "")).strip().lower()
+            == "heartbeat_sftp",
+            "rider": (str(source.get("type", "")).strip().lower() == "wspr_cycle"
+                      and source.get("include_psk") is True),
+        }
+
+    files = []
+    if pdir is not None and Path(pdir).is_dir():
+        files = sorted(n for n in os.listdir(pdir)
+                       if n.endswith(".toml") and not n.startswith("."))
+    present = {n[:-len(".toml")] for n in files}
+    found: dict = {}
+    try:
+        legacy = tomllib.loads(Path(manifest).read_text(encoding="utf-8"))
+    except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+        legacy = {}
+    for entry in legacy.get("pipeline", []) or []:
+        client = str(entry.get("client") or "")
+        if entry.get("name") and client not in present:
+            found[str(entry["name"])] = fields(entry, client, "legacy")
+    for name in files:
+        try:
+            data = tomllib.loads((Path(pdir) / name).read_text(encoding="utf-8"))
+        except (OSError, UnicodeDecodeError, tomllib.TOMLDecodeError):
+            continue
+        for entry in data.get("pipeline", []) or []:
+            if isinstance(entry, dict) and entry.get("name"):
+                found[str(entry["name"])] = fields(
+                    entry, name[:-len(".toml")], f"pipelines.d/{name}")
+    return found
+
+
+def _own_hold(fields: dict, marker: bool, sinks_dir) -> tuple:
+    """(hold?, why) by spec §3.1's five rules, first that applies."""
+    if not fields["governed"] and fields["origin"] == _SIGMOND_ORIGIN:
+        return False, "rule 1: governed = false in sigmond.toml"
+    if fields["origin"] == "legacy" and (fields["client"] == "sigmond"
+                                         or fields["heartbeat"]):
+        return False, "rule 2: the legacy heartbeat"
+    if not marker:
+        return False, "rule 3: no carry-over marker"
+    if not fields["client"]:
+        return False, "rule 4: names no client"
+    state = _own_effective(fields["client"], sinks_dir)
+    return state != "upload", f"{fields['client']} reads {state}"
+
+
+def _own_rider(old_entry: dict, sinks_dir) -> dict | None:
+    """NEW's expected batch for a WSPR tar that carries psk rows (spec §5,
+    §11.2): OLD's batch less each psk row whose producer, from its column
+    or by the tool's own D12 rule, does not read upload."""
+    records = old_entry.get("rider_records")
+    producers = old_entry.get("rider_producers")
+    batch = old_entry.get("batch")
+    if not records or batch is None or producers is None:
+        return None
+    keep, left_out, rides = [], 0, {}
+    for record, made_by in zip(records, producers):
+        if record[0] != "psk.spots":
+            keep.append(record)
+            continue
+        producer = made_by or _own_psk_producer(record[2])
+        if producer not in rides:
+            rides[producer] = _own_effective(producer, sinks_dir) == "upload"
+        if rides[producer]:
+            keep.append(record)
+        else:
+            left_out += 1
+    if not left_out:
+        return {"batch": batch, "left_out": 0}
+    expected = None
+    if keep:
+        expected = dict(batch, records=len(keep),
+                        digest=_digest(keep, batch.get("commit_token")))
+    return {"batch": expected, "left_out": left_out}
+
+
+def _expectations(args, old: dict, new: dict) -> dict:
+    """For each pipeline NEW built: does the tool expect it held, why, and
+    for a WSPR tar with psk rows, the batch it expects."""
+    marker = _own_marker_stands(getattr(args, "marker", None))
+    sinks = getattr(args, "sinks", None)
+    layout = _own_layout(getattr(args, "new_manifest", None) or args.manifest,
+                         getattr(args, "new_pipelines_d", None))
+    out = {}
+    for label, entry in new["pipelines"].items():
+        fields = (layout.get(label.split("#")[0])
+                  or (entry or {}).get("attrs")
+                  or {"client": "", "origin": "legacy", "governed": True,
+                      "heartbeat": False, "rider": False})
+        hold, why = _own_hold(fields, marker, sinks)
+        rider = None
+        o = old["pipelines"].get(label)
+        if not hold and marker and fields.get("rider") and o:
+            rider = _own_rider(o, sinks)
+        out[label] = {"hold": hold, "why": why, "rider": rider}
+    return out
 
 
 # ---- parent: copy, run both trees, compare ------------------------------------
@@ -440,9 +792,15 @@ def _given_files(args) -> list:
     """The files the check must leave alone: the manifest, sink.db and
     watermarks.db, each with the -wal beside it when there is one."""
     files = [*_manifests(args)]
-    for pdir in _pipelines_dirs(args):
+    for pdir in [*_pipelines_dirs(args), getattr(args, "sinks", None)]:
+        if pdir is None:
+            continue
         for root, _dirs, names in os.walk(pdir):
-            files.extend(Path(root) / n for n in sorted(names))
+            files.extend(Path(root) / n for n in sorted(names)
+                         if (Path(root) / n).is_file())
+    marker = getattr(args, "marker", None)
+    if marker is not None and marker.is_file():
+        files.append(marker)
     return [*dict.fromkeys(files),
             *_with_wal(args.sink), *_with_wal(args.watermarks)]
 
@@ -528,6 +886,14 @@ def _run_tree(label: str, tree: Path, args, now_iso: str, scratch: Path) -> dict
     shutil.copyfile(side_manifest, manifest)
     if side_pdir is not None:
         shutil.copytree(side_pdir, etc / "pipelines.d")
+    # The switches and the marker reach NEW alone (spec §11.2), as copies
+    # where a station keeps them: sinks/ beside the manifest, the marker
+    # in the state directory.  Presence alone makes a marker.
+    sinks_copy, marker_copy = etc / "sinks", work / _MARKER_NAME
+    if label == "NEW" and getattr(args, "sinks", None) is not None:
+        shutil.copytree(args.sinks, sinks_copy, symlinks=True)
+    if label == "NEW" and _own_marker_stands(getattr(args, "marker", None)):
+        marker_copy.write_text("")
     out = work / "result.json"
     env = dict(os.environ)
     env.pop("PYTHONPATH", None)
@@ -536,7 +902,8 @@ def _run_tree(label: str, tree: Path, args, now_iso: str, scratch: Path) -> dict
     cmd = [sys.executable, "-B", str(Path(__file__).resolve()),
            "--worker", str(tree), "--manifest", str(manifest),
            "--sink", str(sink), "--watermarks", str(watermarks),
-           "--now", now_iso, "--out", str(out)]
+           "--now", now_iso, "--out", str(out),
+           "--worker-sinks", str(sinks_copy), "--worker-marker", str(marker_copy)]
     proc = subprocess.run(cmd, env=env, capture_output=True, text=True,
                           timeout=1800)
     for line in (proc.stdout + proc.stderr).splitlines():
@@ -557,17 +924,21 @@ def _run_tree(label: str, tree: Path, args, now_iso: str, scratch: Path) -> dict
     return result
 
 
-def _key_text(entry) -> str:
+def _key_text(entry, verdict: str = "") -> str:
     if entry is None:
         return "(not built)"
+    if verdict == "HELD":
+        return "(not read: held)"
     if entry["key"] is None:
         return "(no key read)"
     return "(" + ", ".join(entry["key"]) + ")"
 
 
-def _next_text(entry) -> str:
+def _next_text(entry, verdict: str = "") -> str:
     if entry is None:
         return "(not built)"
+    if verdict == "HELD":
+        return "held: no batch, no retry popped, no record written"
     if entry["error"]:
         return f"error {entry['error']}"
     stored = entry["stored"] or "(empty)"
@@ -599,22 +970,88 @@ def _differing(old, new) -> list:
     return [f for f in _FIELDS if old.get(f) != new.get(f)]
 
 
-def _report(old: dict, new: dict) -> int:
+def _did(entry: dict) -> list:
+    """What a pipeline's pump did, worded; empty when it held: no send
+    record read, no batch, nothing sent, no retry popped, no write."""
+    did = []
+    if entry.get("error"):
+        did.append(f"raised {entry['error']}")
+    if entry.get("key") is not None:
+        did.append("read its send record")
+    if entry.get("batch") is not None:
+        did.append("produced a batch")
+    elif entry.get("sent"):
+        did.append("sent")
+    if entry.get("pops"):
+        did.append("asked for a retry")
+    if entry.get("wrote"):
+        did.append("wrote the store")
+    return did
+
+
+def _rows(n: int) -> str:
+    return f"{n} psk row{'' if n == 1 else 's'}"
+
+
+def _verdict(old, new, expect=None) -> tuple:
+    """(AGREE | HELD | DISAGREE, why, differing fields).
+
+    HELD only where the tool's own reader expects the hold and NEW did
+    nothing at all.  An expected hold that did anything, a hold the reader
+    did not expect, and a WSPR tar other than the expected one are each a
+    DISAGREE: HELD never stands in for one."""
+    if old is None or new is None:
+        return "DISAGREE", "", _differing(old, new)
+    expect = expect or {"hold": False, "why": "", "rider": None}
+    did = _did(new)
+    if expect["hold"]:
+        if not did:
+            return "HELD", expect["why"], []
+        return ("DISAGREE",
+                f"the switches hold it: {expect['why']}; NEW {', '.join(did)}",
+                ["a hold the switches order"])
+    if not did and old.get("key") is not None:
+        return ("DISAGREE", "NEW held it; the switches let it send",
+                ["a hold the switches do not order"])
+    rider = expect.get("rider")
+    if rider and rider["left_out"]:
+        differ = [f for f in _FIELDS if f != "batch" and old.get(f) != new.get(f)]
+        if new.get("batch") != rider["batch"]:
+            differ.append("batch")
+        if differ:
+            return ("DISAGREE", f"expected {_rows(rider['left_out'])} left out",
+                    differ)
+        return ("AGREE", f"{_rows(rider['left_out'])} left out, as expected", [])
+    if _agree(old, new):
+        return "AGREE", "", []
+    return "DISAGREE", "", _differing(old, new)
+
+
+def _report(old: dict, new: dict, expect: dict | None = None) -> int:
+    expect = expect or {}
     names = list(old["pipelines"])
     names += [n for n in new["pipelines"] if n not in names]
-    agree = 0
+    counts = {"AGREE": 0, "HELD": 0, "DISAGREE": 0}
     for name in names:
         o, n = old["pipelines"].get(name), new["pipelines"].get(name)
-        same = _agree(o, n)
-        agree += same
-        print(f"{name}: {'AGREE' if same else 'DISAGREE'}")
+        verdict, why, differ = _verdict(o, n, expect.get(name))
+        counts[verdict] += 1
+        print(f"{name}: {verdict}" + (f" ({why})" if why else ""))
         print(f"  OLD key  {_key_text(o)}")
-        print(f"  NEW key  {_key_text(n)}")
+        print(f"  NEW key  {_key_text(n, verdict)}")
         print(f"  OLD next {_next_text(o)}")
-        print(f"  NEW next {_next_text(n)}")
-        if not same:
+        print(f"  NEW next {_next_text(n, verdict)}")
+        if verdict == "DISAGREE":
             print(f"[compare] {name}: OLD and NEW differ in: "
-                  f"{', '.join(_differing(o, n))}", file=sys.stderr)
+                  f"{', '.join(differ)}", file=sys.stderr)
+    for label, res in (("OLD", old), ("NEW", new)):
+        written = res.get("starting_records")
+        if written is None:
+            continue
+        if written:
+            print(f"{label} wrote starting records: {', '.join(written)}")
+        else:
+            print(f"{label} wrote no starting record")
     refused = 0
     for label, res in (("OLD", old), ("NEW", new)):
         for r in res.get("refused", []):
@@ -628,10 +1065,13 @@ def _report(old: dict, new: dict) -> int:
     if raised:
         print(f"An error stopped these pipelines, so the check shows nothing "
               f"of what they send: {', '.join(raised)}")
-    print(f"{len(names)} pipelines: {agree} agree, {len(names) - agree} disagree")
-    if agree != len(names) or old["unbuilt"] != new["unbuilt"]:
-        note = f" ({len(raised)} raised an error; see above)" if raised else ""
-        print(f"RESULT: DISAGREE{note}")
+    print(f"{len(names)} pipelines: {counts['AGREE']} agree, "
+          f"{counts['HELD']} held, {counts['DISAGREE']} disagree")
+    tally = (f"{counts['AGREE']} AGREE, {counts['HELD']} HELD, "
+             f"{counts['DISAGREE']} DISAGREE")
+    if counts["DISAGREE"] or old["unbuilt"] != new["unbuilt"]:
+        note = f"; {len(raised)} raised an error; see above" if raised else ""
+        print(f"RESULT: DISAGREE ({tally}{note})")
         return 1
     # No difference found.  That proves neutrality only if the check saw
     # something: a pipeline compared, built by both trees, and run to the
@@ -650,9 +1090,11 @@ def _report(old: dict, new: dict) -> int:
         reasons.append(f"{refused} refused file{'' if refused == 1 else 's'}; "
                        f"see above")
     if reasons:
-        print(f"RESULT: INCONCLUSIVE ({'; '.join(reasons)})")
+        print(f"RESULT: INCONCLUSIVE ({tally}; {'; '.join(reasons)})")
         return 1
-    print("RESULT: AGREE")
+    # PASS: no DISAGREE, and every HELD was one the tool's reader expected
+    # (_verdict gives HELD to nothing else).
+    print(f"RESULT: PASS ({tally})")
     return 0
 
 
@@ -683,13 +1125,22 @@ def main(argv=None) -> int:
     p.add_argument("--new", type=Path, help="directory that holds the NEW hs_uploader")
     p.add_argument("--now", help="UTC time both trees read as now "
                                  "(default: the current time, read once)")
+    p.add_argument("--sinks", type=Path,
+                   help="a copy of /etc/hs-uploader/sinks for NEW (default: "
+                        "none, which fails closed once the marker stands)")
+    p.add_argument("--marker", type=Path,
+                   help="the carry-over marker for NEW; it stands when "
+                        "anything exists at the path (default: none)")
     p.add_argument("--worker", type=Path, help=argparse.SUPPRESS)
     p.add_argument("--out", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--worker-sinks", type=Path, help=argparse.SUPPRESS)
+    p.add_argument("--worker-marker", type=Path, help=argparse.SUPPRESS)
     args = p.parse_args(argv)
 
     if args.worker is not None:
         return _worker(args.worker, args.manifest, args.sink, args.watermarks,
-                       args.now, args.out)
+                       args.now, args.out, args.worker_sinks,
+                       args.worker_marker)
 
     for flag in ("old", "new"):
         tree = getattr(args, flag)
@@ -709,7 +1160,7 @@ def main(argv=None) -> int:
         given = getattr(args, flag)
         if given is not None and not given.is_file():
             p.error(f"--{flag.replace('_', '-')} {given} is not a file")
-    for flag in ("old_pipelines_d", "new_pipelines_d"):
+    for flag in ("old_pipelines_d", "new_pipelines_d", "sinks"):
         given = getattr(args, flag)
         if given is not None and not given.is_dir():
             p.error(f"--{flag.replace('_', '-')} {given} is not a directory")
@@ -720,6 +1171,9 @@ def main(argv=None) -> int:
     now_iso = now.strftime("%Y-%m-%dT%H:%M:%SZ")
 
     print(f"neutrality check: OLD {args.old}  NEW {args.new}  now {now_iso}")
+    print(f"NEW switches: {args.sinks or '(none)'}  marker: "
+          f"{'stands' if _own_marker_stands(args.marker) else 'absent'}"
+          f"{f' ({args.marker})' if args.marker else ''}")
     try:
         before = _fingerprint(_given_files(args))
         with tempfile.TemporaryDirectory(prefix="neutrality-") as scratch:
@@ -752,7 +1206,7 @@ def main(argv=None) -> int:
             failed = True
     if failed:
         return 1
-    return _report(old, new)
+    return _report(old, new, _expectations(args, old, new))
 
 
 if __name__ == "__main__":

@@ -39,9 +39,13 @@ uv run pytest -k watermark -v                     # by keyword
 uv build
 
 # Do two trees send the same thing?  Runs OLD and NEW on copies of a
-# station's state; never writes the given files (v3.70 neutrality proof)
+# station's state; never writes the given files (v3.70 neutrality proof).
+# --sinks/--marker give NEW the switches; verdicts AGREE, HELD, DISAGREE,
+# predicted by the tool's own switch reader (never hs_uploader's), and
+# the last line reads RESULT: PASS only with no DISAGREE (spec 2b-part2 §11.2)
 .venv/bin/python tools/neutrality_check.py --manifest pipelines.toml \
-    --sink sink.db --watermarks watermarks.db --old OLD/src --new NEW/src
+    --sink sink.db --watermarks watermarks.db --old OLD/src --new NEW/src \
+    [--sinks sinks/ --marker carry-over-v1.done]
 
 # CLI (operator inspector — not the consumer integration path)
 hs-uploader --help
