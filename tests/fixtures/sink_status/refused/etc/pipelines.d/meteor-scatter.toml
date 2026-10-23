@@ -2,6 +2,8 @@
 name = "meteor-scatter-pskreporter"
 [pipeline.source]
 type = "sqlite"
+database = "sigmond"
+table = "psk.spots"
 start_at = "now"
 [pipeline.transport]
 type = "pskreporter"

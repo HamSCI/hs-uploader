@@ -417,6 +417,7 @@ class PipeView:
     governed: bool
     origin: str
     transport: Any = None
+    builder: bool = False  # a builder entry: what it builds stays unseen
 
 
 def pipe_views(layout: Layout) -> list[PipeView]:
@@ -454,7 +455,8 @@ def pipe_views(layout: Layout) -> list[PipeView]:
                 transport = None
         views.append(PipeView(name=name, client=str(entry.get("client") or ""),
                               governed=bool(entry.get("governed", True)),
-                              origin=origin, transport=transport))
+                              origin=origin, transport=transport,
+                              builder=bool(entry.get("builder"))))
     return views
 
 

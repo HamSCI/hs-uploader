@@ -267,21 +267,73 @@ def _on_real_sinks_dir(sinks: Path) -> bool:
     return sinks.resolve() in real
 
 
+IDENTITY_JSON_CAP = 1 << 20  # bytes; --identity-json refuses anything larger
+
+
+def _toml_problem(v, path: str) -> tuple[str, str]:
+    """(key path, what is wrong) for a value a switch file cannot hold, or
+    ("", "") when ``v`` fits.
+
+    The switch writer emits strings, booleans, integers, floats, tables,
+    empty arrays and arrays of tables.  Anything else (null, an array of
+    values, an empty key) would fail inside ``write_switch`` and blame the
+    switch file, so ``sink set`` refuses it first and names the key.
+    """
+    if isinstance(v, (str, bool, int, float)):
+        return "", ""
+    if v is None:
+        return path, "null has no TOML form"
+    if isinstance(v, dict):
+        for k, x in v.items():
+            if not k:
+                return path, "an empty key has no TOML form"
+            bad = _toml_problem(x, f"{path}.{k}" if path else k)
+            if bad[0] or bad[1]:
+                return bad
+        return "", ""
+    if isinstance(v, list):
+        if v and not all(isinstance(x, dict) for x in v):
+            return path, "an array of values (only arrays of tables fit)"
+        for i, x in enumerate(v):
+            bad = _toml_problem(x, f"{path}[{i}]")
+            if bad[0] or bad[1]:
+                return bad
+        return "", ""
+    return path, f"a {type(v).__name__} has no TOML form"
+
+
 def _read_identity(spec: str) -> dict:
     """The identity tables of ``--identity-json``: a JSON object of objects.
 
     ``-`` reads stdin, so sigmond passes them without a file (ruling 11).
+    At most IDENTITY_JSON_CAP bytes are read; more is refused.  Every value
+    is checked before anything is written.
     """
     import json
-    text = sys.stdin.read() if spec == "-" else Path(spec).read_text()
+    if spec == "-":
+        stream = getattr(sys.stdin, "buffer", sys.stdin)
+        raw = stream.read(IDENTITY_JSON_CAP + 1)
+    else:
+        with open(spec, "rb") as fh:
+            raw = fh.read(IDENTITY_JSON_CAP + 1)
+    if len(raw) > IDENTITY_JSON_CAP:
+        raise ValueError(f"identity JSON is larger than {IDENTITY_JSON_CAP} "
+                         "bytes")
     try:
-        data = json.loads(text)
+        data = json.loads(raw)
     except ValueError as exc:
         raise ValueError(f"identity JSON does not parse: {exc}") from None
     if not isinstance(data, dict) or not all(
             isinstance(v, dict) for v in data.values()):
         raise ValueError("identity JSON must be an object of tables, one "
                          "per instance")
+    for instance, table in data.items():
+        key, what = _toml_problem(table, "")
+        if not instance:
+            key, what = "", "an empty instance name has no TOML form"
+        if what:
+            raise ValueError(f"identity JSON: instance {instance!r}, key "
+                             f"{key or '(the table)'}: {what}")
     return data
 
 
@@ -339,30 +391,31 @@ def _cmd_sink_mark_carried(args) -> int:
     return 0
 
 
-def _refused_in_store(path: Path) -> list[dict]:
-    """Pipeline files the daemon refused, from ``pipeline_state``.
+def _store_rows(path: Path) -> tuple[list[tuple[str, str, str]], str]:
+    """(refused ``pipeline_state`` rows, error) from the store.
 
     Opened read-only (``mode=ro``), so status never creates or changes the
-    store; a missing or unreadable store gives nothing.
+    store.  A missing store is no error (the daemon has not run yet); one
+    that exists and cannot be read is.
     """
     import sqlite3
-    from .pipelines_d import PIPELINES_DIR
-    prefix = f"{PIPELINES_DIR}/"
+    path = Path(path)
+    if not path.exists():
+        return [], ""
+    conn = None
     try:
-        conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro",
+        conn = sqlite3.connect(f"{path.resolve().as_uri()}?mode=ro",
                                uri=True, timeout=2.0)
-    except sqlite3.Error:
-        return []
-    try:
         rows = conn.execute(
             "SELECT name, client, refused_reason FROM pipeline_state "
             "WHERE refused_reason != '' ORDER BY name").fetchall()
-    except sqlite3.Error:
-        rows = []
+    except sqlite3.Error as exc:
+        return [], (f"cannot read the store {path}: {type(exc).__name__}: "
+                    f"{exc}; refusals the daemon recorded are not shown")
     finally:
-        conn.close()
-    return [{"file": n[len(prefix):], "client": c, "reason": r}
-            for n, c, r in rows if n.startswith(prefix)]
+        if conn is not None:
+            conn.close()
+    return rows, ""
 
 
 def _plain(v) -> str:
@@ -376,38 +429,60 @@ def _cmd_sink_status(args) -> int:
     on the pipelines the daemon builds from the same files, so it says "held"
     only while the carry-over marker stands.  ``effective`` and ``held_by``
     read the switches alone and do not depend on the marker (ruling X5).
+    Status cannot see inside a ``builder`` entry; ``builder_pipelines``
+    names those.  The library's log lines stay off stderr: what they would
+    say shows in the report itself.
     """
+    import logging
+    quiet = logging.NullHandler()
+    pkg = logging.getLogger("hs_uploader")
+    pkg.addHandler(quiet)
+    try:
+        return _sink_status(args)
+    finally:
+        pkg.removeHandler(quiet)
+
+
+def _sink_status(args) -> int:
     import json
     from .daemon import pipe_views
     from .gate import SinkGate, exempt_rule, held_by
-    from .pipelines_d import load_layout, sinks_dir_for
+    from .pipelines_d import PIPELINES_DIR, load_layout, sinks_dir_for
 
     sinks = Path(args.sinks) if args.sinks else sinks_dir_for(args.manifest)
     marker = Path(args.marker) if args.marker else sinkswitch.marker_path()
+    errors: list[str] = []
     views = []
-    refused = {}
+    refused: dict[tuple, dict] = {}
     read_failed = False
     try:
         layout = load_layout(args.manifest)
         views = pipe_views(layout)
-        refused = {r.file: {"file": r.file, "client": r.client,
-                            "reason": r.reason} for r in layout.refused}
+        for r in layout.refused:
+            refused[(r.file, None)] = {"file": r.file, "pipeline": None,
+                                       "client": r.client, "reason": r.reason}
     except Exception as exc:  # noqa: BLE001 -- report it, exit 2
         read_failed = True
+        errors.append(f"cannot read {args.manifest}: {exc}")
         print(f"hs-uploader: cannot read {args.manifest}: {exc}",
               file=sys.stderr)
-    # What the daemon refused at its last build wins over this read.
-    for r in _refused_in_store(args.state or default_path()):
-        refused[r["file"]] = r
+    # What the daemon refused at its last build wins over this read.  A
+    # pipeline refused for the store's schema has no file.
+    rows, store_error = _store_rows(args.state or default_path())
+    if store_error:
+        errors.append(store_error)
+    prefix = f"{PIPELINES_DIR}/"
+    for name, client, reason in rows:
+        if name.startswith(prefix):
+            f = name[len(prefix):]
+            refused[(f, None)] = {"file": f, "pipeline": None,
+                                  "client": client, "reason": reason}
+        else:
+            refused[("", name)] = {"file": None, "pipeline": name,
+                                   "client": client, "reason": reason}
 
-    enforced = sinkswitch.marker_stands(marker)
-    gate = SinkGate(sinks, marker)
-    held = []
-    for v in views:
-        d = gate.decide(v)
-        if not d.send:
-            held.append({"pipeline": v.name, "client": v.client,
-                         "reason": d.reason})
+    def file_state(r) -> str:
+        return r.state or ("missing" if r.missing else "error")
 
     names = {v.client for v in views if v.client and exempt_rule(v) == 0}
     has_dir = sinks.is_dir()
@@ -415,10 +490,6 @@ def _cmd_sink_status(args) -> int:
         for f in sinks.glob("*.toml"):
             if sinkswitch.valid_client_name(f.stem):
                 names.add(f.stem)
-
-    def file_state(r) -> str:
-        return r.state or ("missing" if r.missing else "error")
-
     s = sinkswitch.read_switch(sinks / f"{sinkswitch.SITE}.toml")
     site = {"state": file_state(s), "error": s.error,
             "set_at": _plain(s.data.get("set_at")),
@@ -426,14 +497,30 @@ def _cmd_sink_status(args) -> int:
             "reason": _plain(s.data.get("reason"))}
     clients = []
     for name in sorted(names):
-        r = sinkswitch.read_switch(sinks / f"{name}.toml")
         e = sinkswitch.effective_state(name, sinks_dir=sinks)
+        if sinkswitch.valid_client_name(name):
+            fs = file_state(sinkswitch.read_switch(sinks / f"{name}.toml"))
+        else:
+            fs = "error"       # never form a path from a bad name
         clients.append({
-            "client": name, "file_state": file_state(r),
+            "client": name, "file_state": fs,
             "effective": e.state, "held_by": held_by(name, e),
             "error": "; ".join(e.errors),
             "pipelines": [v.name for v in views if v.client == name]})
+    by_client = {c["client"]: c["held_by"] for c in clients}
+
+    enforced = sinkswitch.marker_stands(marker)
+    gate = SinkGate(sinks, marker)
+    held = []
+    for v in views:
+        d = gate.decide(v)
+        if not d.send:
+            who = by_client.get(v.client) if d.rule == 5 else None
+            held.append({"pipeline": v.name, "client": v.client,
+                         "held_by": who or "fault", "reason": d.reason})
+
     no_client = [v.name for v in views if not v.client]
+    builders = [v.name for v in views if v.builder]
     refused_files = [refused[k] for k in sorted(refused)]
     rc = 2 if read_failed else 0
 
@@ -443,7 +530,8 @@ def _cmd_sink_status(args) -> int:
             "marker": str(marker), "sinks_dir": str(sinks), "site": site,
             "clients": clients, "held_pipelines": held,
             "refused_files": refused_files,
-            "no_client_pipelines": no_client}, indent=2))
+            "no_client_pipelines": no_client,
+            "builder_pipelines": builders, "errors": errors}, indent=2))
         return rc
     print(f"hs-uploader sink status - {sinks}")
     if enforced:
@@ -463,11 +551,17 @@ def _cmd_sink_status(args) -> int:
     for h in held:
         print(f"  held: {h['pipeline']} ({h['client'] or '-'}): {h['reason']}")
     for r in refused_files:
-        print(f"  refused: pipelines.d/{r['file']} ({r['client']}): "
-              f"{r['reason']}")
+        what = (f"pipelines.d/{r['file']}" if r["file"] is not None
+                else f"pipeline {r['pipeline']}")
+        print(f"  refused: {what} ({r['client'] or '-'}): {r['reason']}")
     if no_client:
         print(f"  {len(no_client)} pipeline(s) carry no client; no switch "
               f"applies to them: {', '.join(no_client)}")
+    if builders:
+        print(f"  {len(builders)} builder entr(y/ies) status cannot see "
+              f"inside: {', '.join(builders)}")
+    for e in errors:
+        print(f"  error: {e}")
     return rc
 
 

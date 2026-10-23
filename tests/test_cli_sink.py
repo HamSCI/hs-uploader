@@ -351,7 +351,8 @@ def st(tmp_path):
 
 
 TOP = {"schema", "enforced", "marker", "sinks_dir", "site", "clients",
-       "held_pipelines", "refused_files", "no_client_pipelines"}
+       "held_pipelines", "refused_files", "no_client_pipelines",
+       "builder_pipelines", "errors"}
 
 
 def test_status_json_schema_key_for_key(st, capsys):
@@ -366,12 +367,12 @@ def test_status_json_schema_key_for_key(st, capsys):
                           "error", "pipelines"}
     assert d["held_pipelines"]
     for h in d["held_pipelines"]:
-        assert set(h) == {"pipeline", "client", "reason"}
+        assert set(h) == {"pipeline", "client", "held_by", "reason"}
     (st.pd / "bad.toml").write_text(_pipe("b", extra='governed = "yes"\n'))
     d = _json_status(st, capsys)
     assert d["refused_files"]
     for r in d["refused_files"]:
-        assert set(r) == {"file", "client", "reason"}
+        assert set(r) == {"file", "pipeline", "client", "reason"}
 
 
 def test_status_enforced_lists_held_pipelines(st, capsys):
@@ -383,7 +384,8 @@ def test_status_enforced_lists_held_pipelines(st, capsys):
                          "set_by": "test", "set_at": "2026-10-01T00:00:00Z"}
     assert d["held_pipelines"] == [
         {"pipeline": "psk-pskr", "client": "psk-recorder",
-         "reason": "sink filling (client)"}]
+         "held_by": "client", "reason": "sink filling (client)"}]
+    assert d["errors"] == [] and d["builder_pipelines"] == []
     by = {c["client"]: c for c in d["clients"]}
     assert set(by) == {"psk-recorder", "wspr-recorder"}   # no sigmond row
     assert by["psk-recorder"] == {
@@ -475,7 +477,8 @@ def test_status_lists_a_client_whose_file_the_loader_refuses(st, capsys):
     st.file("meteor-scatter", _pipe("ms", extra='governed = "yes"\n'))
     d = _json_status(st, capsys)
     assert d["refused_files"] == [{
-        "file": "meteor-scatter.toml", "client": "meteor-scatter",
+        "file": "meteor-scatter.toml", "pipeline": None,
+        "client": "meteor-scatter",
         "reason": "pipeline 'ms': governed must be true or false"}]
     assert main(st.status()) == 0
     out = capsys.readouterr().out
@@ -495,9 +498,16 @@ def test_status_lists_a_file_the_daemon_refused_at_build(st, capsys):
     store.close()
     os.chmod(st.db, 0o444)                           # status only reads it
     d = _json_status(st, capsys)
-    assert d["refused_files"] == [{
-        "file": "wspr-recorder.toml", "client": "wspr-recorder",
-        "reason": "pipeline 'wspr-tar' failed to build: KeyError('servers')"}]
+    assert d["refused_files"] == [
+        {"file": None, "pipeline": "store-held", "client": "x",
+         "reason": "store schema too old"},
+        {"file": "wspr-recorder.toml", "pipeline": None,
+         "client": "wspr-recorder",
+         "reason": "pipeline 'wspr-tar' failed to build: KeyError('servers')"}]
+    assert d["errors"] == []
+    assert main(st.status()) == 0
+    assert ("  refused: pipeline store-held (x): store schema too old"
+            in capsys.readouterr().out)
 
 
 def test_status_never_creates_the_store(st, capsys):
@@ -520,7 +530,10 @@ def test_status_manifest_read_failure_exits_2(tmp_path, capsys):
     assert main(["sink", "status", "--json", "--manifest", str(m),
                  "--marker", str(tmp_path / "mk")]) == 2
     cap = capsys.readouterr()
-    assert set(json.loads(cap.out)) == TOP
+    d = json.loads(cap.out)
+    assert set(d) == TOP
+    assert len(d["errors"]) == 1 and d["errors"][0].startswith(
+        f"cannot read {m}")
     assert f"cannot read {m}" in cap.err
 
 
@@ -562,3 +575,242 @@ def test_fixture_trees_read_as_named(name, enforced, held, capsys):
 def _run(tree, capsys, *extra) -> str:
     assert main(_fixture_argv(tree, *extra)) == 0
     return capsys.readouterr().out
+
+
+# ---- fix round 1 (Task 9 review) ---------------------------------------------
+
+def test_status_reports_an_unreadable_store_in_errors(st, capsys):
+    st.db.write_bytes(b"this is not a database at all" * 40)
+    d = _json_status(st, capsys)
+    assert len(d["errors"]) == 1 and str(st.db) in d["errors"][0]
+    assert d["refused_files"] == []
+    assert main(st.status()) == 0
+    assert f"  error: cannot read the store {st.db}" in capsys.readouterr().out
+
+
+def test_status_never_forms_a_path_from_a_bad_client_name(st, capsys):
+    """client = "../secret" must not read etc/secret.toml (sinks/../secret)."""
+    (st.etc / "secret.toml").write_text('state = "upload"\n')
+    st.manifest.write_text(HB + _pipe("sneaky", client="../secret"))
+    st.mark()
+    d = _json_status(st, capsys)
+    by = {c["client"]: c for c in d["clients"]}
+    assert by["../secret"]["file_state"] == "error"
+    assert by["../secret"]["effective"] == "off"
+    assert by["../secret"]["held_by"] == "fault"
+    held = {h["pipeline"]: h for h in d["held_pipelines"]}
+    assert held["sneaky"]["held_by"] == "fault"
+    assert held["sneaky"]["reason"] == "bad client name"
+
+
+def test_status_held_by_fault_for_a_broken_site_file(st, capsys):
+    st.mark()
+    (st.sinks / "site.toml").write_text("state = [bad\n")
+    d = _json_status(st, capsys)
+    assert d["site"]["state"] == "error" and d["site"]["error"]
+    by = {c["client"]: c for c in d["clients"]}
+    assert by["wspr-recorder"]["held_by"] == "fault"   # its own file: upload
+    assert by["wspr-recorder"]["effective"] == "off"
+    held = {h["pipeline"]: h for h in d["held_pipelines"]}
+    assert held["wspr-tar"] == {"pipeline": "wspr-tar",
+                                "client": "wspr-recorder", "held_by": "fault",
+                                "reason": "switch unreadable (site)"}
+
+
+def test_status_tie_goes_to_the_site(st, capsys):
+    st.mark()
+    st.switch("site", "fill")                   # psk-recorder reads fill too
+    d = _json_status(st, capsys)
+    by = {c["client"]: c for c in d["clients"]}
+    assert by["psk-recorder"]["held_by"] == "site"
+    held = {h["pipeline"]: h for h in d["held_pipelines"]}
+    assert held["psk-pskr"]["held_by"] == "site"
+    assert held["psk-pskr"]["reason"] == "sink filling (site)"
+
+
+def test_status_keeps_stderr_clean_and_reports_in_the_json(st):
+    """The gate and the switch reader log faults; status shows them in its
+    own report, not as stray lines on stderr.  A real process: under pytest
+    the root logger has a handler, so Python's last-resort stderr handler
+    would never fire in-process."""
+    import subprocess
+    import sys
+    st.mark()
+    (st.sinks / "wspr-recorder.toml").write_text("state = [bad\n")
+    st.file("mag-recorder", _pipe("mag-psws",
+                                   extra='governed = false\n'))  # WARNING
+    env = {**os.environ, "PYTHONPATH": str(Path(cli.__file__).parents[1]),
+           "HS_UPLOADER_STATE_DIR": str(st.state)}
+    out = subprocess.run(
+        [sys.executable, "-P", "-m", "hs_uploader.cli", *st.status("--json")],
+        cwd="/", env=env, capture_output=True, text=True, timeout=60)
+    assert out.returncode == 0, out.stderr
+    assert out.stderr == ""
+    by = {c["client"]: c for c in json.loads(out.stdout)["clients"]}
+    assert "parse error" in by["wspr-recorder"]["error"]  # positive control
+    held = {h["pipeline"] for h in json.loads(out.stdout)["held_pipelines"]}
+    assert "mag-psws" in held                     # governed=false ignored
+
+
+def test_status_removes_its_quiet_handler(st, capsys):
+    import logging
+    _json_status(st, capsys)
+    assert not any(isinstance(h, logging.NullHandler)
+                   for h in logging.getLogger("hs_uploader").handlers)
+
+
+def test_status_names_builder_entries(st, capsys):
+    st.manifest.write_text(HB + '[[pipeline]]\nname = "b"\nbuilder = "x:y"\n'
+                           'client = "c9"\n')
+    d = _json_status(st, capsys)
+    assert d["builder_pipelines"] == ["b"]
+    assert main(st.status()) == 0
+    assert "status cannot see inside: b" in capsys.readouterr().out
+
+
+@pytest.mark.parametrize("text, words", [
+    ('{"B4-100": {"call": null}}', ["'B4-100'", "key call", "null"]),
+    ('{"B4-100": {"psws": {"ids": [1, 2]}}}',
+     ["'B4-100'", "key psws.ids", "array of values"]),
+    ('{"B4-100": {"": "x"}}', ["'B4-100'", "empty key"]),
+    ('{"": {"call": "x"}}', ["empty instance name"]),
+])
+def test_set_identity_json_refuses_what_toml_cannot_hold(
+        tmp_path, monkeypatch, capsys, nonroot, text, words):
+    sinks = tmp_path / "s"
+    sinks.mkdir()
+    sinkswitch.write_switch(sinks / "c1.toml", {"state": "fill"})
+    before = (sinks / "c1.toml").read_bytes()
+    monkeypatch.setattr("sys.stdin", io.StringIO(text))
+    assert main(["sink", "set", "c1", "upload", "--reason", "r", "--by", "b",
+                 "--identity-json", "-", "--sinks", str(sinks)]) == 1
+    err = capsys.readouterr().err
+    for w in words:
+        assert w in err
+    assert "move the file aside" not in err
+    assert (sinks / "c1.toml").read_bytes() == before
+
+
+def test_set_identity_json_nested_tables_and_arrays_of_tables_pass(
+        tmp_path, monkeypatch, nonroot):
+    sinks = tmp_path / "s"
+    ident = {"B4-100": {"call": "AC0G", "n": 3, "ok": True, "f": 1.5,
+                        "psws": {"station_id": "S1"}, "empty": [],
+                        "ids": [{"id": "a"}, {"id": "b"}]}}
+    monkeypatch.setattr("sys.stdin", io.StringIO(json.dumps(ident)))
+    assert main(["sink", "set", "c1", "upload", "--reason", "r", "--by", "b",
+                 "--identity-json", "-", "--sinks", str(sinks)]) == 0
+    assert _read(sinks / "c1.toml")["history"][-1]["identity"] == ident
+
+
+def test_set_identity_json_is_capped(tmp_path, monkeypatch, capsys, nonroot):
+    sinks = tmp_path / "s"
+    pad = " " * (cli.IDENTITY_JSON_CAP - 30)
+    small = '{"B4": {"call": "x"}}' + pad
+    assert len(small) <= cli.IDENTITY_JSON_CAP
+    monkeypatch.setattr("sys.stdin", io.StringIO(small))
+    assert main(["sink", "set", "c1", "upload", "--reason", "r", "--by", "b",
+                 "--identity-json", "-", "--sinks", str(sinks)]) == 0
+    big = '{"B4": {"call": "x"}}' + " " * cli.IDENTITY_JSON_CAP
+    monkeypatch.setattr("sys.stdin", io.StringIO(big))
+    assert main(["sink", "set", "c1", "fill", "--reason", "r", "--by", "b",
+                 "--identity-json", "-", "--sinks", str(sinks)]) == 1
+    assert "larger than" in capsys.readouterr().err
+    f = tmp_path / "big.json"
+    f.write_text(big)
+    assert main(["sink", "set", "c1", "fill", "--reason", "r", "--by", "b",
+                 "--identity-json", str(f), "--sinks", str(sinks)]) == 1
+    assert _read(sinks / "c1.toml")["state"] == "upload"
+
+
+# -- pipe_views parity with the daemon's own build (review I1) --
+
+def _tname(t) -> tuple:
+    return (type(t).__name__, type(getattr(t, "inner", None)).__name__)
+
+
+def _parity(tmp_path, manifest_text: str, files: dict) -> None:
+    from hs_uploader import daemon
+    from hs_uploader.gate import exempt_rule
+    from hs_uploader.pipelines_d import load_layout
+    etc = tmp_path / "par"
+    (etc / "pipelines.d").mkdir(parents=True)
+    m = etc / "pipelines.toml"
+    m.write_text(manifest_text)
+    for name, text in files.items():
+        (etc / "pipelines.d" / name).write_text(text)
+    layout = load_layout(m)
+    store = SqliteWatermarkStore(tmp_path / "wm.db")
+    try:
+        built, refused = daemon.build_layout(
+            layout, watermark=store,
+            paths=daemon.SinkPaths(etc / "sinks", tmp_path / "marker"))
+    finally:
+        store.close()
+    assert refused == []
+    views = [v for v in daemon.pipe_views(layout) if not v.builder]
+    want = [(p.name, p.client, p.governed, p.origin, _tname(p.transport),
+             exempt_rule(p)) for p in built]
+    got = [(v.name, v.client, v.governed, v.origin, _tname(v.transport),
+            exempt_rule(v)) for v in views]
+    assert sorted(got) == sorted(want)
+    assert len(want) >= 3
+
+
+def _src(table):
+    return (f'[pipeline.source]\ntype = "sqlite"\ndatabase = "sigmond"\n'
+            f'table = "{table}"\n')
+
+
+def test_pipe_views_match_the_daemon_build_legacy(tmp_path):
+    """Unnamed legacy entries around a builder, a discard-wrapped heartbeat,
+    and a heartbeat-transport pipeline whose client is not sigmond."""
+    text = (
+        '[[pipeline]]\nclient = "c1"\n' + _src("t.a")
+        + '[pipeline.transport]\ntype = "pskreporter"\n'
+        + '[[pipeline]]\nname = "bld"\nbuilder = "no_such_module:f"\n'
+        + '[[pipeline]]\nclient = "c1"\n' + _src("t.b")
+        + '[pipeline.transport]\ntype = "wsprnet"\n'
+        + '[[pipeline]]\nname = "hb"\nclient = "sigmond"\ndiscard = true\n'
+        + _src("t.hb") + '[pipeline.transport]\ntype = "heartbeat_sftp"\n'
+        'host = "h"\n'
+        + '[[pipeline]]\nname = "hb-other"\nclient = "other"\n' + _src("t.ho")
+        + '[pipeline.transport]\ntype = "heartbeat_sftp"\nhost = "h"\n')
+    _parity(tmp_path, text, {})
+
+
+def test_pipe_views_match_the_daemon_build_files(tmp_path):
+    entry = ('[[pipeline]]\n{extra}' + '{src}'
+             + '[pipeline.transport]\ntype = "pskreporter"\n')
+    files = {
+        "c2.toml": "".join(entry.format(extra=e, src=_src(t)) for e, t in [
+            ("", "f.a"), ("", "f.b"), ('discard = true\n', "f.c"),
+            ('governed = false\n', "f.d")]),
+        "sigmond.toml": entry.format(extra='name = "sig"\ngoverned = false\n',
+                                     src=_src("f.s")),
+    }
+    _parity(tmp_path, '[[pipeline]]\nname = "named"\n' + _src("l.a")
+            + '[pipeline.transport]\ntype = "wsprnet"\n', files)
+
+
+@pytest.mark.parametrize("name", ["enforced", "not-enforced", "site-off",
+                                  "refused"])
+def test_fixture_trees_build_through_the_daemon(name, tmp_path):
+    """The fixture trees are real station trees: the daemon builds them."""
+    from hs_uploader import daemon
+    from hs_uploader.pipelines_d import load_layout
+    tree = FIXTURES / name
+    layout = load_layout(tree / "etc" / "pipelines.toml")
+    store = SqliteWatermarkStore(tmp_path / "wm.db")
+    try:
+        built, refused = daemon.build_layout(
+            layout, watermark=store,
+            paths=daemon.SinkPaths(tree / "etc" / "sinks",
+                                   tree / "state" / "carry-over-v1.done"))
+    finally:
+        store.close()
+    assert {p.name for p in built} == {
+        v.name for v in daemon.pipe_views(layout)}
+    assert len(built) == 4
+    assert [r.client for r in refused] == (
+        ["meteor-scatter"] if name == "refused" else [])

@@ -246,11 +246,18 @@ explicit even when no third-party deps are required.
   `daemon.pipe_views(layout)`: each pipeline the daemon builds from the
   same files, with its transport but no source, store or connection.
   `effective` and `held_by` (`gate.held_by`: site, client, fault or none)
-  read the switches alone and do not depend on the marker.  Refused files
-  come from this read of `pipelines.d/` and from `pipeline_state`, opened
-  read-only.  `--json` carries `"schema": 1`.  `sink set` writes through
-  `write_switch` (lock, atomic) and refuses a non-root caller on the real
-  `sinks/`; `--identity-json -` reads the identity tables from stdin.
+  read the switches alone and do not depend on the marker; a bad client
+  name never becomes a path.  Status cannot see inside a `builder` entry:
+  `builder_pipelines` names those.  Refused files come from this read of
+  `pipelines.d/` and from `pipeline_state`, opened read-only; a pipeline
+  refused for the store's schema shows with `file: null`.  An unreadable
+  manifest (exit 2) or store lands in `errors`.  The command puts a
+  NullHandler on the `hs_uploader` logger while it runs, so library log
+  lines stay off stderr.  `--json` carries `"schema": 1`.  `sink set`
+  writes through `write_switch` (lock, atomic) and refuses a non-root
+  caller on the real `sinks/`; `--identity-json -` reads the identity
+  tables from stdin (1 MiB at most), and refuses a value TOML cannot hold
+  (null, an array of values, an empty key), naming instance and key.
   `sink mark-carried` writes the marker through `write_marker`.
 - `Uploader(gate=...)` asks the gate at the top of each pipeline's pump,
   before each retry pop and before each source batch; a held pipeline

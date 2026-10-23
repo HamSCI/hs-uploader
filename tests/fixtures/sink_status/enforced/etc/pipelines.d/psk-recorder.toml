@@ -2,7 +2,7 @@
 name = "psk-recorder-pskreporter"
 [pipeline.source]
 type = "sqlite"
-db_path = "/var/lib/sigmond/sink.db"
+database = "sigmond"
 table = "psk.spots"
 producer = "psk-recorder"
 [pipeline.transport]
