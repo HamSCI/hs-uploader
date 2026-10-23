@@ -12,11 +12,13 @@ import math
 import os
 import time
 import re
+import secrets
+import stat
 import tomllib
 import datetime as _dt
 from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Mapping, Optional
+from typing import Mapping, Optional, Sequence
 
 log = logging.getLogger(__name__)
 
@@ -25,6 +27,7 @@ STATES = ("off", "fill", "upload")  # strictness order, loosest last
 CLIENT_NAME_RE = re.compile(r"^[a-z0-9][a-z0-9-]*$")
 LOCK_TIMEOUT_S = 10.0  # bound on waiting for sinks/.lock
 SITE = "site"  # sinks/site.toml is the site switch, never a client
+MARKER_NAME = "carry-over-v1.done"
 
 
 def valid_client_name(name: str) -> bool:
@@ -235,6 +238,74 @@ def _fsync_dir(d: Path) -> None:
         os.close(fd)
 
 
+def _atomic_write(path: Path, data: bytes, mode: int) -> None:
+    """Write `data` to `path` atomically; safe in a directory others can write.
+
+    The temporary file sits in the same directory, opened O_CREAT|O_EXCL|
+    O_NOFOLLOW at 0600 under a random name (retry on EEXIST), so a planted
+    link is never followed.  `fchmod` runs on the descriptor, then fsync,
+    `os.replace`, and an fsync of the directory.  A link at `path` is replaced,
+    never followed.  A directory or other non-regular file at `path` is refused.
+    """
+    path = Path(path)
+    d = path.parent
+    try:
+        st = os.lstat(path)
+    except FileNotFoundError:
+        pass
+    else:
+        if not (stat.S_ISREG(st.st_mode) or stat.S_ISLNK(st.st_mode)):
+            raise OSError(f"{path}: not a regular file; refusing to replace it")
+    flags = os.O_WRONLY | os.O_CREAT | os.O_EXCL | os.O_NOFOLLOW
+    for _ in range(100):
+        tmp = d / f".{path.name}.{os.getpid()}.{secrets.token_hex(4)}.tmp"
+        try:
+            fd = os.open(tmp, flags, 0o600)
+            break
+        except FileExistsError:
+            continue
+    else:
+        raise OSError(f"{path}: could not create a temporary file")
+    try:
+        try:
+            os.fchmod(fd, mode)
+            with os.fdopen(fd, "wb") as f:
+                fd = -1
+                f.write(data)
+                f.flush()
+                os.fsync(f.fileno())
+        except BaseException:
+            if fd >= 0:
+                os.close(fd)
+            raise
+        os.replace(tmp, path)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except FileNotFoundError:
+            pass
+        raise
+    _fsync_dir(d)
+
+
+def marker_path() -> Path:
+    """The carry-over marker; same state-dir rule as watermark.sqlite.default_path."""
+    base = os.environ.get("HS_UPLOADER_STATE_DIR", "/var/lib/hs-uploader")
+    return Path(base) / MARKER_NAME
+
+
+def marker_stands(path: Path) -> bool:
+    """True when anything stands at `path`, a dangling link included (ruling 4)."""
+    return os.path.lexists(path)
+
+
+def write_marker(path: Path, lines: Sequence[str]) -> None:
+    """Write the marker: a fixed-width UTC time line, then one line per entry."""
+    stamp = _dt.datetime.now(_dt.timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+    text = "".join(f"{x}\n" for x in [f"carried over at {stamp}", *lines])
+    _atomic_write(Path(path), text.encode("utf-8"), 0o644)
+
+
 def write_switch(path: Path, change: Mapping) -> None:
     """Change one switch file under an exclusive lock, atomically (design §3.4).
 
@@ -291,22 +362,13 @@ def write_switch(path: Path, change: Mapping) -> None:
         if name != SITE and change.get("identity"):
             entry["identity"] = dict(change["identity"])
         data["history"] = list(data.get("history", [])) + [entry]
-        text = dumps_toml(data)
-        tmp = d / f".{path.name}.{os.getpid()}.tmp"
-        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
-            os.fchmod(fd, 0o644)
-            with os.fdopen(fd, "w", encoding="utf-8") as f:
-                f.write(text)
-                f.flush()
-                os.fsync(f.fileno())
-            os.replace(tmp, path)
-        except BaseException:
-            try:
-                os.unlink(tmp)
-            except FileNotFoundError:
-                pass
-            raise
-        _fsync_dir(d)
+            text = dumps_toml(data)
+        except TypeError as e:
+            raise ValueError(
+                f"{path}: cannot re-emit this file ({e}); "
+                "move the file aside to recreate it"
+            ) from e
+        _atomic_write(path, text.encode("utf-8"), 0o644)
     finally:
         os.close(lockfd)  # closing drops the flock

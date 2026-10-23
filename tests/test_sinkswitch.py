@@ -306,3 +306,133 @@ def test_new_sinks_dir_is_0755_under_umask_077(tmp_path):
     finally:
         os.umask(old)
     assert stat.S_IMODE((tmp_path / "sinks").stat().st_mode) == 0o755
+
+
+# ---- marker helpers and emitter errors (part 2, task 2) ---------------------
+
+import threading
+
+
+def test_marker_path_honours_state_dir(tmp_path, monkeypatch):
+    from hs_uploader.watermark.sqlite import default_path
+
+    monkeypatch.setenv("HS_UPLOADER_STATE_DIR", str(tmp_path))
+    assert ss.MARKER_NAME == "carry-over-v1.done"
+    assert ss.marker_path() == tmp_path / ss.MARKER_NAME
+    assert ss.marker_path() == default_path().parent / ss.MARKER_NAME
+    monkeypatch.delenv("HS_UPLOADER_STATE_DIR")
+    assert ss.marker_path() == default_path().parent / ss.MARKER_NAME
+    assert str(ss.marker_path()) == "/var/lib/hs-uploader/carry-over-v1.done"
+
+
+def test_marker_stands_for_file_dangling_link_and_dir(tmp_path):
+    f = tmp_path / "f"
+    f.write_text("x")
+    link = tmp_path / "dangling"
+    link.symlink_to(tmp_path / "nowhere")
+    d = tmp_path / "d"
+    d.mkdir()
+    assert ss.marker_stands(f)
+    assert ss.marker_stands(link)
+    assert ss.marker_stands(d)
+    assert not ss.marker_stands(tmp_path / "absent")
+
+
+def test_write_marker_content_mode_and_names(tmp_path):
+    p = tmp_path / ss.MARKER_NAME
+    ss.write_marker(p, ["wspr: carried", "psk: carried"])
+    text = p.read_text()
+    assert "wspr: carried" in text and "psk: carried" in text
+    assert "UTC" in text or "Z" in text
+    assert stat.S_IMODE(p.stat().st_mode) == 0o644
+    assert not [x for x in tmp_path.iterdir() if x.name.endswith(".tmp")]
+
+
+def test_write_marker_reader_never_sees_partial(tmp_path):
+    p = tmp_path / ss.MARKER_NAME
+    lines = [f"line {i} " + "x" * 200 for i in range(300)]
+    ss.write_marker(p, lines)
+    full = p.read_bytes()
+    stop = threading.Event()
+    bad = []
+
+    def reader():
+        while not stop.is_set():
+            try:
+                b = p.read_bytes()
+            except FileNotFoundError:
+                bad.append("missing")
+                continue
+            if b != full:
+                bad.append(len(b))
+
+    t = threading.Thread(target=reader)
+    t.start()
+    try:
+        for _ in range(100):
+            ss.write_marker(p, lines)
+            # same lines, but the time line may differ in content; compare size
+    finally:
+        stop.set()
+        t.join()
+    # time line has fixed width, so a complete file always has len(full)
+    assert all(b == "missing" or b == len(full) for b in bad) and "missing" not in bad
+
+
+def test_write_marker_symlink_safety(tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"precious")
+    d = tmp_path / "state"
+    d.mkdir()
+    p = d / ss.MARKER_NAME
+    p.symlink_to(victim)
+    # a link at the old, predictable pid-only temporary name
+    (d / f".{p.name}.{os.getpid()}.tmp").symlink_to(victim)
+    ss.write_marker(p, ["a"])
+    assert victim.read_bytes() == b"precious"
+    assert p.is_file() and not p.is_symlink()
+
+
+def test_atomic_write_retries_on_exists(tmp_path, monkeypatch):
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"precious")
+    calls = {"n": 0}
+    real = os.open
+
+    def fake_open(path, flags, *a, **k):
+        if str(path).endswith(".tmp") and calls["n"] < 2:
+            calls["n"] += 1
+            raise FileExistsError(path)
+        return real(path, flags, *a, **k)
+
+    monkeypatch.setattr(os, "open", fake_open)
+    ss._atomic_write(tmp_path / "out", b"data", 0o644)
+    assert calls["n"] == 2
+    assert (tmp_path / "out").read_bytes() == b"data"
+
+
+def test_atomic_write_refuses_symlink_target_dir_victim(tmp_path):
+    victim = tmp_path / "victim"
+    victim.write_bytes(b"precious")
+    out = tmp_path / "out"
+    out.symlink_to(victim)
+    ss._atomic_write(out, b"new", 0o600)
+    assert victim.read_bytes() == b"precious"
+    assert out.read_bytes() == b"new" and not out.is_symlink()
+    assert stat.S_IMODE(out.stat().st_mode) == 0o600
+
+
+def test_atomic_write_refuses_non_regular_target(tmp_path):
+    d = tmp_path / "dir"
+    d.mkdir()
+    with pytest.raises(OSError):
+        ss._atomic_write(d, b"x", 0o644)
+
+
+def test_emitter_error_names_the_file(tmp_path):
+    p = put(tmp_path, "wspr", 'state = "upload"\nnote_at = 2026-01-01T00:00:00Z\n')
+    with pytest.raises(ValueError) as e:
+        ss.write_switch(p, {"state": "fill"})
+    assert str(p) in str(e.value)
+    assert "cannot re-emit" in str(e.value)
+    assert "note_at" in p.read_text()  # nothing written
