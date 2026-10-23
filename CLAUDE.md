@@ -226,9 +226,12 @@ explicit even when no third-party deps are required.
   sets no limit).  `write_switch` writes under `sinks/.lock`, atomically.
 - No switch stops or gates anything in this release.  `Rebuilder.report_switches`
   logs what each governed client's switch would read, and
-  `hs-uploader sink status` prints it with "not enforced".  The pump never
-  consults a switch.  `governed` on an entry is stored on the `Pipeline`
-  and read only for that report.
+  `hs-uploader sink status` prints it with "not enforced".  `governed` on
+  an entry is stored on the `Pipeline` and read only for that report.
+- `Uploader(gate=...)` asks the gate at the top of each pipeline's pump,
+  before each retry pop and before each source batch; a held pipeline
+  touches nothing and resumes where it stopped.  `gate=None` (the default,
+  and every in-process shim) sends always.  The daemon passes no gate yet.
 
 ## watermarks.db schema version (`hs-uploader migrate`)
 

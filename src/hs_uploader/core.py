@@ -284,8 +284,16 @@ class Uploader:
         on_batch_outcome: Optional[Callable[["Pipeline", "RecordBatch", "Outcome"], None]] = None,
         clock: Callable[[], float] = time.monotonic,
         inline_single: bool = True,
+        gate: Optional[Callable[["Pipeline"], bool]] = None,
     ):
         self.pipelines: list[Pipeline] = list(pipelines)
+        # ``gate(pipe)`` answers "may this pipeline send now?" (spec
+        # sink-2b-part2 §3.2).  None sends always: the in-process shims of
+        # psk-recorder, meteor-scatter and wspr-recorder build their own
+        # Uploader with no gate and behave exactly as before.  Only the
+        # daemon passes one (a SinkGate).  Never default this to the
+        # system's switch files.
+        self._gate = gate
         # ``inline_single`` pumps a lone pipeline on the caller's thread.
         # The daemon passes False: its set changes at a rebuild, and a
         # pipeline must keep one thread for its life (a SqliteSource's
@@ -407,8 +415,20 @@ class Uploader:
         results = [f.result() for f in futures]
         return any(results)
 
+    def _may_send(self, pipe: "Pipeline") -> bool:
+        return self._gate is None or bool(self._gate(pipe))
+
     def _pump_one(self, pipe: "Pipeline") -> bool:
-        """Drain one pipeline (deliverables first, then source)."""
+        """Drain one pipeline (deliverables first, then source).
+
+        A held pipeline returns here without work (spec §3.3): it pops no
+        retry, reads no source, ships nothing and writes no attempt row,
+        so its send record and queued retries stand exactly as they were
+        and it resumes where it stopped.  It logs nothing; the gate logs
+        transitions.
+        """
+        if not self._may_send(pipe):
+            return False
         did_work = self._drain_deliverables(pipe)
         # Don't drain the source while deliverables are queued —
         # the cursor hasn't advanced, so a fresh source pull would
@@ -439,6 +459,10 @@ class Uploader:
         now = self._now()
         any_attempted = False
         while True:
+            # Ask before each pop, so a switch that changes mid-pump stops
+            # the next replay and leaves its retry queued untouched.
+            if not self._may_send(pipe):
+                break
             deliverable = pipe.watermark.pop_due_deliverable(
                 pipe.name, now=_iso(now)
             )
@@ -502,6 +526,10 @@ class Uploader:
             ):
                 if not batch.records:
                     continue
+                # Ask before each batch, so a drain-mode pipeline stops
+                # between batches when its switch changes mid-pump.
+                if not self._may_send(pipe):
+                    return any_shipped
                 outcome = pipe.transport.ship(batch, pipe.identity)
                 now = self._now()
                 self._handle_first_attempt(pipe, batch, outcome, now)
