@@ -15,7 +15,7 @@ The gate answers in five rules, in order; the first that applies decides.
 
 The gate keeps no cache of the marker (ruling 4): each decision asks
 ``marker_stands`` afresh.  An exception inside a decision holds the
-pipeline and logs at ERROR once per pipeline and error (ruling 6).  The
+pipeline and logs at ERROR once per pipeline and exception type (ruling 6).  The
 only state the gate keeps, the record of what it has already logged, sits
 behind one lock, since the pump runs pipelines on threads.
 """
@@ -28,8 +28,8 @@ from pathlib import Path
 from typing import Hashable
 
 from .pipelines_d import LEGACY
-from .sinkswitch import (SITE, STATES, effective_state, marker_stands,
-                         read_switch, valid_client_name)
+from .sinkswitch import (STATES, effective_state, marker_stands,
+                         valid_client_name)
 from .transports.discard import DiscardTransport
 from .transports.heartbeat_sftp import HeartbeatSftp
 
@@ -37,6 +37,8 @@ log = logging.getLogger(__name__)
 
 SINK_GATE_ORIGIN = "pipelines.d/sigmond.toml"
 HEARTBEAT_CLIENT = "sigmond"
+
+SAID_CAP = 1024  # bound on the gate's set of logged keys
 
 _VERB = {"off": "off", "fill": "filling", "upload": "uploading"}
 
@@ -62,6 +64,7 @@ class SinkGate:
         self.marker = Path(marker)
         self._lock = threading.Lock()
         self._said: set[Hashable] = set()
+        self._capped = False
 
     def may_send(self, pipe) -> bool:
         return self.decide(pipe).send
@@ -71,7 +74,9 @@ class SinkGate:
             return self._decide(pipe)
         except Exception as e:  # fail closed (ruling 6)
             msg = f"{type(e).__name__}: {e}"
-            if self._first(("fault", _key(pipe), msg)):
+            # Key by type, never by free text: a message that changes each
+            # call must not log each call (ruling 6).
+            if self._first(("fault", _key(pipe), type(e).__name__)):
                 log.error("pipeline %r held: the sink gate failed (%s)",
                           getattr(pipe, "name", "?"), msg)
             return Decision(False, 0, f"gate fault: {msg}")
@@ -103,24 +108,23 @@ class SinkGate:
             return Decision(True, 5, "sink uploading")
         return Decision(False, 5, self._why(pipe.client, eff))
 
-    def _why(self, client: str, eff) -> str:
-        """Name the switch that holds.  The decision is already made; this
-        only words it, so a file that changes in between changes no answer."""
+    @staticmethod
+    def _why(client: str, eff) -> str:
+        """Word the hold from the same `Effective` that decided it; no second read.
+
+        A missing ``sinks/`` reads as a missing client file.
+        """
         if not valid_client_name(client):
             return "bad client name"
-        if not self.sinks_dir.is_dir():
-            return "no switch files (sinks/ missing)"
-        c = read_switch(self.sinks_dir / f"{client}.toml")
-        s = read_switch(self.sinks_dir / f"{SITE}.toml")
-        if c.missing:
+        if eff.client_missing:
             return "no switch file (client)"
-        if c.error:
+        if eff.client_error:
             return "switch unreadable (client)"
-        if s.error:
+        if eff.site_error:
             return "switch unreadable (site)"
         who = "client"
-        if s.state is not None and c.state is not None and (
-                STATES.index(s.state) <= STATES.index(c.state)):
+        if eff.site_state is not None and eff.client_state is not None and (
+                STATES.index(eff.site_state) <= STATES.index(eff.client_state)):
             who = "site"
         return f"sink {_VERB.get(eff.state, eff.state)} ({who})"
 
@@ -128,6 +132,13 @@ class SinkGate:
         """True the first time `key` is seen.  Thread-safe."""
         with self._lock:
             if key in self._said:
+                return False
+            if len(self._said) >= SAID_CAP:
+                if not self._capped:
+                    self._capped = True
+                    log.warning("sink gate: %d lines already logged once; "
+                                "further first-time lines will not be logged",
+                                SAID_CAP)
                 return False
             self._said.add(key)
             return True

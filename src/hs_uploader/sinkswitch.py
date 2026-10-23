@@ -6,6 +6,7 @@ Nothing here enforces a switch; it is a library.
 """
 from __future__ import annotations
 
+import errno
 import fcntl
 import logging
 import math
@@ -14,6 +15,7 @@ import time
 import re
 import secrets
 import stat
+import threading
 import tomllib
 import datetime as _dt
 from dataclasses import dataclass, field
@@ -54,11 +56,37 @@ class Effective:
     client_state: Optional[str]
     site_state: Optional[str]
     errors: list[str]
+    # What each file said, so a caller can word the cause without a second read.
+    client_missing: bool = False
+    client_error: str = ""
+    site_error: str = ""
 
 
 # path -> (signature, SwitchRead); signatures already logged
 _cache: dict[str, tuple[tuple, SwitchRead]] = {}
 _logged: set[tuple] = set()
+_logged_lock = threading.Lock()
+LOGGED_CAP = 1024  # bound on _logged; past it, faults stop logging (one line says so)
+
+
+def _note(key: tuple) -> bool:
+    """True the first time `key` is seen, so the caller logs once.  Thread-safe.
+
+    The set is capped: once full, nothing new is added or logged, and one
+    WARNING says so.  Keys hold a file signature, an errno or a name, never
+    free exception text.
+    """
+    with _logged_lock:
+        if key in _logged:
+            return False
+        if len(_logged) >= LOGGED_CAP:
+            if ("cap",) not in _logged:
+                _logged.add(("cap",))
+                log.warning("sink switch: %d faults logged; further faults "
+                            "will not be logged until restart", LOGGED_CAP)
+            return False
+        _logged.add(key)
+        return True
 
 
 def _signature(st: os.stat_result) -> tuple:
@@ -105,8 +133,7 @@ def read_switch(path: Path, *, cache: bool = True) -> SwitchRead:
             return hit[1]
     res = _parse(path)
     _cache[key] = (sig, res)
-    if res.error and (key, sig) not in _logged:
-        _logged.add((key, sig))
+    if res.error and _note((key, sig)):
         log.error("sink switch: %s (reading as off)", res.error)
     return res
 
@@ -116,10 +143,9 @@ def effective_state(client: str, *, sinks_dir: Path = DEFAULT_SINKS_DIR) -> Effe
     if not valid_client_name(client):
         # Fail closed.  Never form a path from the bad name.
         msg = f"bad client name {client!r}: reading as off"
-        if ("name", repr(client)) not in _logged:
-            _logged.add(("name", repr(client)))
+        if _note(("name", repr(client))):
             log.error("sink switch: %s", msg)
-        return Effective("off", None, None, [msg])
+        return Effective("off", None, None, [msg], client_error=msg)
     sinks_dir = Path(sinks_dir)
     c = read_switch(sinks_dir / f"{client}.toml")
     s = read_switch(sinks_dir / f"{SITE}.toml")
@@ -132,7 +158,9 @@ def effective_state(client: str, *, sinks_dir: Path = DEFAULT_SINKS_DIR) -> Effe
         state = c.state
     else:
         state = STATES[min(STATES.index(c.state), STATES.index(s.state))]
-    return Effective(state, c.state, s.state, errors)
+    return Effective(state, c.state, s.state, errors,
+                     client_missing=c.missing, client_error=c.error,
+                     site_error=s.error)
 
 
 # ---- writing ---------------------------------------------------------------
@@ -295,8 +323,23 @@ def marker_path() -> Path:
 
 
 def marker_stands(path: Path) -> bool:
-    """True when anything stands at `path`, a dangling link included (ruling 4)."""
-    return os.path.lexists(path)
+    """True when anything stands at `path`, a dangling link included (ruling 4).
+
+    Fails closed: only "no such file" (ENOENT, ENOTDIR) reads absent.  Any
+    other error, such as EACCES on the directory, reads as standing, so the
+    switches keep governing; it logs once per (path, errno).
+    """
+    try:
+        os.lstat(path)
+    except (FileNotFoundError, NotADirectoryError):
+        return False
+    except OSError as e:
+        if _note(("marker", str(path), e.errno)):
+            log.error("carry-over marker %s: cannot check it (%s); "
+                      "enforcing the switches", path,
+                      errno.errorcode.get(e.errno, e.errno))
+        return True
+    return True
 
 
 def write_marker(path: Path, lines: Sequence[str]) -> None:

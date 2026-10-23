@@ -436,3 +436,42 @@ def test_emitter_error_names_the_file(tmp_path):
     assert str(p) in str(e.value)
     assert "cannot re-emit" in str(e.value)
     assert "note_at" in p.read_text()  # nothing written
+
+
+def test_marker_stands_fails_closed_on_unreadable_dir(tmp_path, caplog):
+    if os.geteuid() == 0:
+        pytest.skip("root ignores mode 000")
+    d = tmp_path / "state"
+    d.mkdir()
+    m = d / ss.MARKER_NAME
+    assert not ss.marker_stands(m)  # control: readable, absent
+    ss._logged.clear()
+    d.chmod(0o000)
+    try:
+        with caplog.at_level(logging.ERROR, logger=ss.log.name):
+            assert all(ss.marker_stands(m) for _ in range(100))
+    finally:
+        d.chmod(0o755)
+    assert len([r for r in caplog.records if r.levelno == logging.ERROR]) == 1
+    assert not ss.marker_stands(m)
+
+
+def test_marker_stands_enotdir_reads_absent(tmp_path):
+    f = tmp_path / "file"
+    f.write_text("x")
+    assert not ss.marker_stands(f / ss.MARKER_NAME)
+
+
+def test_bad_name_log_keys_are_capped(tmp_path, monkeypatch, caplog):
+    ss._logged.clear()
+    monkeypatch.setattr(ss, "LOGGED_CAP", 5)
+    try:
+        with caplog.at_level(logging.DEBUG, logger=ss.log.name):
+            for i in range(50):
+                assert ss.effective_state(f"Bad{i}", sinks_dir=tmp_path).state == "off"
+        assert len(ss._logged) <= 6
+        errs = [r for r in caplog.records if r.levelno == logging.ERROR]
+        warns = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(errs) == 5 and len(warns) == 1
+    finally:
+        ss._logged.clear()

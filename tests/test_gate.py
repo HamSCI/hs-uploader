@@ -6,6 +6,7 @@ control, so the gate can neither leak nor wrongly hold unnoticed.
 from __future__ import annotations
 
 import logging
+import os
 import threading
 import time
 
@@ -241,8 +242,16 @@ def test_rule5_missing_site_with_client_upload_sends(tree):
     assert SinkGate(sinks, marker).may_send(pipe())
 
 
-@pytest.mark.parametrize("case", ["missing", "broken", "unknown", "no-sinks",
-                                  "bad-name"])
+FAIL_REASON = {
+    "missing": "no switch file (client)",
+    "broken": "switch unreadable (client)",
+    "unknown": "switch unreadable (client)",
+    "no-sinks": "no switch file (client)",  # sinks/ missing: no client file
+    "bad-name": "bad client name",
+}
+
+
+@pytest.mark.parametrize("case", sorted(FAIL_REASON))
 def test_rule5_fails_closed(tree, case):
     sinks, marker = tree
     put(sinks, "site", "upload")
@@ -263,7 +272,8 @@ def test_rule5_fails_closed(tree, case):
     elif case == "bad-name":
         client = "Bad/Name"
     d = g.decide(pipe(client=client))
-    assert not d.send and d.rule == 5 and d.reason
+    assert not d.send and d.rule == 5
+    assert d.reason == FAIL_REASON[case]
 
 
 # ---- a fault inside the gate holds -----------------------------------------
@@ -287,12 +297,87 @@ def test_exception_holds_and_logs_once(tree, monkeypatch, caplog):
     assert len(errs) == 1 and "disk on fire" in errs[0].getMessage()
 
 
+def test_fault_keyed_by_type_not_text(tree, monkeypatch, caplog):
+    sinks, marker = tree
+    g = SinkGate(sinks, marker)
+    n = iter(range(10**6))
+
+    def boom(*a, **k):
+        raise RuntimeError(f"fault number {next(n)}")  # new text every call
+
+    monkeypatch.setattr(gate_mod, "effective_state", boom)
+    with caplog.at_level(logging.DEBUG, logger=gate_mod.log.name):
+        for _ in range(100):
+            assert not g.may_send(pipe())
+        assert len(gate_lines(caplog, logging.ERROR)) == 1
+        # positive control: another exception TYPE is a new fault, logged once
+        def boom2(*a, **k):
+            raise KeyError("x")
+        monkeypatch.setattr(gate_mod, "effective_state", boom2)
+        for _ in range(100):
+            assert not g.may_send(pipe())
+    assert len(gate_lines(caplog, logging.ERROR)) == 2
+
+
+def test_logged_keys_are_capped(tree, monkeypatch, caplog):
+    sinks, marker = tree
+    put(sinks, "psk-recorder", "fill")
+    monkeypatch.setattr(gate_mod, "SAID_CAP", 5)
+    g = SinkGate(sinks, marker)
+    with caplog.at_level(logging.DEBUG, logger=gate_mod.log.name):
+        for i in range(50):
+            for _ in range(3):
+                assert not g.may_send(pipe(f"p{i}", origin=PSK_ORIGIN,
+                                           governed=False))
+    assert len(g._said) == 5
+    warns = [r.getMessage() for r in gate_lines(caplog, logging.WARNING)]
+    assert len(warns) == 6 and "will not be logged" in warns[-1]
+
+
+def test_reason_words_the_deciding_read(tree, monkeypatch):
+    """The reason comes from the Effective that decided, never a second read."""
+    sinks, marker = tree
+    put(sinks, "site", "upload")
+    put(sinks, "psk-recorder", "fill")  # what a second read would see
+    from hs_uploader.sinkswitch import Effective
+    monkeypatch.setattr(gate_mod, "effective_state",
+                        lambda *a, **k: Effective("off", "off", "upload", []))
+    d = SinkGate(sinks, marker).decide(pipe())
+    assert not d.send and d.reason == "sink off (client)"
+
+
+# ---- rule 3 fails closed when the marker cannot be checked -----------------
+
+@pytest.mark.skipif(os.geteuid() == 0, reason="root ignores mode 000")
+def test_unreadable_marker_dir_fails_closed(tree, caplog):
+    sinks, marker = tree
+    marker.unlink()
+    put(sinks, "psk-recorder", "fill")
+    g = SinkGate(sinks, marker)
+    assert g.decide(pipe()).rule == 3  # control: no marker, readable dir: sends
+    marker.parent.chmod(0o000)
+    try:
+        with caplog.at_level(logging.DEBUG):
+            for _ in range(100):
+                d = g.decide(pipe())
+                assert not d.send and d.rule == 5
+    finally:
+        marker.parent.chmod(0o755)
+    errs = [r for r in caplog.records if r.levelno == logging.ERROR
+            and "marker" in r.getMessage()]
+    assert len(errs) == 1
+    assert g.decide(pipe()).rule == 3
+
+
 # ---- X8: gate state under two threads --------------------------------------
 
 class SlowSet(set):
     """Widens the gap between "seen?" and "add", where a race would land."""
 
+    calls = 0
+
     def __contains__(self, key):
+        SlowSet.calls += 1
         found = super().__contains__(key)
         time.sleep(0.002)
         return found
@@ -302,6 +387,7 @@ def test_once_state_is_thread_safe(tree, caplog):
     sinks, marker = tree
     put(sinks, "psk-recorder", "fill")
     g = SinkGate(sinks, marker)
+    SlowSet.calls = 0
     g._said = SlowSet()
     pipes = [pipe(f"p{i}", origin=PSK_ORIGIN, governed=False)
              for i in range(10)]
@@ -319,5 +405,6 @@ def test_once_state_is_thread_safe(tree, caplog):
         for t in ts:
             t.join()
     assert held == [False] * 20
+    assert SlowSet.calls >= 20  # the gate really consulted the slow set
     # one WARNING per pipeline, never two, though both threads judged each
     assert len(gate_lines(caplog, logging.WARNING)) == len(pipes)
