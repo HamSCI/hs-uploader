@@ -50,7 +50,7 @@ from .pipelines_d import (LEGACY, Layout, Refusal, load_layout,
                           pipelines_dir_for, pipelines_signature,
                           sinks_dir_for)
 from .sinkswitch import effective_state, marker_path, marker_stands
-from .gate import SinkGate  # noqa: F401  (re-export: spec §11.2 finds hs_uploader.daemon.SinkGate)
+from .gate import SinkGate  # also re-exported: spec §11.2 finds hs_uploader.daemon.SinkGate
 from .gate import exempt_rule
 from .transports.discard import wrap_if_discard
 from .wake import WakeListener
@@ -635,7 +635,7 @@ class Rebuilder:
         self.watermark = watermark
         self.pdir = pipelines_dir_for(manifest_path)
         self.sdir = sinks_dir_for(manifest_path)
-        self._said: dict[str, str] = {}      # client -> last answer logged
+        self._said: dict[str, tuple] = {}    # client -> (state, enforced) logged
         self._said_no_files = False
         self.signature: Optional[tuple] = None
         self.build = Build()
@@ -660,16 +660,23 @@ class Rebuilder:
     def marker_check(self) -> list[str]:
         """Before each pump: when the marker has appeared since the last
         reading, run the starting-record pass over the running set, so it
-        lands before any held pump (plan ruling 4).  Returns the keys written."""
+        lands before any held pump (plan ruling 4).  Returns the keys written.
+        When the marker appears or goes, the switch report runs again, so it
+        says once whether the gate now enforces the switches."""
         if self.marker is None:
             return []
         stands = marker_stands(self.marker)
         appeared = stands and not self._marker_seen
+        changed = stands != self._marker_seen
         self._marker_seen = stands
         if not appeared:
+            if changed:   # it went: the report says "not enforced" once
+                self.report_switches()
             return []
         logger.info("daemon: carry-over marker %s appeared", self.marker)
-        return write_starting_records(self.running, self.watermark)
+        written = write_starting_records(self.running, self.watermark)
+        self.report_switches()   # now "enforced", once per client
+        return written
 
     def due(self) -> bool:
         """Whether ``pipelines.d/`` moved since the last build (ruling X5)."""
@@ -707,14 +714,20 @@ class Rebuilder:
         return layout.signature, build, running, rows
 
     def report_switches(self) -> None:
-        """Log what each client's switch would say.  Enforces nothing (§6.2).
+        """Log what each governed client's switch reads, and whether the
+        gate enforces it (spec §9.2).
 
-        One INFO line per client when its answer changes; one line when
-        ``sinks/`` is missing.  ``effective_state`` logs each file error once
-        per signature.  Nothing here, and nothing in the pump, gates a send.
+        The gate enforces the switches while the carry-over marker stands
+        (rule 3).  One INFO line per client when its answer or the
+        enforcement changes; one line when ``sinks/`` is missing and the
+        marker does not stand.  With the marker standing, a missing
+        ``sinks/`` is a fault, and the gate reports it (ERROR, then a
+        reminder every 6 h).  ``effective_state`` logs each file error once
+        per signature.  The gate itself logs each pipeline's transitions.
         """
+        enforced = self.marker is not None and marker_stands(self.marker)
         if not self.sdir.is_dir():
-            if not self._said_no_files:
+            if not self._said_no_files and not enforced:
                 logger.info("no switch files; the manifest's policy governs")
                 self._said_no_files = True
             self._said.clear()
@@ -724,10 +737,15 @@ class Rebuilder:
                           if p.client and p.governed})
         for client in clients:
             state = effective_state(client, sinks_dir=self.sdir).state
-            if self._said.get(client) != state:
-                self._said[client] = state
-                logger.info("sink switch for %s would read %s "
-                            "(not enforced in this release)", client, state)
+            answer = (state, enforced)
+            if self._said.get(client) != answer:
+                self._said[client] = answer
+                if enforced:
+                    logger.info("sink switch for %s reads %s (enforced)",
+                                client, state)
+                else:
+                    logger.info("sink switch for %s reads %s (not enforced: "
+                                "no carry-over marker)", client, state)
 
     def start(self) -> tuple[list[Pipeline], list[Pipeline], list[Refusal]]:
         """The start's build: (running, every pipeline built, refused files)."""
@@ -835,6 +853,11 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     watermark = SqliteWatermarkStore(default_path())
     rebuilder = Rebuilder(manifest_path, manifest, watermark,
                           marker=marker_path())
+    # ONE gate for the daemon's life (spec §3.2): every rebuild keeps the
+    # Uploader, and with it this gate, so each pipeline's last decision and
+    # the once-only lines survive a rebuild.  It reads the same sinks/ and
+    # marker as the Rebuilder, `sink status` and the writer.
+    gate = SinkGate(rebuilder.sdir, rebuilder.marker)
     pipelines, built, file_refused = rebuilder.start()
     if not pipelines:
         if file_refused:
@@ -856,7 +879,7 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
     logger.info("daemon: %d pipeline(s): %s",
                 len(pipelines), ", ".join(p.name for p in pipelines))
 
-    uploader = _new_uploader(pipelines)
+    uploader = _new_uploader(pipelines, gate=gate.may_send)
 
     if dry_run:
         logger.info("daemon: --dry-run — pipelines built, not pumping")

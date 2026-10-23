@@ -831,7 +831,9 @@ def test_sqlite_source_closes_on_its_worker_thread_and_leaks_no_fd(
     assert counts[-1] <= counts[2], counts
 
 
-# ---- test 19 and the switch report: reported, never enforced (spec 6.2) --------------
+# ---- test 19 and the switch report (spec 6.2, 9.2) ---------------------------------
+# Without the carry-over marker the switches stay unenforced (gate rule 3), and
+# the report says so; with it standing the report says "enforced".
 
 
 def _sw(station, client, state):
@@ -852,12 +854,16 @@ def fresh_switch_state():
 
 def _would(caplog):
     return [r.getMessage() for r in caplog.records
-            if "would read" in r.getMessage()]
+            if r.getMessage().startswith("sink switch for ")]
+
+
+NOT_ENFORCED = "(not enforced: no carry-over marker)"
 
 
 def test_switch_reading_off_does_not_stop_the_pipeline_shipping(
         station, caplog, fresh_switch_state):
-    """Test 19: the daemon reports the switch and enforces nothing."""
+    """Test 19: without the marker the daemon reports the switch and
+    enforces nothing."""
     station.legacy(_entry("leg", client="c1"))
     _sw(station, "c1", "off")
     with caplog.at_level(logging.INFO, logger="hs_uploader"):
@@ -865,8 +871,7 @@ def test_switch_reading_off_does_not_stop_the_pipeline_shipping(
         up.pump_until_idle()
     p = _by_name(up, "leg")
     assert p.transport.shipped, "an off switch must not stop the send"
-    assert _would(caplog) == [
-        "sink switch for c1 would read off (not enforced in this release)"]
+    assert _would(caplog) == [f"sink switch for c1 reads off {NOT_ENFORCED}"]
 
 
 def test_switch_report_logs_changes_only_and_errors_once(
@@ -880,8 +885,7 @@ def test_switch_report_logs_changes_only_and_errors_once(
         for _i in range(3):                      # three rebuilds, same answer
             station.file("x.toml.new", str(_i))
             r.rebuild(up)
-    assert _would(caplog) == [
-        "sink switch for c1 would read off (not enforced in this release)"]
+    assert _would(caplog) == [f"sink switch for c1 reads off {NOT_ENFORCED}"]
     errors = [x for x in caplog.records if x.levelno == logging.ERROR]
     assert len(errors) == 1
     # the answer changes: one more line
@@ -889,8 +893,59 @@ def test_switch_report_logs_changes_only_and_errors_once(
     caplog.clear()
     with caplog.at_level(logging.INFO, logger="hs_uploader"):
         r.rebuild(up)
-    assert _would(caplog) == [
-        "sink switch for c1 would read upload (not enforced in this release)"]
+    assert _would(caplog) == [f"sink switch for c1 reads upload {NOT_ENFORCED}"]
+
+
+def test_switch_report_says_enforced_when_the_marker_stands(
+        station, caplog, fresh_switch_state):
+    from hs_uploader.sinkswitch import marker_path
+    station.legacy(_entry("leg", client="c1"))
+    _sw(station, "c1", "fill")
+    marker = marker_path()
+    wm = SqliteWatermarkStore(station.db)
+    r = daemon.Rebuilder(station.manifest,
+                         daemon.load_manifest(station.manifest), wm,
+                         marker=marker)
+    with caplog.at_level(logging.INFO, logger="hs_uploader"):
+        r.start()
+        assert _would(caplog) == [
+            f"sink switch for c1 reads fill {NOT_ENFORCED}"]
+        caplog.clear()
+        marker.write_text("carried over\n")    # the marker appears
+        for _ in range(100):                    # a hundred pumps: one line
+            r.marker_check()
+        assert _would(caplog) == ["sink switch for c1 reads fill (enforced)"]
+        for i in range(3):                      # three rebuilds: none more
+            station.file("x.toml.new", str(i))
+            r.report_switches()
+        assert _would(caplog) == ["sink switch for c1 reads fill (enforced)"]
+        caplog.clear()
+        marker.unlink()                         # positive control: it goes
+        for _ in range(100):
+            r.marker_check()
+    assert _would(caplog) == [f"sink switch for c1 reads fill {NOT_ENFORCED}"]
+
+
+def test_no_sinks_directory_with_marker_says_no_policy_line(
+        station, caplog, fresh_switch_state):
+    """With the marker standing a missing sinks/ is a fault the gate reports;
+    "the manifest's policy governs" would be false."""
+    from hs_uploader.sinkswitch import marker_path
+    station.legacy(_entry("leg", client="c1"))
+    marker = marker_path()
+    wm = SqliteWatermarkStore(station.db)
+    r = daemon.Rebuilder(station.manifest,
+                         daemon.load_manifest(station.manifest), wm,
+                         marker=marker)
+    with caplog.at_level(logging.INFO, logger="hs_uploader"):
+        marker.write_text("carried over\n")
+        r.start()
+        assert not any("policy governs" in x.getMessage()
+                       for x in caplog.records)
+        marker.unlink()                         # control: without it, it says so
+        r.report_switches()
+    assert [x.getMessage() for x in caplog.records].count(
+        "no switch files; the manifest's policy governs") == 1
 
 
 def test_no_sinks_directory_logs_one_info_line(

@@ -190,7 +190,7 @@ def test_rule4_no_client_sends_one_info(tree, caplog):
             d = g.decide(p)
             assert d.send and d.rule == 4 and d.reason == "no client"
     infos = [r.getMessage() for r in gate_lines(caplog, logging.INFO)]
-    assert infos == ["pipeline 'old' names no client; its manifest's policy "
+    assert infos == ["pipeline old names no client; its manifest's policy "
                      "governs it"]
 
 

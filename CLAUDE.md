@@ -224,12 +224,22 @@ explicit even when no third-party deps are required.
   (`state` is `off`, `fill` or `upload`; the effective state is the stricter of the client's file and the site file, where `off` is strictest; a
   missing client file or a read failure reads `off`; a missing site file
   sets no limit).  `write_switch` writes under `sinks/.lock`, atomically.
-- The gate exists (`gate.SinkGate`, and `Uploader(gate=...)` below), but the
-  daemon does not pass it yet; spec sink-2b-part2 Task 6 wires it.  Until then
-  no switch stops anything.  `Rebuilder.report_switches`
-  logs what each governed client's switch would read, and
-  `hs-uploader sink status` prints it with "not enforced".  `governed` on
-  an entry is stored on the `Pipeline` and read only for that report.
+- The daemon builds one `gate.SinkGate` at start, on the same `sinks/` and
+  marker path that the Rebuilder, `sink status` and the writer read, and
+  passes its `may_send` to the one `Uploader`.  The Uploader, and so the
+  gate, lasts across rebuilds.  The gate enforces the switches only while
+  the carry-over marker stands (rule 3).  It logs each pipeline's change
+  between sending and held once, at INFO ("pipeline X held: sink filling
+  (site)", "pipeline X sending: sink uploading"); a pipeline held at its
+  first decision logs its held line then.  The rule 4 line ("names no
+  client") appears once per pipeline per daemon.  A fault (a broken switch
+  file, `sinks/` missing under the marker, an exception in the gate) logs
+  at ERROR once, then a reminder every 6 h (`gate.REMIND_S`) while it
+  lasts; every table of logged keys is capped at `gate.SAID_CAP`.
+  `Rebuilder.report_switches` logs each governed client's switch, "reads
+  fill (enforced)" or "(not enforced: no carry-over marker)", once per
+  change, and again when the marker appears or goes.  `hs-uploader sink
+  status` still prints "not enforced" until its own task lands.
 - `Uploader(gate=...)` asks the gate at the top of each pipeline's pump,
   before each retry pop and before each source batch; a held pipeline
   touches nothing and resumes where it stopped.  `gate=None` (the default,

@@ -578,10 +578,8 @@ def test_marker_appearing_runs_the_pass_before_the_next_held_pump(
     ]
 
     class Scripted(Uploader):
-        def __init__(self, pipelines, **kw):
-            gate = SinkGate(station.sinks, station.marker)
-            super().__init__(pipelines, gate=gate.may_send, **kw)
-
+        # The daemon passes its own gate (Task 6), on station.sinks and
+        # station.marker.
         def pump(self):
             n = len(seen)
             p = self.pipelines[0]
