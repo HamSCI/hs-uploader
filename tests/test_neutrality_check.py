@@ -1782,3 +1782,203 @@ def test_a_held_pump_that_writes_its_store_is_no_hold(tmp_path, capsys):
         "psk-pskreporter: DISAGREE (the switches hold it: psk-recorder reads "
         "fill; NEW wrote the store)"), out
     assert "HELD" not in _final(out).split("(")[0]
+
+
+# ---- Task 12 review, fix round 1 ---------------------------------------------
+
+
+def test_a_starting_pass_that_moves_an_existing_record_disagrees(tmp_path, capsys):
+    """I1 (reviewer's attack D2): NEW's starting pass moves the existing
+    send record of the held psk pipeline and reports nothing.  The tool
+    diffs the store itself, so it never trusts NEW's own account."""
+    tree = _changed_tree(
+        tmp_path, "watermark/sqlite.py",
+        "ON CONFLICT(source_id, dest_id, table_name) DO NOTHING\",",
+        "ON CONFLICT(source_id, dest_id, table_name) DO UPDATE SET "
+        "cursor=excluded.cursor\",")
+    d = tree / "hs_uploader" / "daemon.py"
+    text = d.read_text()
+    old = "            if store.get_cursor(*key):\n                continue\n"
+    assert text.count(old) == 1 and text.count("        if wrote:") == 1
+    d.write_text(text.replace(old, (
+        "            if store.get_cursor(*key) and "
+        "getattr(pipe, 'client', '') != 'psk-recorder':\n"
+        "                continue\n")).replace("        if wrote:", "        if False:"))
+    code, out, _ = _gated(capsys, tmp_path,
+                          sinks=_switches(tmp_path, psk_recorder="fill"),
+                          marker=_marker(tmp_path), new=tree)
+    assert code == 1, out
+    assert ("NEW's starting pass changed an existing send record: "
+            + "|".join(PSK_KEY)) in out
+    assert _section(out, "psk-pskreporter").startswith(
+        "psk-pskreporter: DISAGREE (the starting pass moved its send record)")
+    assert _final(out).startswith("RESULT: DISAGREE")
+
+
+def test_starting_records_come_from_the_tools_own_diff(tmp_path, capsys):
+    """A NEW pass that writes a record but reports none is still named."""
+    tree = _changed_tree(tmp_path, "daemon.py", "        if wrote:",
+                         "        if False:")
+    manifest, sink, watermarks, _ = _station(tmp_path, GATED)
+    watermarks.chmod(0o644)
+    conn = sqlite3.connect(watermarks)
+    conn.execute("DELETE FROM watermarks WHERE source_id = ?", (PSK_KEY[0],))
+    conn.commit()
+    conn.close()
+    watermarks.chmod(0o444)
+    args = _args(manifest, sink, watermarks, new=tree) + [
+        "--sinks", str(_switches(tmp_path, psk_recorder="fill")),
+        "--marker", str(_marker(tmp_path))]
+    code = nc.main(args)
+    out = capsys.readouterr().out
+    assert "NEW wrote starting records: " + "|".join(PSK_KEY) in out
+    assert code == 0, out
+
+
+def test_a_held_pump_that_changes_the_sink_is_no_hold(tmp_path, capsys):
+    """M3 (reviewer's attack E): a held pump that deletes sink rows."""
+    tree = _changed_tree(
+        tmp_path, "core.py",
+        'transitions.\n        """\n        if not self._may_send(pipe):\n'
+        '            return False\n',
+        'transitions.\n        """\n        if not self._may_send(pipe):\n'
+        '            import os, sqlite3\n'
+        '            c = sqlite3.connect(os.environ["SIGMOND_SQLITE_PATH"]); '
+        'c.execute("DELETE FROM pending_uploads WHERE target_db=\'psk\'"); '
+        'c.commit(); c.close()\n'
+        '            return False\n')
+    code, out, _ = _gated(capsys, tmp_path,
+                          sinks=_switches(tmp_path, psk_recorder="fill"),
+                          marker=_marker(tmp_path), new=tree)
+    assert code == 1, out
+    assert _section(out, "psk-pskreporter").startswith(
+        "psk-pskreporter: DISAGREE (the switches hold it: psk-recorder reads "
+        "fill; NEW wrote the sink)"), out
+
+
+# I2 (reviewer's attack F): two legacy entries share a name; the second is
+# the heartbeat (exempt by rule 2).  The first must not borrow its exemption.
+DUP = GATED.replace('name = "heartbeat"\nclient = "sigmond"\n',
+                    'name = "psk-pskreporter"\nclient = "sigmond"\n')
+assert DUP.count('name = "psk-pskreporter"') == 2
+
+
+def test_a_duplicate_name_never_lends_its_exemption(tmp_path, capsys):
+    tree = _changed_tree(tmp_path, "core.py", "if self._gate is None:", "if True:")
+    code, out, _ = _gated(capsys, tmp_path, manifest_text=DUP,
+                          sinks=_switches(tmp_path, psk_recorder="fill"),
+                          marker=_marker(tmp_path), new=tree)
+    assert code == 1, out
+    assert _section(out, "psk-pskreporter").startswith(
+        "psk-pskreporter: DISAGREE (the switches hold it: psk-recorder reads fill")
+    assert _section(out, "psk-pskreporter#2").startswith("psk-pskreporter#2: AGREE")
+    assert _final(out).startswith("RESULT: DISAGREE")
+
+
+def test_a_duplicate_name_on_a_correct_tree_passes(tmp_path, capsys):
+    code, out, _ = _gated(capsys, tmp_path, manifest_text=DUP,
+                          sinks=_switches(tmp_path, psk_recorder="fill"),
+                          marker=_marker(tmp_path))
+    assert code == 0, out
+    assert _section(out, "psk-pskreporter").startswith(
+        "psk-pskreporter: HELD (psk-recorder reads fill)")
+    assert _section(out, "psk-pskreporter#2").startswith("psk-pskreporter#2: AGREE")
+
+
+def test_a_name_that_holds_a_hash_is_matched_whole(tmp_path, capsys):
+    text = GATED.replace('name = "wspr-wsprnet"\n', 'name = "wspr#net"\n')
+    code, out, _ = _gated(capsys, tmp_path, manifest_text=text,
+                          sinks=_switches(tmp_path, wspr_recorder="fill"),
+                          marker=_marker(tmp_path))
+    assert code == 0, out
+    assert _section(out, "wspr#net").startswith(
+        "wspr#net: HELD (wspr-recorder reads fill)")
+
+
+def _ns(manifest, **kw):
+    base = dict(manifest=manifest, new_manifest=None, new_pipelines_d=None,
+                sinks=None, marker=None)
+    base.update(kw)
+    return argparse.Namespace(**base)
+
+
+def _new_entry(name, occurrence=1, **attrs):
+    entry = _entry()
+    entry.update(name=name, occurrence=occurrence, attrs={
+        "client": "", "origin": "legacy", "governed": True,
+        "heartbeat": False, "rider": False, **attrs})
+    return entry
+
+
+def test_a_duplicate_whose_order_cannot_be_matched_is_inconclusive(tmp_path, capsys):
+    manifest = tmp_path / "pipelines.toml"
+    manifest.write_text(DUP.format(heartbeat=tmp_path))
+    # NEW built them the other way round: its first carries sigmond.
+    new = _result({
+        "psk-pskreporter": _new_entry("psk-pskreporter", 1, client="sigmond",
+                                      heartbeat=True),
+        "psk-pskreporter#2": _new_entry("psk-pskreporter", 2,
+                                        client="psk-recorder")})
+    old = _result({k: _entry() for k in new["pipelines"]})
+    expect = nc._expectations(_ns(manifest, marker=_marker(tmp_path)), old, new)
+    assert nc._report(old, new, expect) == 1
+    out = capsys.readouterr().out
+    assert "psk-pskreporter: INCONCLUSIVE (" in out
+    assert _untallied(out).startswith("RESULT: INCONCLUSIVE (")
+    assert "not judged" in _final(out)
+
+
+def test_a_pipeline_outside_the_tools_layout_is_inconclusive_once_the_marker_stands(
+        tmp_path, capsys):
+    """M1: a builder entry's pipelines are not in the tool's own read; their
+    expectation never comes from NEW's own attributes."""
+    manifest = tmp_path / "pipelines.toml"
+    manifest.write_text(GATED.format(heartbeat=tmp_path))
+    new = _result({"built-by-builder": _new_entry("built-by-builder",
+                                                  client="sigmond")})
+    old = _result({"built-by-builder": _entry()})
+    expect = nc._expectations(_ns(manifest, marker=_marker(tmp_path)), old, new)
+    assert nc._report(old, new, expect) == 1
+    out = capsys.readouterr().out
+    assert "built-by-builder: INCONCLUSIVE (not in the manifest the tool read" in out
+    assert "PASS" not in _final(out)
+    # Without the marker nothing is held, so the tool can judge it.
+    expect = nc._expectations(_ns(manifest), old, new)
+    assert nc._report(old, new, expect) == 0
+
+
+def test_include_psk_reads_as_the_factory_reads_it(tmp_path):
+    """M2: a truthy include_psk other than true still rides."""
+    manifest = tmp_path / "pipelines.toml"
+    manifest.write_text(GATED.replace("include_psk = true", "include_psk = 1")
+                        .format(heartbeat=tmp_path))
+    assert nc._own_layout(manifest, None)["wspr-wsprdaemon"][0]["rider"] is True
+
+
+def test_a_held_pump_on_a_wal_sink_is_still_a_hold(tmp_path, capsys):
+    """No false alarm from the sink print: a WAL sink whose rows still sit
+    in the -wal stays byte-for-byte unchanged around a held pump, since the
+    worker's guard connection keeps any close from checkpointing it."""
+    manifest, sink, watermarks, _ = _station(tmp_path, GATED)
+    sink.chmod(0o644)
+    conn = sqlite3.connect(sink)
+    try:
+        conn.execute("PRAGMA journal_mode=WAL")
+        conn.execute("PRAGMA wal_autocheckpoint=0")
+        conn.execute(
+            "INSERT INTO pending_uploads(target_db, target_table, "
+            "schema_version, payload_json, queued_at) VALUES (?,?,?,?,?)",
+            ("psk", "spots", 2, json.dumps({
+                "time": "2026-10-07T12:04:15Z", "mode": "ft8",
+                "tx_call": "K6FGH", "forward_to_pskreporter": 0}),
+             "2026-10-07T12:04:15Z"))
+        conn.commit()
+        assert Path(f"{sink}-wal").exists()
+        code = nc.main(_args(manifest, sink, watermarks) + [
+            "--sinks", str(_switches(tmp_path, psk_recorder="fill")),
+            "--marker", str(_marker(tmp_path))])
+    finally:
+        conn.close()
+    out = capsys.readouterr().out
+    assert code == 0, out
+    assert _section(out, "psk-pskreporter").startswith("psk-pskreporter: HELD")

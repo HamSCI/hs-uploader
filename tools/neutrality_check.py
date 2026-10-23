@@ -35,7 +35,14 @@ builds each Uploader with the tree's own SinkGate when the tree has one,
 and passes the same paths to the tree's build (the psk rider gate).  A
 tree without a gate (part 1 or older) runs as it always ran.  While the
 marker stands, NEW's starting-record pass runs before any pump, as the
-daemon runs it, and the report names each key it wrote.
+daemon runs it.  The tool diffs the store copy's send records around the
+pass itself: it names each key the pass added, and a record that existed
+and changed ends that pipeline, and the run, DISAGREE.
+
+Once the marker stands, a pipeline the tool cannot find in its own read of
+the manifest (a builder entry), or one of several entries sharing a name
+whose build order the tool cannot confirm, ends INCONCLUSIVE: the tool
+never borrows NEW's own idea of what governs it.
 
 The tool predicts which pipelines the switches hold with its own small
 reader (tomllib; the stricter of the client's file and site.toml; a
@@ -51,7 +58,7 @@ upload.  Each pipeline then ends in one of three verdicts:
              expected one);
   HELD       the tool's reader says the switches hold it, and NEW read no
              send record, produced no batch, sent nothing, asked for no
-             retry and wrote nothing to its store;
+             retry and changed neither its store copy nor its sink copy;
   DISAGREE   anything else: an unexpected hold, an expected hold that did
              anything, a tar other than the expected one.  HELD never
              stands in for a DISAGREE.
@@ -336,6 +343,37 @@ def _store_print(path: Path) -> str:
     return h.hexdigest()
 
 
+def _sink_print(path: Path) -> tuple:
+    """(size, mtime_ns, inode) of the sink copy and any -wal or -journal
+    beside it.  Any write changes one of them; a read changes none, since
+    the worker holds a guard connection open, so no reader's close can
+    checkpoint the -wal into the file."""
+    marks = []
+    for suffix in ("", "-wal", "-journal"):
+        try:
+            st = os.stat(f"{path}{suffix}")
+        except FileNotFoundError:
+            marks.append(None)
+        else:
+            marks.append((st.st_size, st.st_mtime_ns, st.st_ino))
+    return tuple(marks)
+
+
+def _store_rows(sqlite3, watermarks: Path) -> dict:
+    """Every send record in the store copy, read by the tool itself:
+    "source|dest|table" -> (cursor, last_ack).  The tool learns what NEW's
+    starting pass wrote from this, never from NEW's own account (Ruling 15)."""
+    conn = sqlite3.connect(watermarks)
+    try:
+        return {f"{s}|{d}|{tb}": (bytes(c).hex() if isinstance(c, (bytes, memoryview))
+                                  else repr(c), a)
+                for s, d, tb, c, a in conn.execute(
+                    "SELECT source_id, dest_id, table_name, cursor, last_ack "
+                    "FROM watermarks")}
+    finally:
+        conn.close()
+
+
 def _rider_producers(sqlite3, sink: Path, records: list) -> list:
     """For each psk.spots record of a cycle batch, the `producer` column of
     the sink row it came from ('' when the column reads '' or the sink has
@@ -414,6 +452,10 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
     ids: list = []
     opened: set = set()
     _tap_sqlite(sqlite3, sink, ids, opened)
+    # Held open for the whole run, so no other connection's close is the
+    # last one and checkpoints the sink's -wal (see _sink_print).
+    guard = sqlite3.connect(sink)
+    guard.execute("SELECT count(*) FROM sqlite_master").fetchall()
     now = _parse_now(now_iso)
     try:
         _freeze_clock(now)
@@ -494,9 +536,10 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
     store = _TapStore(watermarks)
     result: dict = {"tree": str(pkg), "pipelines": {}, "unbuilt": [],
                     "refused": [], "gate": gate is not None,
-                    "starting_records": None}
+                    "starting_records": None, "start_moved": []}
 
     def finish() -> int:
+        guard.close()
         result["opened"] = sorted(opened)
         out.write_text(json.dumps(result))
         return 0
@@ -532,12 +575,26 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
     write_start = getattr(daemon_mod, "write_starting_records", None)
     if gate is not None and write_start is not None and not freeze_error:
         if os.path.lexists(marker):
-            result["starting_records"] = list(write_start(pipelines, store))
+            # What the pass wrote comes from the tool's own diff of the
+            # store, never from the pass's return value (review I1).  A
+            # record that existed and changed, or vanished, is a fault.
+            before = _store_rows(sqlite3, watermarks)
+            write_start(pipelines, store)
+            after = _store_rows(sqlite3, watermarks)
             store.reads.clear()
+            result["starting_records"] = sorted(k for k in after
+                                                if k not in before)
+            result["start_moved"] = sorted(
+                k for k in before if after.get(k) != before[k])
+    seen: dict = {}
     for pipe in pipelines:
         label, n = pipe.name, 2
         while label in result["pipelines"]:
             label, n = f"{pipe.name}#{n}", n + 1
+        # The tool matches a pipeline to its manifest entry by its real name
+        # and its place among the pipelines of that name, never by parsing
+        # the label (review I2).
+        seen[pipe.name] = seen.get(pipe.name, 0) + 1
         limits = _limits(pipe.transport, pipe)
         recorder = _Recorder(pipe.transport)
         pipe.transport = recorder
@@ -546,7 +603,8 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
         entry = {"key": None, "stored": None, "queued": None,
                  "limits": limits, "batch": None, "error": None,
                  "sent": False, "pops": 0, "wrote": False,
-                 "attrs": _attrs(pipe)}
+                 "sink_wrote": False, "attrs": _attrs(pipe),
+                 "name": pipe.name, "occurrence": seen[pipe.name]}
         if freeze_error:
             # Pumping now would run on the real clock.  Say so, and stop.
             entry["error"] = freeze_error
@@ -557,6 +615,7 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
             entry["queued"] = store.queued(pipe.name)
             kw = {} if gate is None else {"gate": gate.may_send}
             before = _store_print(watermarks)
+            sink_before = _sink_print(sink)
             uploader = Uploader([pipe], now_fn=now.timestamp, **kw)
             try:
                 uploader.pump()
@@ -565,6 +624,7 @@ def _worker(tree: Path, manifest_path: Path, sink: Path, watermarks: Path,
             finally:
                 uploader.close()
                 entry["wrote"] = _store_print(watermarks) != before
+                entry["sink_wrote"] = _sink_print(sink) != sink_before
         except Exception as exc:  # noqa: BLE001 - reported per pipeline
             entry["error"] = f"{type(exc).__name__}: {exc}"
         entry["sent"] = recorder.sent
@@ -663,10 +723,12 @@ def _own_psk_producer(payload) -> str:
 
 
 def _own_layout(manifest: Path, pdir) -> dict:
-    """pipeline name -> the fields the gate's rules read, from the tool's
-    own read of the manifest and pipelines.d/.  A file present in
-    pipelines.d/ silences its client's legacy entries; a file's client is
-    its name.  A file that does not parse adds nothing (NEW refuses it)."""
+    """pipeline name -> a list of the fields the gate's rules read, one per
+    entry of that name, in the daemon's build order (legacy entries in
+    manifest order, then each file in name order), from the tool's own read
+    of the manifest and pipelines.d/.  A file present in pipelines.d/
+    silences its client's legacy entries; a file's client is its name.  A
+    file that does not parse adds nothing (NEW refuses it)."""
     def fields(entry, client, origin):
         source = entry.get("source") or {}
         transport = entry.get("transport") or {}
@@ -676,8 +738,9 @@ def _own_layout(manifest: Path, pdir) -> dict:
             "governed": entry.get("governed", True) is not False,
             "heartbeat": str(transport.get("type", "")).strip().lower()
             == "heartbeat_sftp",
+            # bool(), as pipeline_factory reads it (review M2).
             "rider": (str(source.get("type", "")).strip().lower() == "wspr_cycle"
-                      and source.get("include_psk") is True),
+                      and bool(source.get("include_psk", False))),
         }
 
     files = []
@@ -693,7 +756,8 @@ def _own_layout(manifest: Path, pdir) -> dict:
     for entry in legacy.get("pipeline", []) or []:
         client = str(entry.get("client") or "")
         if entry.get("name") and client not in present:
-            found[str(entry["name"])] = fields(entry, client, "legacy")
+            found.setdefault(str(entry["name"]), []).append(
+                fields(entry, client, "legacy"))
     for name in files:
         try:
             data = tomllib.loads((Path(pdir) / name).read_text(encoding="utf-8"))
@@ -701,8 +765,8 @@ def _own_layout(manifest: Path, pdir) -> dict:
             continue
         for entry in data.get("pipeline", []) or []:
             if isinstance(entry, dict) and entry.get("name"):
-                found[str(entry["name"])] = fields(
-                    entry, name[:-len(".toml")], f"pipelines.d/{name}")
+                found.setdefault(str(entry["name"]), []).append(fields(
+                    entry, name[:-len(".toml")], f"pipelines.d/{name}"))
     return found
 
 
@@ -758,12 +822,41 @@ def _expectations(args, old: dict, new: dict) -> dict:
     sinks = getattr(args, "sinks", None)
     layout = _own_layout(getattr(args, "new_manifest", None) or args.manifest,
                          getattr(args, "new_pipelines_d", None))
+    built: dict = {}       # name -> how many pipelines NEW built of it
+    for label, entry in new["pipelines"].items():
+        name = (entry or {}).get("name", label)
+        built[name] = built.get(name, 0) + 1
     out = {}
     for label, entry in new["pipelines"].items():
-        fields = (layout.get(label.split("#")[0])
-                  or (entry or {}).get("attrs")
-                  or {"client": "", "origin": "legacy", "governed": True,
-                      "heartbeat": False, "rider": False})
+        entry = entry or {}
+        name, occurrence = entry.get("name", label), entry.get("occurrence", 1)
+        own = layout.get(name) or []
+        if not marker:
+            # Rule 3: nothing is held, and no rider leaves out a row.
+            out[label] = {"hold": False, "why": "", "rider": None}
+            continue
+        unjudged = None
+        if occurrence > len(own):
+            # A builder entry, or anything else the tool cannot read for
+            # itself: its expectation never comes from NEW (review M1).
+            unjudged = ("not in the manifest the tool read (a builder "
+                        "entry?); the tool cannot judge its switches")
+        elif len(own) > 1:
+            # Several entries share the name.  NEW's n-th pipeline of the
+            # name is the n-th entry in build order; NEW's own attributes
+            # serve only to confirm that order (review I2).
+            mine = own[occurrence - 1]
+            theirs = entry.get("attrs") or {}
+            if (built.get(name) != len(own)
+                    or theirs.get("client") != mine["client"]
+                    or theirs.get("origin") != mine["origin"]):
+                unjudged = (f"{len(own)} entries share the name {name!r} and "
+                            f"the tool cannot match this one to its entry")
+        if unjudged:
+            out[label] = {"hold": None, "why": unjudged, "rider": None,
+                          "unjudged": True}
+            continue
+        fields = own[occurrence - 1]
         hold, why = _own_hold(fields, marker, sinks)
         rider = None
         o = old["pipelines"].get(label)
@@ -986,6 +1079,8 @@ def _did(entry: dict) -> list:
         did.append("asked for a retry")
     if entry.get("wrote"):
         did.append("wrote the store")
+    if entry.get("sink_wrote"):
+        did.append("wrote the sink")
     return did
 
 
@@ -993,7 +1088,7 @@ def _rows(n: int) -> str:
     return f"{n} psk row{'' if n == 1 else 's'}"
 
 
-def _verdict(old, new, expect=None) -> tuple:
+def _verdict(old, new, expect=None, moved=frozenset()) -> tuple:
     """(AGREE | HELD | DISAGREE, why, differing fields).
 
     HELD only where the tool's own reader expects the hold and NEW did
@@ -1002,7 +1097,12 @@ def _verdict(old, new, expect=None) -> tuple:
     DISAGREE: HELD never stands in for one."""
     if old is None or new is None:
         return "DISAGREE", "", _differing(old, new)
+    if old.get("key") is not None and "|".join(old["key"]) in moved:
+        return ("DISAGREE", "the starting pass moved its send record",
+                ["the send record, before any pump"])
     expect = expect or {"hold": False, "why": "", "rider": None}
+    if expect.get("unjudged"):
+        return "INCONCLUSIVE", expect["why"], []
     did = _did(new)
     if expect["hold"]:
         if not did:
@@ -1031,10 +1131,11 @@ def _report(old: dict, new: dict, expect: dict | None = None) -> int:
     expect = expect or {}
     names = list(old["pipelines"])
     names += [n for n in new["pipelines"] if n not in names]
-    counts = {"AGREE": 0, "HELD": 0, "DISAGREE": 0}
+    counts = {"AGREE": 0, "HELD": 0, "DISAGREE": 0, "INCONCLUSIVE": 0}
+    moved = set(new.get("start_moved") or [])
     for name in names:
         o, n = old["pipelines"].get(name), new["pipelines"].get(name)
-        verdict, why, differ = _verdict(o, n, expect.get(name))
+        verdict, why, differ = _verdict(o, n, expect.get(name), moved)
         counts[verdict] += 1
         print(f"{name}: {verdict}" + (f" ({why})" if why else ""))
         print(f"  OLD key  {_key_text(o)}")
@@ -1052,6 +1153,8 @@ def _report(old: dict, new: dict, expect: dict | None = None) -> int:
             print(f"{label} wrote starting records: {', '.join(written)}")
         else:
             print(f"{label} wrote no starting record")
+    for key in sorted(moved):
+        print(f"NEW's starting pass changed an existing send record: {key}")
     refused = 0
     for label, res in (("OLD", old), ("NEW", new)):
         for r in res.get("refused", []):
@@ -1069,7 +1172,7 @@ def _report(old: dict, new: dict, expect: dict | None = None) -> int:
           f"{counts['HELD']} held, {counts['DISAGREE']} disagree")
     tally = (f"{counts['AGREE']} AGREE, {counts['HELD']} HELD, "
              f"{counts['DISAGREE']} DISAGREE")
-    if counts["DISAGREE"] or old["unbuilt"] != new["unbuilt"]:
+    if counts["DISAGREE"] or moved or old["unbuilt"] != new["unbuilt"]:
         note = f"; {len(raised)} raised an error; see above" if raised else ""
         print(f"RESULT: DISAGREE ({tally}{note})")
         return 1
@@ -1084,6 +1187,8 @@ def _report(old: dict, new: dict, expect: dict | None = None) -> int:
         reasons.append(f"{len(unbuilt)} not built; see above")
     if raised:
         reasons.append(f"{len(raised)} raised an error; see above")
+    if counts["INCONCLUSIVE"]:
+        reasons.append(f"{counts['INCONCLUSIVE']} not judged; see above")
     if refused:
         # A refused file sends nothing, so the pipelines in it were never
         # compared (Ruling 2).
