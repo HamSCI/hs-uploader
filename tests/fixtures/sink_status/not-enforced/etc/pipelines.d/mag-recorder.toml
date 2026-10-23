@@ -1,0 +1,9 @@
+[[pipeline]]
+name = "mag-recorder-psws"
+[pipeline.source]
+type = "filetree"
+root = "/var/lib/mag-recorder/outbox"
+patterns = ["*.zip"]
+[pipeline.transport]
+type = "psws_dataset"
+instrument_id = "367"

@@ -1,0 +1,9 @@
+[[pipeline]]
+name = "wspr-recorder-wsprnet"
+[pipeline.source]
+type = "sqlite"
+db_path = "/var/lib/sigmond/sink.db"
+table = "wspr.spots"
+producer = "wspr-recorder"
+[pipeline.transport]
+type = "wsprnet"

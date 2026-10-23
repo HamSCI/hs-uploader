@@ -49,7 +49,9 @@ hs-uploader migrate --check    # watermarks.db schema version; writes nothing
 hs-uploader migrate            # run pending migrations (sigmond does this on each manifest write)
 hs-uploader capabilities            # store schema version this code writes (one integer, now 3)
 hs-uploader capabilities --features # feature words: pipelines.d, send-log-v3, switch-files
-hs-uploader sink status             # each client's switch file and effective state; enforces nothing
+hs-uploader sink status [--json]    # switches, effective states, and what the gate holds ("enforced" once the marker stands)
+hs-uploader sink set <site|client> <off|fill|upload> --reason R --by B   # through write_switch (root on the real sinks/)
+hs-uploader sink mark-carried [--note N]   # writes the carry-over marker atomically
 ```
 
 Clients store rows through `hs_uploader.sink.Writer` and build
@@ -238,8 +240,18 @@ explicit even when no third-party deps are required.
   lasts; every table of logged keys is capped at `gate.SAID_CAP`.
   `Rebuilder.report_switches` logs each governed client's switch, "reads
   fill (enforced)" or "(not enforced: no carry-over marker)", once per
-  change, and again when the marker appears or goes.  `hs-uploader sink
-  status` still prints "not enforced" until its own task lands.
+  change, and again when the marker appears or goes.
+- `hs-uploader sink status` says "enforced" while the marker stands.  Its
+  held pipelines come from `SinkGate.decide` itself, asked about
+  `daemon.pipe_views(layout)`: each pipeline the daemon builds from the
+  same files, with its transport but no source, store or connection.
+  `effective` and `held_by` (`gate.held_by`: site, client, fault or none)
+  read the switches alone and do not depend on the marker.  Refused files
+  come from this read of `pipelines.d/` and from `pipeline_state`, opened
+  read-only.  `--json` carries `"schema": 1`.  `sink set` writes through
+  `write_switch` (lock, atomic) and refuses a non-root caller on the real
+  `sinks/`; `--identity-json -` reads the identity tables from stdin.
+  `sink mark-carried` writes the marker through `write_marker`.
 - `Uploader(gate=...)` asks the gate at the top of each pipeline's pump,
   before each retry pop and before each source batch; a held pipeline
   touches nothing and resumes where it stopped.  `gate=None` (the default,

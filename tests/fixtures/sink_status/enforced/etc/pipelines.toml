@@ -1,0 +1,14 @@
+[identity]
+call = "AC0G"
+grid = "EM38ww"
+
+[[pipeline]]
+name = "sigmond-heartbeat"
+client = "sigmond"
+[pipeline.source]
+type = "sqlite"
+db_path = "/var/lib/sigmond/sink.db"
+table = "sigmond.heartbeat"
+[pipeline.transport]
+type = "heartbeat_sftp"
+host = "heartbeat.example"

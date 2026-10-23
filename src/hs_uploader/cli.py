@@ -30,11 +30,23 @@ import os
 import sys
 from pathlib import Path
 
+from . import sinkswitch
 from .watermark.sqlite import SqliteWatermarkStore, default_path
 
 
 # A word appears only in the release that ships its code complete (spec 7.1).
 FEATURES = ("pipelines.d", "send-log-v3", "switch-files")
+
+# The production manifest; sinks/ beside it is the real switch directory.
+_REAL_MANIFEST = "/etc/hs-uploader/pipelines.toml"
+
+# `sink status --json` layout version; sigmond refuses another (V14).
+SINK_STATUS_SCHEMA = 1
+
+
+def _euid() -> int:
+    """The caller's effective uid; tests replace it to drive the root check."""
+    return os.geteuid()
 
 
 def _build_parser() -> argparse.ArgumentParser:
@@ -135,16 +147,52 @@ def _build_parser() -> argparse.ArgumentParser:
         help="Print one feature word per line instead of the schema version.")
     sp_caps.set_defaults(func=None)
 
-    sp_sink = sub.add_parser("sink", help="Sink switches (reported, not enforced).")
+    sp_sink = sub.add_parser(
+        "sink", help="Sink switches: set one, mark the carry-over done, and "
+                     "report what the gate enforces.")
     sink_sub = sp_sink.add_subparsers(dest="sink_cmd", required=True)
     sp_ss = sink_sub.add_parser(
-        "status", help="Show each client's switch file and effective state.")
+        "status", help="Show the site switch, each client's switch file and "
+                       "effective state, and the pipelines the gate holds.")
     sp_ss.add_argument("--json", action="store_true")
-    sp_ss.add_argument("--manifest", default="/etc/hs-uploader/pipelines.toml",
+    sp_ss.add_argument("--manifest", default=_REAL_MANIFEST,
                        help="legacy manifest; sinks/ lies beside it")
     sp_ss.add_argument("--sinks", default=None,
                        help="switch directory (default: sinks/ beside --manifest)")
+    sp_ss.add_argument("--marker", default=None,
+                       help="carry-over marker (default: "
+                            "$HS_UPLOADER_STATE_DIR/carry-over-v1.done)")
     sp_ss.set_defaults(func=None)
+
+    sp_set = sink_sub.add_parser(
+        "set", help="Set the site switch or one client's switch, under the "
+                    "switch lock (root, on the real directory).")
+    sp_set.add_argument("name", help="site, or a client name")
+    sp_set.add_argument("state", help="off, fill or upload")
+    sp_set.add_argument("--reason", required=True)
+    sp_set.add_argument("--by", required=True,
+                        help="who set it, e.g. 'smd sink (mjh)'")
+    sp_set.add_argument(
+        "--identity-json", default=None, metavar="FILE|-",
+        help="JSON object of identity tables, one per instance, for this "
+             "history entry; - reads stdin")
+    where = sp_set.add_mutually_exclusive_group()
+    where.add_argument("--sinks", default=None,
+                       help=f"switch directory (default: "
+                            f"{sinkswitch.DEFAULT_SINKS_DIR})")
+    where.add_argument("--manifest", default=None,
+                       help="legacy manifest; sinks/ lies beside it")
+    sp_set.set_defaults(func=None)
+
+    sp_mark = sink_sub.add_parser(
+        "mark-carried", help="Write the carry-over marker: the switches "
+                             "govern from now on.")
+    sp_mark.add_argument("--note", default=None,
+                         help="one line written below the time line")
+    sp_mark.add_argument("--marker", default=None,
+                         help="marker path (default: "
+                              "$HS_UPLOADER_STATE_DIR/carry-over-v1.done)")
+    sp_mark.set_defaults(func=None)
 
     sp_serve = sub.add_parser(
         "serve",
@@ -176,6 +224,10 @@ def main(argv: list[str] | None = None) -> int:
         from . import daemon
         return daemon.run(args.manifest, dry_run=args.dry_run, once=args.once)
     if args.cmd == "sink":
+        if args.sink_cmd == "set":
+            return _cmd_sink_set(args)
+        if args.sink_cmd == "mark-carried":
+            return _cmd_sink_mark_carried(args)
         return _cmd_sink_status(args)
     if args.cmd == "capabilities":
         if args.features:
@@ -206,72 +258,217 @@ def main(argv: list[str] | None = None) -> int:
 
 # ---- subcommands ----
 
-_NOT_ENFORCED = "not enforced: the manifest's policy decides what ships"
-_NO_FILES = "no switch files; the manifest's policy governs"
+def _on_real_sinks_dir(sinks: Path) -> bool:
+    """True when ``sinks`` is the production switch directory: the
+    library's default, or ``sinks/`` beside the production manifest."""
+    from .pipelines_d import sinks_dir_for
+    real = {Path(sinkswitch.DEFAULT_SINKS_DIR).resolve(),
+            sinks_dir_for(_REAL_MANIFEST).resolve()}
+    return sinks.resolve() in real
+
+
+def _read_identity(spec: str) -> dict:
+    """The identity tables of ``--identity-json``: a JSON object of objects.
+
+    ``-`` reads stdin, so sigmond passes them without a file (ruling 11).
+    """
+    import json
+    text = sys.stdin.read() if spec == "-" else Path(spec).read_text()
+    try:
+        data = json.loads(text)
+    except ValueError as exc:
+        raise ValueError(f"identity JSON does not parse: {exc}") from None
+    if not isinstance(data, dict) or not all(
+            isinstance(v, dict) for v in data.values()):
+        raise ValueError("identity JSON must be an object of tables, one "
+                         "per instance")
+    return data
+
+
+def _cmd_sink_set(args) -> int:
+    """``sink set <site|client> <off|fill|upload>`` (spec §9.1)."""
+    from .pipelines_d import sinks_dir_for
+
+    def fail(msg: str) -> int:
+        print(f"hs-uploader sink set: {msg}", file=sys.stderr)
+        return 1
+
+    if args.state not in sinkswitch.STATES:
+        return fail(f"state {args.state!r} is not one of "
+                    f"{'/'.join(sinkswitch.STATES)}; nothing written")
+    if args.name != sinkswitch.SITE and not sinkswitch.valid_client_name(
+            args.name):
+        return fail(f"{args.name!r} is neither 'site' nor a client name "
+                    "([a-z0-9][a-z0-9-]*); nothing written")
+    if args.sinks:
+        sinks = Path(args.sinks)
+    elif args.manifest:
+        sinks = sinks_dir_for(args.manifest)
+    else:
+        sinks = Path(sinkswitch.DEFAULT_SINKS_DIR)
+    if _euid() != 0 and _on_real_sinks_dir(sinks):
+        return fail(f"{sinks} belongs to root:sigmond; run as root "
+                    "(nothing written)")
+    change = {"state": args.state, "reason": args.reason, "set_by": args.by}
+    if args.identity_json is not None:
+        try:
+            ident = _read_identity(args.identity_json)
+        except (OSError, ValueError) as exc:
+            return fail(f"--identity-json: {exc}; nothing written")
+        if ident:
+            change["identity"] = ident
+    path = sinks / f"{args.name}.toml"
+    try:
+        before = sinkswitch.write_switch(path, change)
+    except (OSError, ValueError, TimeoutError) as exc:
+        return fail(str(exc))
+    print(f"sink set: {args.name} {before} -> {args.state} ({path})")
+    return 0
+
+
+def _cmd_sink_mark_carried(args) -> int:
+    """``sink mark-carried``: the carry-over marker, written atomically."""
+    marker = Path(args.marker) if args.marker else sinkswitch.marker_path()
+    try:
+        sinkswitch.write_marker(marker, [args.note] if args.note else [])
+    except OSError as exc:
+        print(f"hs-uploader sink mark-carried: {marker}: {exc}",
+              file=sys.stderr)
+        return 1
+    print(f"sink mark-carried: {marker}")
+    return 0
+
+
+def _refused_in_store(path: Path) -> list[dict]:
+    """Pipeline files the daemon refused, from ``pipeline_state``.
+
+    Opened read-only (``mode=ro``), so status never creates or changes the
+    store; a missing or unreadable store gives nothing.
+    """
+    import sqlite3
+    from .pipelines_d import PIPELINES_DIR
+    prefix = f"{PIPELINES_DIR}/"
+    try:
+        conn = sqlite3.connect(f"{Path(path).resolve().as_uri()}?mode=ro",
+                               uri=True, timeout=2.0)
+    except sqlite3.Error:
+        return []
+    try:
+        rows = conn.execute(
+            "SELECT name, client, refused_reason FROM pipeline_state "
+            "WHERE refused_reason != '' ORDER BY name").fetchall()
+    except sqlite3.Error:
+        rows = []
+    finally:
+        conn.close()
+    return [{"file": n[len(prefix):], "client": c, "reason": r}
+            for n, c, r in rows if n.startswith(prefix)]
+
+
+def _plain(v) -> str:
+    return "" if v is None else str(v)
 
 
 def _cmd_sink_status(args) -> int:
+    """``sink status``: what the switches say and what the gate holds.
+
+    ``held_pipelines`` comes from the daemon's own gate (``SinkGate.decide``)
+    on the pipelines the daemon builds from the same files, so it says "held"
+    only while the carry-over marker stands.  ``effective`` and ``held_by``
+    read the switches alone and do not depend on the marker (ruling X5).
+    """
     import json
-    from . import sinkswitch
-    from .pipelines_d import sinks_dir_for
+    from .daemon import pipe_views
+    from .gate import SinkGate, exempt_rule, held_by
+    from .pipelines_d import load_layout, sinks_dir_for
+
     sinks = Path(args.sinks) if args.sinks else sinks_dir_for(args.manifest)
-    owners: set[str] = set()
-    no_client = 0
+    marker = Path(args.marker) if args.marker else sinkswitch.marker_path()
+    views = []
+    refused = {}
     read_failed = False
     try:
-        from .pipelines_d import load_layout
-        for entry, _origin in load_layout(args.manifest).entries:
-            if entry.get("client"):
-                owners.add(str(entry["client"]))
-            else:
-                no_client += 1
-    except Exception as exc:
+        layout = load_layout(args.manifest)
+        views = pipe_views(layout)
+        refused = {r.file: {"file": r.file, "client": r.client,
+                            "reason": r.reason} for r in layout.refused}
+    except Exception as exc:  # noqa: BLE001 -- report it, exit 2
         read_failed = True
-        print(f"hs-uploader: cannot read {args.manifest}: {exc}", file=sys.stderr)
+        print(f"hs-uploader: cannot read {args.manifest}: {exc}",
+              file=sys.stderr)
+    # What the daemon refused at its last build wins over this read.
+    for r in _refused_in_store(args.state or default_path()):
+        refused[r["file"]] = r
+
+    enforced = sinkswitch.marker_stands(marker)
+    gate = SinkGate(sinks, marker)
+    held = []
+    for v in views:
+        d = gate.decide(v)
+        if not d.send:
+            held.append({"pipeline": v.name, "client": v.client,
+                         "reason": d.reason})
+
+    names = {v.client for v in views if v.client and exempt_rule(v) == 0}
     has_dir = sinks.is_dir()
-    names = set(owners)
     if has_dir:
         for f in sinks.glob("*.toml"):
-            if f.name != "site.toml" and sinkswitch.valid_client_name(f.stem):
+            if sinkswitch.valid_client_name(f.stem):
                 names.add(f.stem)
 
-    def row(name: str) -> dict:
+    def file_state(r) -> str:
+        return r.state or ("missing" if r.missing else "error")
+
+    s = sinkswitch.read_switch(sinks / f"{sinkswitch.SITE}.toml")
+    site = {"state": file_state(s), "error": s.error,
+            "set_at": _plain(s.data.get("set_at")),
+            "set_by": _plain(s.data.get("set_by")),
+            "reason": _plain(s.data.get("reason"))}
+    clients = []
+    for name in sorted(names):
         r = sinkswitch.read_switch(sinks / f"{name}.toml")
-        d = {"file": "missing" if r.missing else (r.state or "error"),
-             "error": r.error}
-        if name == sinkswitch.SITE:
-            d["effective"] = r.state if r.state else ("unset" if r.missing
-                                                      else "off")
-        else:
-            e = sinkswitch.effective_state(name, sinks_dir=sinks)
-            d["effective"] = e.state
-            d["error"] = "; ".join(e.errors)
-        return d
+        e = sinkswitch.effective_state(name, sinks_dir=sinks)
+        clients.append({
+            "client": name, "file_state": file_state(r),
+            "effective": e.state, "held_by": held_by(name, e),
+            "error": "; ".join(e.errors),
+            "pipelines": [v.name for v in views if v.client == name]})
+    no_client = [v.name for v in views if not v.client]
+    refused_files = [refused[k] for k in sorted(refused)]
+    rc = 2 if read_failed else 0
 
-    site = row(sinkswitch.SITE)
-    clients = {n: row(n) for n in sorted(names)}
     if args.json:
-        print(json.dumps({"sinks_dir": str(sinks), "has_sinks_dir": has_dir,
-                          "enforced": False, "note": _NOT_ENFORCED,
-                          "no_client_pipelines": no_client,
-                          "manifest_read_failed": read_failed,
-                          "site": site, "clients": clients}, indent=2))
-        return 2 if read_failed else 0
+        print(json.dumps({
+            "schema": SINK_STATUS_SCHEMA, "enforced": enforced,
+            "marker": str(marker), "sinks_dir": str(sinks), "site": site,
+            "clients": clients, "held_pipelines": held,
+            "refused_files": refused_files,
+            "no_client_pipelines": no_client}, indent=2))
+        return rc
     print(f"hs-uploader sink status - {sinks}")
+    if enforced:
+        print(f"  enforced: the carry-over marker {marker} stands")
+    else:
+        print(f"  not enforced: no carry-over marker at {marker}; "
+              "every pipeline sends as its manifest says")
     if not has_dir:
-        print(f"  {_NO_FILES}")
-    for name, d in [("site", site), *clients.items()]:
-        err = f"  error: {d['error']}" if d["error"] else ""
-        if has_dir:
-            print(f"  {name}: file {d['file']}, effective {d['effective']}{err}")
-        else:
-            print(f"  {name}: (no switch files; not enforced){err}")
+        print(f"  no switch files in {sinks}")
+    err = f"  error: {site['error']}" if site["error"] else ""
+    print(f"  site: file {site['state']}{err}")
+    for c in clients:
+        by = f", held by {c['held_by']}" if c["held_by"] else ""
+        err = f"  error: {c['error']}" if c["error"] else ""
+        print(f"  {c['client']}: file {c['file_state']}, effective "
+              f"{c['effective']}{by}{err}")
+    for h in held:
+        print(f"  held: {h['pipeline']} ({h['client'] or '-'}): {h['reason']}")
+    for r in refused_files:
+        print(f"  refused: pipelines.d/{r['file']} ({r['client']}): "
+              f"{r['reason']}")
     if no_client:
-        print(f"  {no_client} pipeline(s) carry no client; "
-              "no switch applies to them")
-    print(f"  {_NOT_ENFORCED}")
-    return 2 if read_failed else 0
-
+        print(f"  {len(no_client)} pipeline(s) carry no client; no switch "
+              f"applies to them: {', '.join(no_client)}")
+    return rc
 
 
 def _cmd_status(args, store: SqliteWatermarkStore) -> int:

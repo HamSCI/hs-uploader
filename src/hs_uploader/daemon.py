@@ -407,6 +407,57 @@ def _build_file(entries: list[Mapping[str, Any]], origin: str, *,
     return slots, taken, fresh, ""
 
 
+@dataclass
+class PipeView:
+    """What the gate reads of one pipeline: built without a source, a
+    store or a connection, so ``sink status`` asks the gate itself."""
+
+    name: str
+    client: str
+    governed: bool
+    origin: str
+    transport: Any = None
+
+
+def pipe_views(layout: Layout) -> list[PipeView]:
+    """One view per pipeline the daemon builds from ``layout``.
+
+    Names follow the daemon's build: a generic entry without a name is
+    ``pipeline-<i>``, counting generic legacy entries (builders apart) or
+    a file's entries; a builder entry takes its ``name`` or its spec (what
+    the builder itself returns stays unknown here).  The transport is
+    built as the factory builds it, discard wrapper included, so rule 2
+    sees the same type; one that fails to build stays ``None``.
+    """
+    from .pipeline_factory import _build_transport
+
+    views: list[PipeView] = []
+    legacy_generic = 0
+    file_index: dict[str, int] = {}
+    for entry, origin in layout.entries:
+        if origin == LEGACY:
+            i = legacy_generic
+            if not entry.get("builder"):
+                legacy_generic += 1
+        else:
+            i = file_index.get(origin, 0)
+            file_index[origin] = i + 1
+        if entry.get("builder"):
+            name = str(entry.get("name") or entry["builder"])
+            transport = None
+        else:
+            name = str(entry.get("name") or f"pipeline-{i}")
+            try:
+                transport = wrap_if_discard(
+                    entry, _build_transport(entry["transport"]))
+            except Exception:  # noqa: BLE001 -- the daemon refuses it; no rule 2
+                transport = None
+        views.append(PipeView(name=name, client=str(entry.get("client") or ""),
+                              governed=bool(entry.get("governed", True)),
+                              origin=origin, transport=transport))
+    return views
+
+
 def _admit(slots: list[_Slot], names: dict[str, Pipeline],
            keys: dict[tuple, Pipeline]) -> str:
     """Accept one file's pipelines unless one collides; return the reason."""

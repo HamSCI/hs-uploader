@@ -288,10 +288,9 @@ def test_sink_status_without_sinks_dir_says_so(tmp_path, capsys):
     m = _station_dir(tmp_path)
     assert main(["sink", "status", "--manifest", str(m)]) == 0
     out = capsys.readouterr().out
-    assert "no switch files; the manifest's policy governs" in out
-    assert "not enforced: the manifest's policy decides what ships" in out
-    assert "effective" not in out        # no verdict where nothing enforces
-    assert "c1: (no switch files; not enforced)" in out
+    assert f"no switch files in {tmp_path / 'etc' / 'sinks'}" in out
+    assert "  not enforced: no carry-over marker at " in out
+    assert "c1: file missing, effective off, held by fault" in out
 
 
 def test_sink_status_lists_site_and_each_client(tmp_path, capsys):
@@ -304,18 +303,20 @@ def test_sink_status_lists_site_and_each_client(tmp_path, capsys):
     (sinks / "c3.toml").write_text("state = [bad\n")
     assert main(["sink", "status", "--json", "--manifest", str(m)]) == 0
     d = _json.loads(capsys.readouterr().out)
-    assert d["site"]["file"] == "fill" and d["site"]["effective"] == "fill"
-    assert d["clients"]["c1"]["file"] == "upload"
-    assert d["clients"]["c1"]["effective"] == "fill"      # site limits it
-    assert d["clients"]["c2"]["file"] == "missing"
-    assert d["clients"]["c2"]["effective"] == "off"
-    assert d["clients"]["only-file"]["effective"] == "off"
-    assert d["clients"]["c3"]["error"]
-    assert d["enforced"] is False
+    by = {c["client"]: c for c in d["clients"]}
+    assert d["site"]["state"] == "fill"
+    assert by["c1"]["file_state"] == "upload"
+    assert by["c1"]["effective"] == "fill"            # site limits it
+    assert by["c1"]["held_by"] == "site"
+    assert by["c2"]["file_state"] == "missing"
+    assert by["c2"]["effective"] == "off"
+    assert by["only-file"]["effective"] == "off"
+    assert by["only-file"]["pipelines"] == []
+    assert by["c3"]["error"] and by["c3"]["file_state"] == "error"
+    assert d["enforced"] is False and d["held_pipelines"] == []
     assert main(["sink", "status", "--manifest", str(m)]) == 0
     out = capsys.readouterr().out
-    for word in ("site", "c1", "c2", "c3", "only-file",
-                 "not enforced: the manifest's policy decides what ships"):
+    for word in ("site", "c1", "c2", "c3", "only-file", "not enforced"):
         assert word in out
 
 
@@ -327,21 +328,24 @@ def test_sink_status_sinks_flag_overrides_the_derived_directory(tmp_path, capsys
     assert main(["sink", "status", "--json", "--manifest", str(m),
                  "--sinks", str(other)]) == 0
     d = _json.loads(capsys.readouterr().out)
-    assert d["clients"]["c1"]["effective"] == "upload"
+    assert d["clients"][0]["effective"] == "upload"
+    assert d["sinks_dir"] == str(other)
 
 
 def test_sink_status_counts_pipelines_without_a_client(tmp_path, capsys):
     m = _station_dir(tmp_path)
     m.write_text(m.read_text() + '[[pipeline]]\nname = "nc"\nbuilder = "x:y"\n')
     assert main(["sink", "status", "--manifest", str(m)]) == 0
-    assert ("1 pipeline(s) carry no client; no switch applies to them"
+    assert ("1 pipeline(s) carry no client; no switch applies to them: nc"
             in capsys.readouterr().out)
     assert main(["sink", "status", "--json", "--manifest", str(m)]) == 0
-    assert _json.loads(capsys.readouterr().out)["no_client_pipelines"] == 1
+    assert _json.loads(capsys.readouterr().out)["no_client_pipelines"] == ["nc"]
 
 
 def test_sink_status_manifest_read_failure_exits_2(tmp_path, capsys):
     m = tmp_path / "missing.toml"
     assert main(["sink", "status", "--json", "--manifest", str(m)]) == 2
-    assert _json.loads(capsys.readouterr().out)["manifest_read_failed"] is True
+    cap = capsys.readouterr()
+    assert _json.loads(cap.out)["schema"] == 1
+    assert f"cannot read {m}" in cap.err
     assert main(["sink", "status", "--manifest", str(m)]) == 2

@@ -251,11 +251,7 @@ class SinkGate:
             return "switch unreadable (client)"
         if eff.site_error:
             return "switch unreadable (site)"
-        who = "client"
-        if eff.site_state is not None and eff.client_state is not None and (
-                STATES.index(eff.site_state) <= STATES.index(eff.client_state)):
-            who = "site"
-        return f"sink {_VERB.get(eff.state, eff.state)} ({who})"
+        return f"sink {_VERB.get(eff.state, eff.state)} ({_order_by(eff)})"
 
     def _file_faults(self, client: str, eff) -> None:
         """Remind of a switch-file fault every REMIND_S while it lasts.
@@ -334,6 +330,28 @@ class SinkGate:
                 return False
             self._said.add(key)
             return True
+
+
+def _order_by(eff) -> str:
+    """Which switch's order sets ``eff``: "site" when the site file reads as
+    strict as the client's or stricter, else "client"."""
+    if eff.site_state is not None and eff.client_state is not None and (
+            STATES.index(eff.site_state) <= STATES.index(eff.client_state)):
+        return "site"
+    return "client"
+
+
+def held_by(client: str, eff) -> Optional[str]:
+    """Which switch holds ``client``: None while ``eff`` reads upload,
+    "fault" for a bad name, a missing or unreadable file (the reads that
+    fail closed), else "site" or "client", as the gate words its hold
+    (``sink status``, spec §7.5, §9.2)."""
+    if eff.state == "upload":
+        return None
+    if (not valid_client_name(client) or eff.client_missing
+            or eff.client_error or eff.site_error):
+        return "fault"
+    return _order_by(eff)
 
 
 def exempt_rule(pipe) -> int:

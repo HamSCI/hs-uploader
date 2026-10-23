@@ -1,0 +1,7 @@
+[[pipeline]]
+name = "meteor-scatter-pskreporter"
+[pipeline.source]
+type = "sqlite"
+start_at = "now"
+[pipeline.transport]
+type = "pskreporter"

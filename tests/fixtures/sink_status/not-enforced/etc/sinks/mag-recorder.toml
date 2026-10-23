@@ -1,0 +1,12 @@
+client = "mag-recorder"
+state = "upload"
+reason = "fixture"
+set_by = "carry-over"
+set_at = "2026-10-01T00:00:00Z"
+
+[[history]]
+at = "2026-10-01T00:00:00Z"
+from = "off"
+to = "upload"
+by = "carry-over"
+reason = "fixture"

@@ -349,13 +349,16 @@ def write_marker(path: Path, lines: Sequence[str]) -> None:
     _atomic_write(Path(path), text.encode("utf-8"), 0o644)
 
 
-def write_switch(path: Path, change: Mapping) -> None:
+def write_switch(path: Path, change: Mapping) -> str:
     """Change one switch file under an exclusive lock, atomically (design §3.4).
 
     `change`: `state` (required), and optionally `reason`, `set_by`, `set_at`,
     `grant` (merged into the file's grant table), `identity` (tables written
     into this history entry).  Appends one `[[history]]` entry.  A file that
     fails to parse raises ValueError and nothing is written.
+
+    Returns what the file said before: its state, "missing", or "invalid"
+    for a state outside STATES (the history entry records either as "off").
     """
     path = Path(path)
     name = _check_path(path)
@@ -390,6 +393,7 @@ def write_switch(path: Path, change: Mapping) -> None:
             )
         data = dict(cur.data)
         old = cur.state or "off"
+        before = cur.state or ("missing" if cur.missing else "invalid")
         at = change.get("set_at") or _now()
         by = change.get("set_by", "")
         reason = change.get("reason", "")
@@ -413,5 +417,6 @@ def write_switch(path: Path, change: Mapping) -> None:
                 "move the file aside to recreate it"
             ) from e
         _atomic_write(path, text.encode("utf-8"), 0o644)
+        return before
     finally:
         os.close(lockfd)  # closing drops the flock
