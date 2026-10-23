@@ -266,7 +266,8 @@ def test_capabilities_bare_prints_3():
 def test_capabilities_features_names_what_this_release_does():
     out = _run_caps("--features")
     assert out.returncode == 0
-    assert out.stdout == "pipelines.d\nsend-log-v3\nswitch-files\n"
+    assert out.stdout == "gate\npipelines.d\nsend-log-v3\nswitch-files\n"
+    assert out.stdout.splitlines() == sorted(out.stdout.splitlines())
 
 
 # ---- sink status (spec 6.2) ----------------------------------------------------------

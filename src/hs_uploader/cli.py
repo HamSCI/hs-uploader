@@ -35,7 +35,7 @@ from .watermark.sqlite import SqliteWatermarkStore, default_path
 
 
 # A word appears only in the release that ships its code complete (spec 7.1).
-FEATURES = ("pipelines.d", "send-log-v3", "switch-files")
+FEATURES = ("gate", "pipelines.d", "send-log-v3", "switch-files")
 
 # The production manifest; sinks/ beside it is the real switch directory.
 _REAL_MANIFEST = "/etc/hs-uploader/pipelines.toml"
