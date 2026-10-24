@@ -659,18 +659,22 @@ def test_status_tie_goes_to_the_site(st, capsys):
     assert held["psk-pskr"]["reason"] == "sink filling (site)"
 
 
-def test_status_keeps_stderr_clean_and_reports_in_the_json(st):
+def test_status_keeps_stderr_clean_and_reports_in_the_json(st, monkeypatch):
     """The gate and the switch reader log faults; status shows them in its
     own report, not as stray lines on stderr.  A real process: under pytest
     the root logger has a handler, so Python's last-resort stderr handler
-    would never fire in-process."""
+    would never fire in-process.  The child gets a minimal environment: a
+    PYTHONWARNINGS (or any other setting) in the caller's must not reach
+    it, so the test plants one (an invalid filter writes to stderr)."""
     import subprocess
     import sys
+    monkeypatch.setenv("PYTHONWARNINGS", "bogus::NoSuchWarning")
     st.mark()
     (st.sinks / "wspr-recorder.toml").write_text("state = [bad\n")
     st.file("mag-recorder", _pipe("mag-psws",
                                    extra='governed = false\n'))  # WARNING
-    env = {**os.environ, "PYTHONPATH": str(Path(cli.__file__).parents[1]),
+    env = {"PATH": "/usr/bin:/bin", "LANG": "C.UTF-8",
+           "PYTHONPATH": str(Path(cli.__file__).parents[1]),
            "HS_UPLOADER_STATE_DIR": str(st.state)}
     out = subprocess.run(
         [sys.executable, "-P", "-m", "hs_uploader.cli", *st.status("--json")],
