@@ -510,6 +510,37 @@ def test_status_lists_a_file_the_daemon_refused_at_build(st, capsys):
             in capsys.readouterr().out)
 
 
+def test_status_survives_non_text_values_in_a_replaced_store(st, capsys):
+    """A store someone replaced may hold BLOBs or numbers where text
+    belongs.  Status decodes them, says so in errors, and still prints
+    schema 1 (Task 18 LOW)."""
+    import sqlite3
+    st.mark()
+    with sqlite3.connect(st.db) as c:             # a replaced store: no types
+        c.execute("CREATE TABLE pipeline_state (name, client, refused_reason)")
+        c.execute("INSERT INTO pipeline_state VALUES ('psk-pskr', 'psk', '')")
+        c.execute("INSERT INTO pipeline_state (name, client, refused_reason) "
+                  "VALUES (?, ?, ?)",
+                  (b"pipelines.d/blob.toml", b"blob\xff", b"why"))
+        c.execute("INSERT INTO pipeline_state (name, client, refused_reason) "
+                  "VALUES (?, ?, ?)", (7, None, 3.5))
+    d = _json_status(st, capsys)
+    assert d["schema"] == 1
+    assert d["refused_files"] == [
+        {"file": None, "pipeline": "7", "client": "", "reason": "3.5"},
+        {"file": "blob.toml", "pipeline": None, "client": "blob\ufffd",
+         "reason": "why"}]
+    assert len(d["errors"]) == 1 and "non-text" in d["errors"][0]
+    assert main(st.status()) == 0
+    assert "  refused: pipelines.d/blob.toml" in capsys.readouterr().out
+    # Control: a store of text alone reports no such error.
+    with sqlite3.connect(st.db) as c:
+        c.execute("DELETE FROM pipeline_state WHERE typeof(name) != 'text' "
+                  "OR typeof(client) != 'text' "
+                  "OR typeof(refused_reason) != 'text'")
+    assert _json_status(st, capsys)["errors"] == []
+
+
 def test_status_never_creates_the_store(st, capsys):
     assert not st.db.exists()
     _json_status(st, capsys)

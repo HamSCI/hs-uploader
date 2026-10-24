@@ -396,7 +396,8 @@ def _store_rows(path: Path) -> tuple[list[tuple[str, str, str]], str]:
 
     Opened read-only (``mode=ro``), so status never creates or changes the
     store.  A missing store is no error (the daemon has not run yet); one
-    that exists and cannot be read is.
+    that exists and cannot be read is.  A non-text value (a replaced
+    store) comes back decoded, with an error line that says so.
     """
     import sqlite3
     path = Path(path)
@@ -415,7 +416,23 @@ def _store_rows(path: Path) -> tuple[list[tuple[str, str, str]], str]:
     finally:
         if conn is not None:
             conn.close()
-    return rows, ""
+    # A replaced store may hold a BLOB, a number or NULL where the daemon
+    # writes text.  Decode each such value rather than crash, and say so.
+    odd = 0
+    text_rows = []
+    for row in rows:
+        out = []
+        for v in row:
+            if not isinstance(v, str):
+                odd += 1
+                v = (v.decode("utf-8", "replace") if isinstance(v, bytes)
+                     else "" if v is None else str(v))
+            out.append(v)
+        text_rows.append(tuple(out))
+    if odd:
+        return text_rows, (f"the store {path} holds {odd} non-text "
+                           f"value(s) in pipeline_state; shown decoded")
+    return text_rows, ""
 
 
 def _plain(v) -> str:
