@@ -504,7 +504,12 @@ class Writer:
             if not enforced and not any(self._dropping.values()):
                 return rows
             sinks_dir = self._sinks_dir if self._sinks_dir is not None else default_dir
+            # Judge the whole batch before touching any state: a check that
+            # raises part way stores every row, so no verdict of this batch
+            # may reach the log or the counts (the last line must match
+            # what stored).
             verdict: dict = {}
+            drops: dict = {}
             kept = []
             for row in rows:
                 producer = self.producer or infer_producer(self.database, self.table, row)
@@ -512,13 +517,16 @@ class Writer:
                 if drop is None:
                     drop = verdict[producer] = enforced and self._reads_off(
                         producer, effective_state, valid, sinks_dir)
-                    self._note_verdict(producer, drop)
                 if drop:
-                    # A producer past the cap never entered _dropping.
-                    if producer in self._dropping:
-                        self.dropped[producer] = self.dropped.get(producer, 0) + 1
+                    drops[producer] = drops.get(producer, 0) + 1
                 else:
                     kept.append(row)
+            for producer, drop in verdict.items():
+                self._note_verdict(producer, drop)
+            for producer, n in drops.items():
+                # A producer past the cap never entered _dropping.
+                if producer in self._dropping:
+                    self.dropped[producer] = self.dropped.get(producer, 0) + n
             return kept
         except Exception as e:
             kind = type(e).__name__

@@ -345,3 +345,35 @@ def test_the_marker_vanishing_logs_the_storing_again_line_once(tree, caplog):
         _put(w, [{"mode": "C"}])
     assert len(caplog.records) == 1 and "reads off" in caplog.records[0].getMessage()
     assert len(_stored(tree)) == 100
+
+
+def test_a_check_that_fails_mid_batch_leaves_no_stale_verdict(tree, monkeypatch, caplog):
+    """A raise after one producer's verdict stores the whole batch; the
+    log and the counts must not say that producer stored nothing."""
+    real = sinkswitch.effective_state
+
+    def picky(producer, **kw):
+        if producer == "meteor-scatter":
+            raise RuntimeError("switch reader broke")
+        return real(producer, **kw)
+
+    _switch(tree.sinks, "psk-recorder", "off")
+    _switch(tree.sinks, "meteor-scatter", "upload")
+    monkeypatch.setattr(sinkswitch, "effective_state", picky)
+    w = _writer(tree)                     # producer inferred per row
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        _put(w, [{"mode": "FT8"}, {"mode": "MSK144"}])
+    assert _stored(tree) == [("psk-recorder", "FT8"), ("meteor-scatter", "MSK144")]
+    infos = [r.getMessage() for r in caplog.records if r.levelno == logging.INFO]
+    assert infos == []
+    assert w.dropped == {}
+    assert not any(w._dropping.values())
+    # Control: the same producer alone drops, and says so once.
+    caplog.clear()
+    with caplog.at_level(logging.DEBUG, logger=LOGGER):
+        _put(w, [{"mode": "FT8"}])
+    assert [r.getMessage() for r in caplog.records] == [
+        "hamsci_sink: sink switch reads off for psk-recorder: "
+        "storing nothing for repositories"]
+    assert w.dropped == {"psk-recorder": 1}
+    assert len(_stored(tree)) == 2
