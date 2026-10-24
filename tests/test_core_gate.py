@@ -399,3 +399,33 @@ def test_flip_within_one_read_control(tmp_path):
     pipe, wm = _multi(tmp_path, log, gate, flip=False)
     Uploader([pipe], gate=gate).pump()
     assert log == [("ship", (1,)), ("ship", (2,)), ("ship", (3,))]
+
+
+class CursorCounter:
+    """Wraps a watermark store and counts get_cursor calls."""
+
+    def __init__(self, inner):
+        self.inner = inner
+        self.cursor_reads = 0
+
+    def get_cursor(self, *a, **k):
+        self.cursor_reads += 1
+        return self.inner.get_cursor(*a, **k)
+
+    def __getattr__(self, name):
+        return getattr(self.inner, name)
+
+
+@pytest.mark.parametrize("flip,cursor_reads,reads", [(True, 1, 1), (False, 4, 4)])
+def test_outer_drain_check_stops_before_the_cursor_read(tmp_path, flip,
+                                                        cursor_reads, reads):
+    """core.py's top-of-loop check in _drain_source (final batch (c)): a
+    switch that flips between two drain iterations stops the drain before
+    it reads the cursor or the source again.  flip=False is the control:
+    the same harness counts every iteration's reads."""
+    log, gate = [], Switch(True)
+    pipe, wm = _drain_mode(tmp_path, log, gate, flip=flip)
+    pipe.watermark = counted = CursorCounter(wm)
+    Uploader([pipe], gate=gate).pump()
+    assert (counted.cursor_reads, pipe.source.reads) == (cursor_reads, reads)
+    assert len(log) == (1 if flip else 3)
