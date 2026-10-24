@@ -515,7 +515,8 @@ def test_alternating_gate_fault_logs_one_error_and_no_transition_lines(
         assert len(errs) == 1
         infos = hsu_lines(caplog)
         assert len([m for m in infos if " held: " in m]) <= 1
-        assert [m for m in infos if " sending: " in m] == []
+        # one recovery line answers the one ERROR line; no transition line
+        assert [m for m in infos if " sending: " in m] == [RECOVERED]
         # positive control: a real switch change still logs, once each way
         caplog.clear()
         monkeypatch.setattr(gate_mod, "effective_state", real)
@@ -564,3 +565,84 @@ def test_daemon_rebuild_forgets_removed_pipelines(station, monkeypatch, signals)
     made = _run_loop(monkeypatch, station, script)
     g = made[0]._gate.__self__
     assert [k[1] for k in g._last] == ["leg"]
+
+
+# ---- recovery from a gate fault logs once (Task 6 parked minor) -------------
+
+RECOVERED = "pipeline p1 sending: the sink gate recovered"
+
+
+def test_long_gate_fault_recovery_logs_one_info_line(tree, monkeypatch, caplog):
+    sinks, marker = tree
+    sw(sinks, "c1", "upload")
+    clock = Clock()
+    g = SinkGate(sinks, marker, clock=clock)
+    wm = SqliteWatermarkStore(":memory:")
+    p = mkpipe("p1", "c1", wm)
+    real = gate_mod.effective_state
+
+    def boom(*a, **k):
+        raise RuntimeError("disk on fire")
+
+    with caplog.at_level(logging.DEBUG, logger="hs_uploader"):
+        assert g.may_send(p)                  # sending before the fault
+        monkeypatch.setattr(gate_mod, "effective_state", boom)
+        for _ in range(100):                  # a 10 h fault: ERROR + reminder
+            clock.t += 360.0
+            assert not g.may_send(p)
+        assert not [m for m in hsu_lines(caplog) if "recovered" in m]
+        monkeypatch.setattr(gate_mod, "effective_state", real)
+        for _ in range(100):
+            assert g.may_send(p)
+    errs = [m for m in hsu_lines(caplog, logging.ERROR) if "gate failed" in m]
+    assert len(errs) == 2                     # first sight and one reminder
+    assert [m for m in hsu_lines(caplog) if "recovered" in m] == [RECOVERED]
+
+
+def test_flapping_gate_fault_logs_one_recovery_line(tree, monkeypatch, caplog):
+    sinks, marker = tree
+    sw(sinks, "c1", "upload")
+    clock = Clock()
+    g = SinkGate(sinks, marker, clock=clock)
+    wm = SqliteWatermarkStore(":memory:")
+    p = mkpipe("p1", "c1", wm)
+    monkeypatch.setattr(gate_mod, "effective_state",
+                        _flaky(gate_mod.effective_state))
+    with caplog.at_level(logging.DEBUG, logger="hs_uploader"):
+        for _ in range(200):
+            clock.t += 30.0                   # 100 min in all, under 6 h
+            g.may_send(p)
+        assert [m for m in hsu_lines(caplog) if "recovered" in m] == [
+            RECOVERED]
+        # positive control: past 6 h the fault logs again, and so does its
+        # recovery, once each
+        clock.t += REMIND_S + 1
+        for _ in range(200):
+            clock.t += 30.0
+            g.may_send(p)
+    assert len(hsu_lines(caplog, logging.ERROR)) == 2
+    assert [m for m in hsu_lines(caplog) if "recovered" in m] == [
+        RECOVERED, RECOVERED]
+
+
+def test_recovery_into_a_hold_says_held(tree, monkeypatch, caplog):
+    sinks, marker = tree
+    sw(sinks, "c1", "fill")
+    g = SinkGate(sinks, marker, clock=Clock())
+    wm = SqliteWatermarkStore(":memory:")
+    p = mkpipe("p1", "c1", wm)
+    real = gate_mod.effective_state
+
+    def boom(*a, **k):
+        raise RuntimeError("disk on fire")
+
+    with caplog.at_level(logging.DEBUG, logger="hs_uploader"):
+        assert not g.may_send(p)
+        monkeypatch.setattr(gate_mod, "effective_state", boom)
+        for _ in range(10):
+            assert not g.may_send(p)
+        monkeypatch.setattr(gate_mod, "effective_state", real)
+        for _ in range(10):
+            assert not g.may_send(p)
+    assert [m for m in hsu_lines(caplog) if "recovered" in m] == [
+        "pipeline p1 held: the sink gate recovered; sink filling (client)"]
