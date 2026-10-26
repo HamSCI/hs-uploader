@@ -78,6 +78,92 @@ def _default_known_hosts() -> str:
     return str(Path(base) / "known_hosts")
 
 
+# ---------- persistent ssh connection (ControlMaster) ----------
+#
+# Every sftp this transport runs is today a full TCP connect + key exchange +
+# auth + teardown.  A station shipping a WSPR cycle every 2 minutes pays about
+# 1,296 of those a day, and across 92 gateway accounts that is ~119,000
+# handshakes a day arriving at gw1 -- which is what `MaxStartups 10:30:100`
+# throttles.  Holding ONE connection up and running each transfer as a new
+# CHANNEL on it takes that to ~10 reconnects a station per day.
+#
+# ⚠ THIS IS A COST WIN, NOT A LATENCY WIN.  It removes ~0.2-0.5 s of handshake
+# per transfer, while the gateway reflector holds every arriving file for
+# `min_age_seconds: 10` on a `scan_interval: 5` loop.  That 10-15 s floor
+# dominates end-to-end latency and nothing here touches it.  Do not let anyone
+# re-argue a cadence on the strength of this change.
+#
+# The process model is deliberately untouched: still one `sftp` invocation per
+# shipment, one Outcome per batch, so retries, watermarks and backlog figures
+# behave exactly as before.  A master that dies mid-transfer fails that
+# transfer, which returns retry_later -- an existing path, not a new one.
+#
+# Knobs:
+#   HS_UPLOADER_SSH_MULTIPLEX=0        opt out entirely (per host)
+#   HS_UPLOADER_SSH_CONTROL_DIR=PATH   where the sockets live
+SSH_CONTROL_DIR_DEFAULT = "/run/hs-uploader"
+SSH_CONTROL_PERSIST = "10m"
+# A hung master is the case worth guarding: ControlMaster=auto already falls
+# back to a fresh connection when the socket is DEAD, but a master whose peer
+# went away silently would block every transfer behind it until the transfer
+# timeout.  Keepalives bound that to ~90 s.
+SSH_SERVER_ALIVE_INTERVAL = "30"
+SSH_SERVER_ALIVE_COUNT_MAX = "3"
+# A unix socket path is capped near 108 bytes (sizeof sun_path), and ssh
+# refuses a longer one -- so the directory is short on purpose and the whole
+# path is measured before use rather than assumed to fit.
+SSH_CONTROL_PATH_MAX = 100
+# Used only when the caller knows neither the user nor the hosts yet; the
+# real values are measured when they are known.
+_SSH_ASSUMED_USER_LEN = 24
+_SSH_ASSUMED_HOST_LEN = 32
+
+
+def _ssh_control_dir() -> Optional[Path]:
+    """Directory for ControlMaster sockets, or None to multiplex nothing.
+
+    Returns None when the operator opted out, or when the directory cannot be
+    made writable.  Falling back to a plain connection is always correct: the
+    multiplexing is an optimisation, and a transport that refused to ship
+    because it could not open a socket would trade a cost win for an outage.
+    """
+    if os.environ.get("HS_UPLOADER_SSH_MULTIPLEX", "1").strip() in ("0", "no", "false"):
+        return None
+    base = Path(os.environ.get("HS_UPLOADER_SSH_CONTROL_DIR",
+                               SSH_CONTROL_DIR_DEFAULT))
+    try:
+        base.mkdir(parents=True, exist_ok=True)
+    except OSError:
+        return None
+    return base if os.access(base, os.W_OK | os.X_OK) else None
+
+
+def _ssh_control_path(base: Optional[Path],
+                      servers: Sequence[str] = (),
+                      user: str = "") -> Optional[str]:
+    """``<dir>/cm-%r@%h:%p``, or None if the expansion would not fit.
+
+    ⛔ THE ``%r@%h:%p`` IS LOAD-BEARING, NOT DECORATION.  Without ``%h`` the
+    master opened to gw1 is reused when the transport fails over to gw2, and
+    the failover then silently delivers every tar to the gateway that was
+    already failing -- while reporting success, because the put succeeds.
+
+    ssh REFUSES a ControlPath whose expansion overruns ``sun_path`` rather
+    than falling back, so a path that will not fit must be declined here, in
+    favour of plain connections.  The expansion is measured against the hosts
+    and user this transport actually uses, not guessed: the longest server
+    name in ``servers`` and ``user``, with generous defaults when the caller
+    knows neither yet (the real user arrives with the identity, at ship time).
+    """
+    if base is None:
+        return None
+    longest_host = max((len(h) for h in servers), default=_SSH_ASSUMED_HOST_LEN)
+    longest_user = len(user) or _SSH_ASSUMED_USER_LEN
+    expanded = (len(str(base / "cm-")) + longest_user + 1 + longest_host
+                + 1 + len("65535"))
+    return str(base / "cm-%r@%h:%p") if expanded <= SSH_CONTROL_PATH_MAX else None
+
+
 # Phase 2 PR 5 also flipped the tar root from `wsprdaemon/` to `wspr/`
 # (modes as peers, not WSPR-specific service nesting). The
 # wsprdaemon-server PR accepts BOTH roots on the read side — but only
@@ -821,6 +907,7 @@ class WsprdaemonTarSftp:
         compression_level: int = 9,
         tar_root: str = TAR_ROOT_NEW,
         known_hosts_file: Optional[str] = None,
+        ssh_control_dir: Optional[Path | str] = None,
     ):
         self.servers = list(servers)
         self.spool_root = Path(spool_root) if spool_root else None
@@ -828,6 +915,14 @@ class WsprdaemonTarSftp:
         # Writable known_hosts (see _default_known_hosts) — avoids the
         # ProtectHome=read-only "can't write ~/.ssh/known_hosts" warning.
         self.known_hosts_file = known_hosts_file or _default_known_hosts()
+        # Resolved ONCE, at construction: the daemon rebuilds transports
+        # between pumps, so a per-call probe would stat /run on every tar for
+        # an answer that does not change.  None means "do not multiplex",
+        # which is always a correct answer (see _ssh_control_dir).
+        self._ssh_control_path = _ssh_control_path(
+            Path(ssh_control_dir) if ssh_control_dir is not None
+            else _ssh_control_dir(),
+            servers=self.servers, user=sftp_user or "")
         self.remote_path = remote_path
         self.connect_timeout_sec = connect_timeout_sec
         self.xfer_timeout_sec = xfer_timeout_sec
@@ -1015,9 +1110,17 @@ class WsprdaemonTarSftp:
                 server,
             )
             self._remove_host_key(server)
+            # ⛔ NO MULTIPLEXING ON THE HOST-KEY RETRY.  A live master was
+            # authenticated against the key we have just decided is stale;
+            # reusing it would carry the tar over the very connection whose
+            # identity is in question, and would report success.  Forcing a
+            # fresh connection is what makes clearing known_hosts mean
+            # anything.
+            self._close_control_master(server, identity)
             rc, out = self._run_sftp(
                 server, batch, identity,
                 extra_opts=["StrictHostKeyChecking=accept-new"],
+                multiplex=False,
             )
             if rc == 0:
                 return True, out
@@ -1034,6 +1137,7 @@ class WsprdaemonTarSftp:
         batch_cmd: bytes,
         identity,
         extra_opts: Optional[list[str]] = None,
+        multiplex: bool = True,
     ) -> tuple[int, str]:
         cmd = [
             "sftp", "-b", "-",
@@ -1049,6 +1153,14 @@ class WsprdaemonTarSftp:
             "-o", "GlobalKnownHostsFile=/dev/null",
             "-o", "StrictHostKeyChecking=accept-new",
         ]
+        if multiplex and self._ssh_control_path:
+            cmd += [
+                "-o", "ControlMaster=auto",
+                "-o", f"ControlPath={self._ssh_control_path}",
+                "-o", f"ControlPersist={SSH_CONTROL_PERSIST}",
+                "-o", f"ServerAliveInterval={SSH_SERVER_ALIVE_INTERVAL}",
+                "-o", f"ServerAliveCountMax={SSH_SERVER_ALIVE_COUNT_MAX}",
+            ]
         if identity.ssh_key_file:
             cmd += ["-i", identity.ssh_key_file]
         for opt in extra_opts or []:
@@ -1066,6 +1178,21 @@ class WsprdaemonTarSftp:
             ).decode(errors="replace")
         except subprocess.TimeoutExpired:
             return 1, "sftp timed out"
+
+    def _close_control_master(self, server: str, identity) -> None:
+        """Tear down any live master to ``server`` (``ssh -O exit``).
+
+        Best effort: no master is the normal case and `ssh -O exit` then exits
+        non-zero, which is not a failure of anything.
+        """
+        if not self._ssh_control_path:
+            return
+        subprocess.run(
+            ["ssh", "-O", "exit",
+             "-o", f"ControlPath={self._ssh_control_path}",
+             f"{self._sftp_user(identity)}@{server}"],
+            capture_output=True,
+        )
 
     def _remove_host_key(self, server: str) -> None:
         # Operate on the same writable known_hosts the sftp commands use
