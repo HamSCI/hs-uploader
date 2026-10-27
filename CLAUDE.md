@@ -108,6 +108,8 @@ fails.
   - `WsprdaemonTarSftp` / `WsprdaemonTarFtp` — cycle-aligned tar
     bundles to wsprdaemon.org.
   - `WsprNet` — HTTP multipart POST to `wsprnet.org/meptspots.php`.
+    ⚠ Mutually exclusive with the wsprdaemon transports'
+    `forward_to_wsprnet=True` (below): running both double-posts.
   - `PswsMagnetometerSftp` — daily zip to PSWS for mag-recorder.
 - **WatermarkStore** (`watermark/`) — owns per-`(source, destination,
   table)` cursor and retry-deliverable state. `SqliteWatermarkStore`
@@ -333,6 +335,44 @@ explicit even when no third-party deps are required.
   `lstat`, so anything at the path counts; only ENOENT/ENOTDIR read
   absent.  `write_marker` writes `carried over at <UTC>` and one line per
   note, mode 0644, atomically.
+
+## Proxying wsprnet.org through the WD servers (`forward_to_wsprnet`)
+
+`WsprdaemonTarSftp` / `WsprdaemonTarFtp` take two optional station-level
+arguments:
+
+| Argument | Meaning |
+|---|---|
+| `forward_to_wsprnet` | `True`/`False` asks the WD servers to post this station's WSPR spots to wsprnet.org on its behalf. `None` (default) says nothing. |
+| `wsprnet_reporter` | `(call, grid)` this station posts to wsprnet **under**, when that differs from its `rx_call`. |
+
+A station that proxies stops sending its WSPR spots twice — once in the tar
+and again over its own `WsprNet` pipeline.  The servers derive the MEPT
+submission from the extended rows the tar already carries.
+
+- The switch is written **both** into `routing.json` (`default.forward_to_wsprnet`)
+  **and** into field 33 of every extended spot line, from this one argument,
+  so the two can never disagree.  Different server vintages read different
+  ones.
+- **⛔ `None` writes nothing at all**, not `false`.  On the server, absent
+  means "leave field 33 alone"; an explicit `false` from a station that
+  merely has no opinion would switch off a legacy per-spot setting nobody
+  asked us to touch.  So a station that has not opted in builds a
+  **byte-identical** tar to before this existed — the switch is not a flag
+  day for the fleet.
+- `routing.json` is emitted for a **WSPR-only** tar when either argument is
+  set.  The station most likely to want this has no `ft8`/`ft4` at all;
+  gating the file on psk rows would make the switch unsendable for exactly
+  those sites.
+- **⚠ Turning this on does NOT stop the `WsprNet` transport.**  That is a
+  separate pipeline.  Switch them together or wsprnet gets both copies.
+
+Server side (the parse, the `proxy_upload` column, the reporter-identity
+table): `rrobinett/wsprdaemon-server`, CLAUDE.md § "wsprnet.org forwarder".
+`tests/test_transport_wsprdaemon.py` holds a cross-repo contract test that
+imports the server's parser and asserts it reads back exactly what this
+builder wrote — the key names live in two repos with nothing joining them,
+and a rename on one side is silent.
 
 ## watermarks.db schema version (`hs-uploader migrate`)
 

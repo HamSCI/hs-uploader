@@ -1050,3 +1050,181 @@ def test_key_generation_failure_is_nonfatal(tmp_path):
     with _open_tar_blob(captured["bytes"]) as tf:
         info = tf.extractfile("client_upload_info.txt").read().decode()
     assert "ssh_public_key=\n" in info
+
+
+# ---- the station-level wsprnet switch (forward_to_wsprnet) ----
+#
+# rob's spec: "this would be a single setting that would apply to all spots."
+# One station-level switch asks the WD servers to post this station's WSPR
+# spots to wsprnet.org on its behalf, so the spots stop being transmitted
+# twice.  It is written BOTH into routing.json and into field 33 of every
+# extended line, because different server vintages read different ones —
+# and they can never disagree, since both come from one argument.
+
+
+def _tar_members(blob):
+    import json as _j
+    with _open_tar_blob(blob) as tf:
+        names = set(tf.getnames())
+        routing = (_j.loads(tf.extractfile("routing.json").read())
+                   if "routing.json" in names else None)
+        spot_name = next((n for n in names if n.endswith("_wd_spots.txt")), None)
+        lines = (tf.extractfile(spot_name).read().decode().splitlines()
+                 if spot_name else [])
+    return names, routing, lines
+
+
+def _wspr_tar(**kw):
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
+    records = [_record_from_row(_row_v2()),
+               _record_from_row(_row_v2(callsign="N0STR"))]
+    return build_wsprdaemon_tar_from_records(
+        records, rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_T3FD", rx_site="AC0G=B1_EM38ww", **kw)
+
+
+def test_saying_nothing_changes_NOTHING_about_the_tar():
+    """⛔ THE INERTNESS PROOF.  Every station in the fleet builds tars through
+    this path today.  If adding the switch changed a byte for a station that
+    has not opted in, this would be a flag day for 85 sites instead of a
+    switch they throw one at a time."""
+    names, routing, lines = _tar_members(_wspr_tar())
+    assert routing is None and "routing.json" not in names
+    assert lines and all(ln.split()[33] == "0" for ln in lines)
+
+
+def test_on_sets_field_33_on_EVERY_line_and_says_so_in_routing_json():
+    names, routing, lines = _tar_members(_wspr_tar(forward_to_wsprnet=True))
+    assert routing["default"]["forward_to_wsprnet"] is True
+    assert len(lines) == 2
+    assert all(ln.split()[33] == "1" for ln in lines)
+
+
+def test_off_is_EXPLICIT_not_merely_absent():
+    """A station that switches proxying off must say so: on the server,
+    absent means 'leave field 33 alone', so an off switch that wrote nothing
+    would leave the server forwarding spots this station now posts itself —
+    and wsprnet would get both."""
+    names, routing, lines = _tar_members(_wspr_tar(forward_to_wsprnet=False))
+    assert routing["default"]["forward_to_wsprnet"] is False
+    assert all(ln.split()[33] == "0" for ln in lines)
+
+
+def test_routing_json_and_field_33_can_never_disagree():
+    for flag in (True, False):
+        _n, routing, lines = _tar_members(_wspr_tar(forward_to_wsprnet=flag))
+        from_json = routing["default"]["forward_to_wsprnet"]
+        from_line = {ln.split()[33] for ln in lines}
+        assert from_line == {"1" if from_json else "0"}
+
+
+def test_a_wspr_only_station_can_still_send_the_switch():
+    """⛔ The station most likely to want this has no ft8/ft4 at all.  Gating
+    routing.json on psk rows would make the switch unsendable for exactly
+    those sites."""
+    names, routing, _l = _tar_members(_wspr_tar(forward_to_wsprnet=True))
+    assert "routing.json" in names
+    assert not [n for n in names if n.startswith("ft8/")]
+
+
+def test_the_declared_identity_rides_in_routing_json():
+    _n, routing, _l = _tar_members(
+        _wspr_tar(forward_to_wsprnet=True,
+                  wsprnet_reporter=("AC0G", "EM38ww")))
+    assert routing["default"]["wsprnet_reporter"] == {"call": "AC0G",
+                                                     "grid": "EM38ww"}
+
+
+def test_an_identity_with_no_call_is_not_written():
+    _n, routing, _l = _tar_members(
+        _wspr_tar(forward_to_wsprnet=True, wsprnet_reporter=("", "EM38ww")))
+    assert "wsprnet_reporter" not in routing["default"]
+
+
+def test_the_switch_does_not_disturb_the_psk_flags_beside_it():
+    from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records
+    records = [_psk_record(_psk_row(forward_to_pskreporter=False)),
+               _record_from_row(_row_v2())]
+    blob = build_wsprdaemon_tar_from_records(
+        records, rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_RX888", rx_site="AC0G=B1_EM38ww",
+        forward_to_wsprnet=True)
+    _n, routing, _l = _tar_members(blob)
+    assert routing["default"] == {"forward_to_pskreporter": False,
+                                  "forward_to_wsprnet": True}
+
+
+def test_the_transport_carries_the_switch_to_the_builder():
+    """Constructed once per pipeline rebuild; the tar must reflect it."""
+    from hs_uploader.transports.wsprdaemon import WsprdaemonTarSftp
+    t = WsprdaemonTarSftp(servers=["wd1.example"], receiver="KA9Q_T3FD",
+                          forward_to_wsprnet=True,
+                          wsprnet_reporter=("AC0G", "EM38ww"))
+    assert t.forward_to_wsprnet is True
+    batch = RecordBatch(records=[_record_from_row(_row_v2())],
+                        cursor_after=b"1")
+    class _Id:
+        call, grid = "AC0G/B1", "EM38ww"
+    _n, routing, lines = _tar_members(t._build_tar(batch, _Id()))
+    assert routing["default"]["forward_to_wsprnet"] is True
+    assert lines[0].split()[33] == "1"
+
+
+# ---- cross-repo: the switch the client writes is the one the server reads ----
+
+def test_the_SERVER_reads_back_exactly_what_this_client_wrote():
+    """⛔ THE CONTRACT MUST NOT FORK.  routing.json is written here and parsed
+    in rrobinett/wsprdaemon-server, with nothing joining the two spellings.
+    A key renamed on one side is silent: the station believes it opted in,
+    the server sees nothing, and the spots simply never reach wsprnet.
+
+    Skips when no wsprdaemon-server checkout sits beside this repo.
+    """
+    import sys as _sys, types as _types
+    from pathlib import Path as _P
+    srv = _P(__file__).resolve().parents[2] / "wsprdaemon-server"
+    if not (srv / "wsprdaemon_server.py").exists():
+        import pytest
+        pytest.skip("no wsprdaemon-server checkout to compare against")
+    for _mod in ("clickhouse_connect", "clickhouse_driver"):
+        if _mod not in _sys.modules:
+            _stub = _types.ModuleType(_mod)
+            _stub.Client = object
+            _stub.get_client = lambda **kw: None
+            _sys.modules[_mod] = _stub
+    _sys.path.insert(0, str(srv))
+    import wsprdaemon_server as ws
+
+    key = "AC0G=B1_EM38ww/KA9Q_T3FD"   # <RX_SITE>/<RECEIVER>, as the tar files it
+    for flag in (True, False):
+        _n, routing, lines = _tar_members(
+            _wspr_tar(forward_to_wsprnet=flag,
+                      wsprnet_reporter=("AC0G", "EM38ww")))
+        assert ws._wsprnet_flag(routing, key) is flag
+        assert ws._wsprnet_reporter(routing, key) == ("AC0G", "EM38ww")
+        # ...and the server's three-valued read of a tar that said nothing.
+        _n2, routing2, _l2 = _tar_members(_wspr_tar())
+        assert routing2 is None
+        assert ws._wsprnet_flag({}, key) is None
+
+
+def test_the_FTP_BOOTSTRAP_path_carries_the_switch_too():
+    """⛔ FTP is the FIRST tar a new station ever sends — the one before the
+    gateway holds its pubkey.  A switch dropped only on this path would be
+    invisible on every station that has been running a while and silently
+    wrong on every station being brought up."""
+    import pathlib
+    from hs_uploader.transports.wsprdaemon import WsprdaemonTarFtp
+    t = WsprdaemonTarFtp(servers=["wd1.example"], receiver="KA9Q_T3FD",
+                         forward_to_wsprnet=True,
+                         wsprnet_reporter=("AC0G", "EM38ww"))
+    batch = RecordBatch(records=[_record_from_row(_row_v2())],
+                        cursor_after=b"1")
+    import tempfile as _tf
+    with _tf.TemporaryDirectory() as td:
+        ident = _ident(key=str(pathlib.Path(td) / "id_ed25519"))
+        names, routing, lines = _tar_members(t._build_tar(batch, ident))
+    assert "client_upload_info.txt" in names      # it IS the bootstrap tar
+    assert routing["default"]["forward_to_wsprnet"] is True
+    assert routing["default"]["wsprnet_reporter"]["call"] == "AC0G"
+    assert lines[0].split()[33] == "1"

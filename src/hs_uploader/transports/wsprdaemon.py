@@ -495,7 +495,8 @@ def _ts_from_iso(iso: str) -> tuple[str, str, str]:
     )
 
 
-def _format_extended_line(cols: dict, rx_call: str, rx_grid: str) -> str:
+def _format_extended_line(cols: dict, rx_call: str, rx_grid: str,
+                           proxy_upload: bool = False) -> str:
     """Render one schema-v2 row dict as a 34-field wsprdaemon extended
     line (matches the file content wd-extend-spots wrote for v1).
 
@@ -546,7 +547,7 @@ def _format_extended_line(cols: dict, rx_call: str, rx_grid: str) -> str:
         v_lat,
         v_lon,
         0,                                     # overloads_count (Phase 2)
-        0,                                     # proxy_upload_flag
+        int(bool(proxy_upload)),               # proxy_upload_flag (field 33)
     )
 
 
@@ -615,32 +616,50 @@ def _psk_cycle_key(time_iso: str) -> str:
     return dt.strftime("%y%m%d_%H") + f"{cycle_minute:02d}"
 
 
-def _render_routing_json(receivers_forward: dict) -> bytes:
+def _render_routing_json(
+    receivers_forward: dict,
+    *,
+    forward_to_wsprnet: Optional[bool] = None,
+    wsprnet_reporter: Optional[tuple[str, str]] = None,
+) -> bytes:
     """Emit routing.json from a {receiver_key: forward_bool} map.
 
     Receiver key: ``<RX_SITE>/<RECEIVER>``. When every receiver shares
     the same flag, collapse to a single ``default`` entry; otherwise
     emit ``default`` + per-receiver overrides. Producer always biases
     `default` toward True so an older server defaults to forwarding.
+
+    ``forward_to_wsprnet`` is a STATION-level setting and so is only ever
+    written under ``default``: one switch for every spot this station
+    ships, which is the contract the server reads.  ``None`` omits the
+    key entirely rather than writing ``false`` — on the server, absent
+    means "leave field 33 alone", and writing an explicit ``false`` from
+    a station that simply has no opinion would switch off a legacy
+    per-spot setting nobody asked us to touch.
     """
+    obj: dict = {}
     if not receivers_forward:
-        return json.dumps(
-            {"default": {"forward_to_pskreporter": True}}
-        ).encode() + b"\n"
-    flags = set(receivers_forward.values())
-    if len(flags) == 1:
-        only = flags.pop()
-        return json.dumps(
-            {"default": {"forward_to_pskreporter": bool(only)}}
-        ).encode() + b"\n"
-    # Mixed: pick the majority as default, override the minority. Keeps
-    # routing.json compact even on a host with many receivers.
-    n_true = sum(1 for v in receivers_forward.values() if v)
-    default_flag = n_true >= (len(receivers_forward) / 2)
-    obj = {"default": {"forward_to_pskreporter": bool(default_flag)}}
-    for key, val in sorted(receivers_forward.items()):
-        if bool(val) != default_flag:
-            obj[key] = {"forward_to_pskreporter": bool(val)}
+        obj = {"default": {"forward_to_pskreporter": True}}
+    else:
+        flags = set(receivers_forward.values())
+        if len(flags) == 1:
+            obj = {"default": {"forward_to_pskreporter": bool(flags.pop())}}
+        else:
+            # Mixed: pick the majority as default, override the minority.
+            # Keeps routing.json compact even on a host with many receivers.
+            n_true = sum(1 for v in receivers_forward.values() if v)
+            default_flag = n_true >= (len(receivers_forward) / 2)
+            obj = {"default": {"forward_to_pskreporter": bool(default_flag)}}
+            for key, val in sorted(receivers_forward.items()):
+                if bool(val) != default_flag:
+                    obj[key] = {"forward_to_pskreporter": bool(val)}
+    if forward_to_wsprnet is not None:
+        obj["default"]["forward_to_wsprnet"] = bool(forward_to_wsprnet)
+    if wsprnet_reporter is not None:
+        call, grid = wsprnet_reporter
+        if call:
+            obj["default"]["wsprnet_reporter"] = {"call": call,
+                                                  "grid": grid or ""}
     return json.dumps(obj, sort_keys=True).encode() + b"\n"
 
 
@@ -656,6 +675,8 @@ def build_wsprdaemon_tar_from_records(
     compression: str = COMPRESSION_BZ2,
     compression_level: int = 9,
     tar_root: str = TAR_ROOT_NEW,
+    forward_to_wsprnet: Optional[bool] = None,
+    wsprnet_reporter: Optional[tuple[str, str]] = None,
 ) -> bytes:
     """Build a Phase 2 wsprdaemon tar from sink.db-style records.
 
@@ -676,6 +697,19 @@ def build_wsprdaemon_tar_from_records(
     spot records. Records carrying a `psk.spots` table also produce
     a ``routing.json`` at the tar root with the per-receiver forwarding
     flags collected from each row's ``forward_to_pskreporter`` field.
+
+    ``forward_to_wsprnet`` asks the WD servers to post this station's WSPR
+    spots to wsprnet.org on its behalf.  It is written BOTH ways on
+    purpose — into ``routing.json`` AND into field 33 of every extended
+    spot line — because the two are read by different server vintages: a
+    server that predates the routing key reads field 33, and a tar whose
+    routing.json were ever lost or rewritten still carries the station's
+    intent in the spots themselves.  They cannot disagree, since both come
+    from this one argument.
+
+    ⚠ Turning it on does NOT stop this station posting to wsprnet
+    directly; that is the WsprNet transport's own pipeline, and shipping
+    both would double-post.  Switch them together.
     """
     spot_groups: dict = {}
     noise_groups: dict = {}
@@ -813,10 +847,17 @@ def build_wsprdaemon_tar_from_records(
                 tf, "client_upload_info.txt",
                 _client_info_bytes(reporter_id, pubkey),
             )
-        if psk_groups:
+        # ⚠ Also emitted for a WSPR-ONLY tar when the station declared a
+        # wsprnet setting.  Gating routing.json on psk rows alone would mean
+        # a station with no ft8/ft4 at all — exactly the kind that proxies
+        # its wsprnet uploads — could never send the switch.
+        if psk_groups or forward_to_wsprnet is not None or wsprnet_reporter:
             _tar_add_bytes(
                 tf, "routing.json",
-                _render_routing_json(receivers_forward),
+                _render_routing_json(
+                    receivers_forward,
+                    forward_to_wsprnet=forward_to_wsprnet,
+                    wsprnet_reporter=wsprnet_reporter),
             )
         for (rx_id, band, mode, ts_filename), rows in spot_groups.items():
             row_call, row_grid, row_recv, row_site = rx_id
@@ -824,7 +865,9 @@ def build_wsprdaemon_tar_from_records(
             if is_w:
                 # Per-row identity: the spot line carries this
                 # receiver's call+grid, not the uploader's.
-                lines = [_format_extended_line(r, row_call, row_grid)
+                lines = [_format_extended_line(
+                             r, row_call, row_grid,
+                             proxy_upload=bool(forward_to_wsprnet))
                          for r in rows]
                 suffix = "_wd_spots.txt"
             else:
@@ -908,8 +951,15 @@ class WsprdaemonTarSftp:
         tar_root: str = TAR_ROOT_NEW,
         known_hosts_file: Optional[str] = None,
         ssh_control_dir: Optional[Path | str] = None,
+        forward_to_wsprnet: Optional[bool] = None,
+        wsprnet_reporter: Optional[tuple[str, str]] = None,
     ):
         self.servers = list(servers)
+        # Station-level: ask the WD servers to post our WSPR spots to
+        # wsprnet.org.  None = say nothing, which leaves whatever the
+        # server already believes untouched.
+        self.forward_to_wsprnet = forward_to_wsprnet
+        self.wsprnet_reporter = wsprnet_reporter
         self.spool_root = Path(spool_root) if spool_root else None
         self.sftp_user_override = sftp_user
         # Writable known_hosts (see _default_known_hosts) — avoids the
@@ -1030,6 +1080,8 @@ class WsprdaemonTarSftp:
                 compression=self.compression,
                 compression_level=self.compression_level,
                 tar_root=self.tar_root,
+                forward_to_wsprnet=self.forward_to_wsprnet,
+                wsprnet_reporter=self.wsprnet_reporter,
             )
         return None
 
@@ -1240,8 +1292,12 @@ class WsprdaemonTarFtp:
         compression: str = COMPRESSION_BZ2,
         compression_level: int = 9,
         tar_root: str = TAR_ROOT_NEW,
+        forward_to_wsprnet: Optional[bool] = None,
+        wsprnet_reporter: Optional[tuple[str, str]] = None,
     ):
         self.servers = list(servers)
+        self.forward_to_wsprnet = forward_to_wsprnet
+        self.wsprnet_reporter = wsprnet_reporter
         self.spool_root = Path(spool_root) if spool_root else None
         self.ftp_user = ftp_user
         self.ftp_password_file = (
@@ -1330,6 +1386,8 @@ class WsprdaemonTarFtp:
                 compression=self.compression,
                 compression_level=self.compression_level,
                 tar_root=self.tar_root,
+                forward_to_wsprnet=self.forward_to_wsprnet,
+                wsprnet_reporter=self.wsprnet_reporter,
             )
         return None
 
