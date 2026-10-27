@@ -621,6 +621,7 @@ def _render_routing_json(
     *,
     forward_to_wsprnet: Optional[bool] = None,
     wsprnet_reporter: Optional[tuple[str, str]] = None,
+    psk_reporter: Optional[tuple[str, str]] = None,
 ) -> bytes:
     """Emit routing.json from a {receiver_key: forward_bool} map.
 
@@ -628,6 +629,10 @@ def _render_routing_json(
     the same flag, collapse to a single ``default`` entry; otherwise
     emit ``default`` + per-receiver overrides. Producer always biases
     `default` toward True so an older server defaults to forwarding.
+
+    ``psk_reporter`` is likewise station-level and optional: omitting it
+    leaves every receiver reported under its own identity, which is the
+    only safe default — see the server's `schema/psk_reporter.sql`.
 
     ``forward_to_wsprnet`` is a STATION-level setting and so is only ever
     written under ``default``: one switch for every spot this station
@@ -660,6 +665,19 @@ def _render_routing_json(
         if call:
             obj["default"]["wsprnet_reporter"] = {"call": call,
                                                   "grid": grid or ""}
+    if psk_reporter is not None:
+        call, grid = psk_reporter
+        if call:
+            # ⛔ Declared ONLY to merge.  The server's default is this
+            # receiver's own rx_sign and grid — the identity it uses
+            # posting to PSKReporter directly — so a station that says
+            # nothing keeps exactly the credit and map pin it has.  Two
+            # receivers become one reported station only by declaring the
+            # SAME call and grid.  A declaration with no call is dropped
+            # rather than half-applied: a grid alone cannot name a
+            # reporter.
+            obj["default"]["psk_reporter"] = {"call": call,
+                                              "grid": grid or ""}
     return json.dumps(obj, sort_keys=True).encode() + b"\n"
 
 
@@ -677,6 +695,7 @@ def build_wsprdaemon_tar_from_records(
     tar_root: str = TAR_ROOT_NEW,
     forward_to_wsprnet: Optional[bool] = None,
     wsprnet_reporter: Optional[tuple[str, str]] = None,
+    psk_reporter: Optional[tuple[str, str]] = None,
 ) -> bytes:
     """Build a Phase 2 wsprdaemon tar from sink.db-style records.
 
@@ -851,13 +870,15 @@ def build_wsprdaemon_tar_from_records(
         # wsprnet setting.  Gating routing.json on psk rows alone would mean
         # a station with no ft8/ft4 at all — exactly the kind that proxies
         # its wsprnet uploads — could never send the switch.
-        if psk_groups or forward_to_wsprnet is not None or wsprnet_reporter:
+        if (psk_groups or forward_to_wsprnet is not None
+                or wsprnet_reporter or psk_reporter):
             _tar_add_bytes(
                 tf, "routing.json",
                 _render_routing_json(
                     receivers_forward,
                     forward_to_wsprnet=forward_to_wsprnet,
-                    wsprnet_reporter=wsprnet_reporter),
+                    wsprnet_reporter=wsprnet_reporter,
+                    psk_reporter=psk_reporter),
             )
         for (rx_id, band, mode, ts_filename), rows in spot_groups.items():
             row_call, row_grid, row_recv, row_site = rx_id
@@ -953,6 +974,7 @@ class WsprdaemonTarSftp:
         ssh_control_dir: Optional[Path | str] = None,
         forward_to_wsprnet: Optional[bool] = None,
         wsprnet_reporter: Optional[tuple[str, str]] = None,
+        psk_reporter: Optional[tuple[str, str]] = None,
     ):
         self.servers = list(servers)
         # Station-level: ask the WD servers to post our WSPR spots to
@@ -960,6 +982,7 @@ class WsprdaemonTarSftp:
         # server already believes untouched.
         self.forward_to_wsprnet = forward_to_wsprnet
         self.wsprnet_reporter = wsprnet_reporter
+        self.psk_reporter = psk_reporter
         self.spool_root = Path(spool_root) if spool_root else None
         self.sftp_user_override = sftp_user
         # Writable known_hosts (see _default_known_hosts) — avoids the
@@ -1082,6 +1105,7 @@ class WsprdaemonTarSftp:
                 tar_root=self.tar_root,
                 forward_to_wsprnet=self.forward_to_wsprnet,
                 wsprnet_reporter=self.wsprnet_reporter,
+                psk_reporter=self.psk_reporter,
             )
         return None
 
@@ -1294,10 +1318,12 @@ class WsprdaemonTarFtp:
         tar_root: str = TAR_ROOT_NEW,
         forward_to_wsprnet: Optional[bool] = None,
         wsprnet_reporter: Optional[tuple[str, str]] = None,
+        psk_reporter: Optional[tuple[str, str]] = None,
     ):
         self.servers = list(servers)
         self.forward_to_wsprnet = forward_to_wsprnet
         self.wsprnet_reporter = wsprnet_reporter
+        self.psk_reporter = psk_reporter
         self.spool_root = Path(spool_root) if spool_root else None
         self.ftp_user = ftp_user
         self.ftp_password_file = (
@@ -1388,6 +1414,7 @@ class WsprdaemonTarFtp:
                 tar_root=self.tar_root,
                 forward_to_wsprnet=self.forward_to_wsprnet,
                 wsprnet_reporter=self.wsprnet_reporter,
+                psk_reporter=self.psk_reporter,
             )
         return None
 

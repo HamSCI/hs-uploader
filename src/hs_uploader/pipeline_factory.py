@@ -256,8 +256,9 @@ def _wsprnet_proxy_kw(spec: Mapping[str, Any]) -> dict[str, Any]:
     """Manifest keys that ask the WD servers to post our WSPR spots.
 
     Keys are a cross-repo contract with sigmond's manifest renderer:
-    ``forward_to_wsprnet`` (bool) and ``wsprnet_reporter_call`` /
-    ``wsprnet_reporter_grid``.
+    ``forward_to_wsprnet`` (bool), ``wsprnet_reporter_call`` /
+    ``wsprnet_reporter_grid``, and ``psk_reporter_call`` /
+    ``psk_reporter_grid``.
 
     ⛔ AN ABSENT KEY MUST STAY ABSENT, not become False.  The switch is
     three-valued end to end: on the server, silence means "leave the
@@ -278,6 +279,16 @@ def _wsprnet_proxy_kw(spec: Mapping[str, Any]) -> dict[str, Any]:
     if call:
         kw["wsprnet_reporter"] = (str(call),
                                   str(spec.get("wsprnet_reporter_grid") or ""))
+    # ⛔ psk_reporter_call is declared ONLY to MERGE this receiver with
+    # another.  Absent, the server reports the station under its own
+    # rx_sign and grid — the identity it uses posting to PSKReporter
+    # directly — so saying nothing cannot move anyone's credit or map
+    # pin.  Two receivers become one reported station only by declaring
+    # the SAME call and grid.
+    psk_call = spec.get("psk_reporter_call")
+    if psk_call:
+        kw["psk_reporter"] = (str(psk_call),
+                              str(spec.get("psk_reporter_grid") or ""))
     return kw
 
 

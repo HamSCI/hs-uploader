@@ -1228,3 +1228,62 @@ def test_the_FTP_BOOTSTRAP_path_carries_the_switch_too():
     assert routing["default"]["forward_to_wsprnet"] is True
     assert routing["default"]["wsprnet_reporter"]["call"] == "AC0G"
     assert lines[0].split()[33] == "1"
+
+
+# ---- declared PSKReporter identity: merging is asked for, never inferred ----
+
+def test_declaring_NOTHING_leaves_psk_reporter_out_of_routing_json():
+    """⛔ The default must be each receiver's OWN identity.  Writing a
+    psk_reporter nobody asked for would hand the server a merge decision
+    the operator never made."""
+    _n, routing, _l = _tar_members(_wspr_tar(forward_to_wsprnet=True))
+    assert routing is not None
+    assert "psk_reporter" not in routing.get("default", {})
+
+
+def test_a_declared_psk_identity_reaches_routing_json():
+    _n, routing, _l = _tar_members(
+        _wspr_tar(psk_reporter=("AC0G", "EM38ww")))
+    assert routing["default"]["psk_reporter"] == {"call": "AC0G",
+                                                  "grid": "EM38ww"}
+
+
+def test_a_psk_declaration_with_no_CALL_is_not_written():
+    """A grid alone cannot name a reporter; half of one is worse than none."""
+    _n, routing, _l = _tar_members(_wspr_tar(psk_reporter=("", "EM38ww")))
+    assert routing is None or "psk_reporter" not in routing.get("default", {})
+
+
+def test_a_psk_declaration_ALONE_still_gets_a_routing_json():
+    """A WSPR-only station declaring only a PSK merge must still ship the
+    file — otherwise the declaration is unsendable from exactly the kind of
+    host that has no ft8/ft4 tree to trigger it."""
+    _n, routing, _l = _tar_members(_wspr_tar(psk_reporter=("AC0G", "EM38ww")))
+    assert routing is not None
+
+
+def test_the_SERVER_reads_BACK_the_psk_identity_this_client_wrote():
+    """⛔ Second cross-repo contract, same hazard as the wsprnet one: the
+    key is spelled in two repos with nothing joining them, and a rename on
+    either side silently un-merges (or wrongly merges) a live station."""
+    import sys as _sys, types as _types
+    from pathlib import Path as _P
+    srv = _P(__file__).resolve().parents[2] / "wsprdaemon-server"
+    if not (srv / "wsprdaemon_server.py").exists():
+        import pytest
+        pytest.skip("no wsprdaemon-server checkout to compare against")
+    for _mod in ("clickhouse_connect", "clickhouse_driver"):
+        if _mod not in _sys.modules:
+            _stub = _types.ModuleType(_mod)
+            _stub.Client = object
+            _stub.get_client = lambda **kw: None
+            _sys.modules[_mod] = _stub
+    _sys.path.insert(0, str(srv))
+    import wsprdaemon_server as ws
+
+    key = "AC0G=B1_EM38ww/KA9Q_T3FD"
+    _n, routing, _l = _tar_members(_wspr_tar(psk_reporter=("AC0G", "EM38ww")))
+    assert ws._psk_reporter(routing, key) == ("AC0G", "EM38ww")
+    # ...and a tar that declared nothing must read as "no opinion", never
+    # as a merge.
+    assert ws._psk_reporter({}, key) is None

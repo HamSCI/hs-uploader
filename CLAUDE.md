@@ -345,6 +345,7 @@ arguments:
 |---|---|
 | `forward_to_wsprnet` | `True`/`False` asks the WD servers to post this station's WSPR spots to wsprnet.org on its behalf. `None` (default) says nothing. |
 | `wsprnet_reporter` | `(call, grid)` this station posts to wsprnet **under**, when that differs from its `rx_call`. |
+| `psk_reporter` | `(call, grid)` this station is reported to **PSKReporter** under. Declared ONLY to merge with another receiver. |
 
 A station that proxies stops sending its WSPR spots twice — once in the tar
 and again over its own `WsprNet` pipeline.  The servers derive the MEPT
@@ -367,8 +368,33 @@ submission from the extended rows the tar already carries.
 - **⚠ Turning this on does NOT stop the `WsprNet` transport.**  That is a
   separate pipeline.  Switch them together or wsprnet gets both copies.
 
+### `psk_reporter` — PSKReporter identity, and the one way to merge
+
+`psk_reporter` is **not** a switch and has no `forward_to_` twin: the
+decision to proxy PSK rows is `forward_to_pskreporter`, per receiver,
+already in `routing.json`.  This argument answers a different question —
+**who the spots are reported as.**
+
+- **Omitting it is the safe default and the normal case.**  The server
+  reports every row under its own `rx_sign` and grid, which is exactly the
+  identity this station uses posting to PSKReporter directly.  A station
+  that says nothing cannot have its credit or its map pin moved by moving
+  onto the proxy.
+- **It exists to MERGE.**  Two receivers are reported as one station when
+  they declare the SAME `(call, grid)` — that is "merge, and merge with
+  what?", expressed as data.  Merging is never inferred from a shared
+  callsign prefix: `AC0G/B4` is in Missouri and `AC0G/ND` in North Dakota.
+- A declaration with no `call` is dropped rather than half-applied: a grid
+  alone cannot name a reporter.
+- Like `wsprnet_reporter`, it is written only under `default` and triggers
+  a `routing.json` even on a WSPR-only tar — the station most likely to
+  declare one may have no `ft8`/`ft4` tree to trigger the file.
+- Manifest keys (cross-repo contract with sigmond): `psk_reporter_call`,
+  `psk_reporter_grid`, read by `pipeline_factory._wsprnet_proxy_kw`.
+
 Server side (the parse, the `proxy_upload` column, the reporter-identity
-table): `rrobinett/wsprdaemon-server`, CLAUDE.md § "wsprnet.org forwarder".
+tables): `rrobinett/wsprdaemon-server`, CLAUDE.md § "wsprnet.org forwarder"
+and § "Reporter identity (`psk.reporter`)".
 `tests/test_transport_wsprdaemon.py` holds a cross-repo contract test that
 imports the server's parser and asserts it reads back exactly what this
 builder wrote — the key names live in two repos with nothing joining them,

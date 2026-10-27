@@ -406,3 +406,50 @@ def test_a_reporter_grid_without_a_call_is_not_an_identity(tmp_path, monkeypatch
     m["pipeline"][0]["transport"]["wsprnet_reporter_grid"] = "EM38ww"
     wd = build_pipelines(m, watermark=_wm())[0]
     assert wd.transport.wsprnet_reporter is None
+
+
+def test_a_manifest_that_says_nothing_declares_NO_psk_identity():
+    """⛔ Absent must stay absent.  A psk_reporter invented here would make
+    every station in the fleet declare a merge it never configured."""
+    from hs_uploader.pipeline_factory import _wsprnet_proxy_kw
+    assert "psk_reporter" not in _wsprnet_proxy_kw({})
+    assert "psk_reporter" not in _wsprnet_proxy_kw({"psk_reporter_grid": "EM38ww"})
+
+
+def test_the_psk_identity_keys_are_READ_by_the_factory():
+    """⚠ A key the factory does not read is SILENT: the manifest says the
+    station declared a merge, the tar says nothing, and the two receivers
+    stay separate with nobody reporting an error."""
+    from hs_uploader.pipeline_factory import _wsprnet_proxy_kw
+    kw = _wsprnet_proxy_kw({"psk_reporter_call": "AC0G",
+                            "psk_reporter_grid": "EM38ww"})
+    assert kw["psk_reporter"] == ("AC0G", "EM38ww")
+
+
+def test_the_psk_identity_reaches_BOTH_legs_of_the_tar_transport():
+    """⛔ Accepting the argument is not carrying it.  A transport that
+    stores `psk_reporter` and never hands it to the tar builder leaves the
+    declaration in the station's config and out of the tar — exactly the
+    silent half-wiring that made `forward_to_wsprnet` need its own helper.
+
+    FTP matters as much as SFTP: it is the FIRST tar a new station sends,
+    so a drop there is wrong only during bring-up, when nobody is looking.
+    """
+    import pathlib, tempfile
+    from hs_uploader.transports.wsprdaemon import (WsprdaemonTarSftp,
+                                                   WsprdaemonTarFtp)
+    from tests.test_transport_wsprdaemon import (
+        _tar_members, _record_from_row, _row_v2, _ident)
+    from hs_uploader.sources.base import RecordBatch
+
+    batch = RecordBatch(records=[_record_from_row(_row_v2())],
+                        cursor_after=b"1")
+    for cls in (WsprdaemonTarSftp, WsprdaemonTarFtp):
+        t = cls(servers=["wd1.example"], receiver="KA9Q_T3FD",
+                psk_reporter=("AC0G", "EM38ww"))
+        with tempfile.TemporaryDirectory() as td:
+            ident = _ident(key=str(pathlib.Path(td) / "id_ed25519"))
+            _n, routing, _l = _tar_members(t._build_tar(batch, ident))
+        assert routing is not None, f"{cls.__name__} shipped no routing.json"
+        assert routing["default"]["psk_reporter"] == {
+            "call": "AC0G", "grid": "EM38ww"}, cls.__name__
