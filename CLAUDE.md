@@ -338,7 +338,7 @@ explicit even when no third-party deps are required.
 
 ## Proxying wsprnet.org through the WD servers (`forward_to_wsprnet`)
 
-`WsprdaemonTarSftp` / `WsprdaemonTarFtp` take two optional station-level
+`WsprdaemonTarSftp` / `WsprdaemonTarFtp` take three optional station-level
 arguments:
 
 | Argument | Meaning |
