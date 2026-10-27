@@ -344,3 +344,65 @@ def test_psws_dataset_trigger_knobs_pass_through(tmp_path, monkeypatch):
     grape = build_pipelines(_manifest(tmp_path), watermark=_wm())[0].transport
     assert (grape.remote_path, grape.trigger_path, grape.trigger_prefix,
             grape.trigger_ts_colons) == ("", "", "c", False)
+
+
+# ---- the wsprnet proxy switch, manifest → transport ----------------------
+#
+# ⚠ A manifest key the factory does not read is SILENT: the station's
+# config says it opted in, the tar says nothing, and the spots reach
+# wsprnet by neither route — the server is not forwarding them and the
+# station has stopped posting them itself.
+
+
+def test_a_manifest_that_says_nothing_leaves_the_switch_UNSET(tmp_path, monkeypatch):
+    """⛔ Absent must stay absent, not become False.  Every station in the
+    fleet renders this manifest today; if silence became an explicit
+    opt-out, all of them would start shipping one they never configured."""
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    wd = build_pipelines(_wspr_manifest(tmp_path), watermark=_wm())[0]
+    assert wd.transport.forward_to_wsprnet is None
+    assert wd.transport.wsprnet_reporter is None
+    assert wd.transport.fallback_ftp.forward_to_wsprnet is None
+
+
+def test_the_switch_reaches_BOTH_legs_of_the_tar_transport(tmp_path, monkeypatch):
+    """FTP is the bootstrap leg — the first tar a new station sends.  A
+    switch carried only on the SFTP leg would be missing on exactly the
+    tars nobody is watching yet."""
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    m = _wspr_manifest(tmp_path)
+    m["pipeline"][0]["transport"]["forward_to_wsprnet"] = True
+    wd = build_pipelines(m, watermark=_wm())[0]
+    assert wd.transport.forward_to_wsprnet is True
+    assert wd.transport.fallback_ftp.forward_to_wsprnet is True
+
+
+def test_an_explicit_false_survives_as_false_not_as_absent(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    m = _wspr_manifest(tmp_path)
+    m["pipeline"][0]["transport"]["forward_to_wsprnet"] = False
+    wd = build_pipelines(m, watermark=_wm())[0]
+    assert wd.transport.forward_to_wsprnet is False
+
+
+def test_the_reporter_identity_crosses_the_manifest_boundary(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    m = _wspr_manifest(tmp_path)
+    m["pipeline"][0]["transport"].update(
+        forward_to_wsprnet=True,
+        wsprnet_reporter_call="AC0G",
+        wsprnet_reporter_grid="EM38ww",
+    )
+    wd = build_pipelines(m, watermark=_wm())[0]
+    assert wd.transport.wsprnet_reporter == ("AC0G", "EM38ww")
+    assert wd.transport.fallback_ftp.wsprnet_reporter == ("AC0G", "EM38ww")
+
+
+def test_a_reporter_grid_without_a_call_is_not_an_identity(tmp_path, monkeypatch):
+    """A grid alone cannot name a reporter; half an identity must not
+    become one."""
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    m = _wspr_manifest(tmp_path)
+    m["pipeline"][0]["transport"]["wsprnet_reporter_grid"] = "EM38ww"
+    wd = build_pipelines(m, watermark=_wm())[0]
+    assert wd.transport.wsprnet_reporter is None

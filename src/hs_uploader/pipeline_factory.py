@@ -211,6 +211,11 @@ def _build_transport(spec: Mapping[str, Any]):
             for k in ("version", "compression", "tar_root", "receiver"):
                 if spec.get(k) is not None:
                     fb_kw[k] = str(spec[k])
+            # ...including the wsprnet switch.  FTP is the BOOTSTRAP leg,
+            # the first tar a new station ever sends; a switch carried
+            # only on the SFTP leg would be missing on exactly the tars
+            # nobody is watching yet.
+            fb_kw.update(_wsprnet_proxy_kw(spec))
             if spec.get("upload_id"):
                 fb_kw["upload_id"] = str(spec["upload_id"])
             fb = WsprdaemonTarFtp(**fb_kw)
@@ -227,6 +232,7 @@ def _build_transport(spec: Mapping[str, Any]):
         # WsprCycleSource parks its watermark on "wspr.cycle" so it doesn't
         # collide with the raw-table (wspr.spots) wsprnet pipeline.
         kw["primary_table_name"] = str(spec.get("primary_table_name", "wspr.cycle"))
+        kw.update(_wsprnet_proxy_kw(spec))
         return WsprdaemonTarSftp(fallback_ftp=fb, **kw)
     if ttype == "heartbeat_sftp":
         # Manifest keys are a cross-repo contract with sigmond's
@@ -244,6 +250,35 @@ def _build_transport(spec: Mapping[str, Any]):
             kw["name"] = str(spec["name"])
         return HeartbeatSftp(**kw)
     raise ValueError(f"unknown transport type: {ttype!r}")
+
+
+def _wsprnet_proxy_kw(spec: Mapping[str, Any]) -> dict[str, Any]:
+    """Manifest keys that ask the WD servers to post our WSPR spots.
+
+    Keys are a cross-repo contract with sigmond's manifest renderer:
+    ``forward_to_wsprnet`` (bool) and ``wsprnet_reporter_call`` /
+    ``wsprnet_reporter_grid``.
+
+    ⛔ AN ABSENT KEY MUST STAY ABSENT, not become False.  The switch is
+    three-valued end to end: on the server, silence means "leave the
+    station's own per-spot field 33 alone".  If this helper turned a
+    manifest that says nothing into ``forward_to_wsprnet=False``, every
+    station in the fleet would begin shipping an explicit opt-out it
+    never configured.
+
+    ⚠ A key the factory does not read is SILENT: the station's config
+    says it opted in, the tar says nothing, and the spots reach wsprnet
+    by neither route.  That is why this is a named helper with its own
+    test rather than two more entries in the allow-list above.
+    """
+    kw: dict[str, Any] = {}
+    if spec.get("forward_to_wsprnet") is not None:
+        kw["forward_to_wsprnet"] = bool(spec["forward_to_wsprnet"])
+    call = spec.get("wsprnet_reporter_call")
+    if call:
+        kw["wsprnet_reporter"] = (str(call),
+                                  str(spec.get("wsprnet_reporter_grid") or ""))
+    return kw
 
 
 def _retry(spec: Optional[Mapping[str, Any]]) -> RetryPolicy:
