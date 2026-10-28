@@ -599,8 +599,16 @@ def _cmd_status(args, store: SqliteWatermarkStore) -> int:
             )
     pending = store.deliverable_count()
     dl = store.dead_letter_count()
-    print(f"  {pending} deliverable(s) pending retry, {dl} in dead-letter")
     summary = backlog.summarize(store.path)
+    # Lead with the damage; keep the attempt count beside it, because the
+    # two differing is itself the signal that something is retry-looping.
+    datasets = sum(p.get("dead_letter_datasets", 0)
+                   for p in summary.get("pipelines", []))
+    if dl and datasets and datasets != dl:
+        print(f"  {pending} deliverable(s) pending retry, "
+              f"{datasets} dataset(s) in dead-letter ({dl} attempts)")
+    else:
+        print(f"  {pending} deliverable(s) pending retry, {dl} in dead-letter")
     orphans = summary.get("orphaned_dead_letters", 0)
     if orphans:
         print(f"  {orphans} of those dead letter(s) belong to a pipeline the "

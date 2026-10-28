@@ -75,8 +75,10 @@ def summarize(watermark_db_path: Union[str, Path],
 
         {"readable": True,
          "pipelines": [{"name": <pipeline>, "deliverable_count": int,
-                         "dead_letter_count": int,
+                         "dead_letter_count": int,     # rows = attempts
                          "dead_letter_recent_count": int,
+                         "dead_letter_datasets": int,  # distinct payloads
+                         "dead_letter_recent_datasets": int,
                          "dead_letter_newest": str | None,
                          "client": str, "refused_reason": str}, ...],
          "cursors": [{"source_id": ..., "dest_id": ..., "table_name": ...,
@@ -147,8 +149,30 @@ def summarize(watermark_db_path: Union[str, Path],
                     "GROUP BY pipeline"
                 )
             }
+            # ⛔ COUNT THE DAMAGE, NOT THE RETRY CADENCE.  A dataset that
+            # is dead-lettered, re-queued and dead-lettered again adds a row
+            # each time, so the raw count measures how often we tried, not
+            # how much is lost.  Measured on AC0G/B4 2026-10-27: 82 dead
+            # letters covering TWO datasets — one day's mag zip and one
+            # day's GRAPE — reported as "78 failed for good".
+            #
+            # `dataset_id` is the first rowid that carried this payload in
+            # this pipeline, so every re-dead-lettering of the same thing
+            # collapses onto it.  Done as a correlated subquery so the
+            # blobs stay in SQLite and are never transferred.
+            #
+            # The `d2.pipeline = d1.pipeline` predicate cannot change any
+            # per-pipeline count — the ids are only ever grouped within one
+            # pipeline, so it is an equivalent mutant and no test covers it.
+            # Keep it anyway: it makes the id mean "this dataset, here", so
+            # a later caller may union ids across pipelines without the
+            # same payload in two pipelines silently counting once.
             dead_rows = list(conn.execute(
-                "SELECT pipeline, ts FROM dead_letter"))
+                "SELECT pipeline, ts, ("
+                "  SELECT MIN(d2.rowid) FROM dead_letter d2"
+                "   WHERE d2.pipeline = d1.pipeline"
+                "     AND d2.payload_blob = d1.payload_blob"
+                ") AS dataset_id FROM dead_letter d1"))
             # The two tables of spec 4.5 are absent on a version-1 store;
             # that is a normal state, not an unreadable one.
             superseded = _optional_rows(
@@ -170,13 +194,20 @@ def summarize(watermark_db_path: Union[str, Path],
     dead_letter_counts: dict = {}
     dead_letter_recent: dict = {}
     dead_letter_newest: dict = {}
+    dead_sets: dict = {}
+    dead_sets_recent: dict = {}
     for row in dead_rows:
         name, ts = row["pipeline"], row["ts"]
+        did = row["dataset_id"]
         dead_letter_counts[name] = dead_letter_counts.get(name, 0) + 1
+        dead_sets.setdefault(name, set()).add(did)
         if _is_recent(ts, cutoff):
             dead_letter_recent[name] = dead_letter_recent.get(name, 0) + 1
+            dead_sets_recent.setdefault(name, set()).add(did)
         if name not in dead_letter_newest or ts > dead_letter_newest[name]:
             dead_letter_newest[name] = ts
+    dead_letter_datasets = {k: len(v) for k, v in dead_sets.items()}
+    dead_letter_recent_datasets = {k: len(v) for k, v in dead_sets_recent.items()}
 
     successors: dict = {}
     for row in superseded:
@@ -202,6 +233,10 @@ def summarize(watermark_db_path: Union[str, Path],
             "deliverable_count": deliverable_counts.get(name, 0),
             "dead_letter_count": dead_letter_counts.get(name, 0),
             "dead_letter_recent_count": dead_letter_recent.get(name, 0),
+            # distinct datasets, not attempts — see the query above
+            "dead_letter_datasets": dead_letter_datasets.get(name, 0),
+            "dead_letter_recent_datasets":
+                dead_letter_recent_datasets.get(name, 0),
             "dead_letter_newest": dead_letter_newest.get(name),
         }
         for name in pipeline_names

@@ -70,6 +70,44 @@ logger = logging.getLogger(__name__)
 TABLE = "mag.daily_zip"
 
 
+# ssh says WHY it failed on one line, usually not the last one.  Taking the
+# tail of the output is what hid "Permission denied (publickey)" behind the
+# transfer chatter that followed it.
+_SFTP_DIAGNOSTICS = (
+    "permission denied",
+    "host key verification failed",
+    "remote host identification has changed",
+    "no such file or directory",
+    "connection refused",
+    "connection closed",
+    "connection timed out",
+    "could not resolve hostname",
+    "disk quota exceeded",
+    "no space left on device",
+    "too many authentication failures",
+    "operation not permitted",
+    "broken pipe",
+    "timed out",
+    "not found on path",
+)
+
+
+def _diagnose(output: str) -> str:
+    """The line that says WHY, else the tail.
+
+    An auth refusal and a network blip both end rc=255; only the text tells
+    them apart, and only if the text survives to the log.
+    """
+    lines = [ln.strip() for ln in output.splitlines() if ln.strip()]
+    for ln in lines:
+        low = ln.lower()
+        if any(sig in low for sig in _SFTP_DIAGNOSTICS):
+            return ln[:300]
+    if lines:
+        return " | ".join(lines)[-300:]
+    return "(no output from sftp)"
+
+
 class PswsMagnetometerSftp:
     """Upload daily ``OBS<date>T<HH:MM>.zip`` files to PSWS.
 
@@ -282,11 +320,12 @@ class PswsMagnetometerSftp:
         # "host key changed" or "network blip" from "permanent
         # rejection" here; the watermark retry policy bounds attempts
         # before falling into dead-letter.
+        detail = _diagnose(output)
         logger.warning(
             "PswsDatasetSftp: sftp rc=%d for %s: %s",
-            rc, dataset_name, output[-300:].strip(),
+            rc, dataset_name, detail,
         )
-        return Outcome.retry_later(f"sftp rc={rc}")
+        return Outcome.retry_later(f"sftp rc={rc}: {detail}")
 
     def _dir_put_lines(self, local_path: Path, remote_name: str) -> list[str]:
         """Recursive ``mkdir``/``put`` batch for a directory dataset.
@@ -332,7 +371,15 @@ class PswsMagnetometerSftp:
         cmd = [
             "sftp",
             "-b", "-",
-            "-q",
+            # ⛔ NOT -q.  `sftp -q` disables the progress meter AND every
+            # warning and diagnostic ssh would have printed, so a server
+            # REFUSING THE KEY reads in the journal exactly like a network
+            # blip: "Connection closed", rc=255, no reason.  Measured on
+            # AC0G/B4 2026-10-26..27 — PSWS refused S000170's key for 24 h,
+            # 993 retries and 82 dead letters, and "Permission denied
+            # (publickey)" never once reached the log.  LogLevel=ERROR keeps
+            # the diagnosis without the per-file chatter.
+            "-o", "LogLevel=ERROR",
             "-o", "BatchMode=yes",
             "-o", f"ConnectTimeout={self.connect_timeout_sec}",
             "-o", "StrictHostKeyChecking=accept-new",

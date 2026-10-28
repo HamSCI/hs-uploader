@@ -460,6 +460,15 @@ V376_PIPELINE_KEYS = {
     "dead_letter_count", "dead_letter_recent_count", "dead_letter_newest",
 }
 
+# Added after v3.76.  Consumers read keys by name, so an ADDED key is
+# compatible and a REMOVED or RENAMED one is not — that asymmetry is what
+# this pin exists to hold, so the baseline above is never edited and new
+# keys are listed here instead.
+ADDED_PIPELINE_KEYS = {
+    # distinct datasets behind the dead letters, not the attempt count
+    "dead_letter_datasets", "dead_letter_recent_datasets",
+}
+
 
 def _seed_last_send(db):
     s = SqliteWatermarkStore(db)
@@ -479,7 +488,12 @@ def test_last_send_is_top_level_and_pipeline_keys_are_unchanged(tmp_path):
         "ts": "2026-10-20T01:02:03+00:00", "records": 7}]
     assert out["pipelines"]
     for p in out["pipelines"]:
-        assert set(p) == V376_PIPELINE_KEYS
+        keys = set(p)
+        # nothing the v3.76 contract promised may disappear
+        assert V376_PIPELINE_KEYS <= keys, V376_PIPELINE_KEYS - keys
+        # and nothing may appear that this file does not know about
+        assert keys <= V376_PIPELINE_KEYS | ADDED_PIPELINE_KEYS, (
+            keys - V376_PIPELINE_KEYS - ADDED_PIPELINE_KEYS)
 
 
 def test_last_send_reads_empty_on_a_version_2_store(tmp_path):
