@@ -46,35 +46,24 @@ def _temp_db_path() -> str:
 
 
 class TestNoOpMode(unittest.TestCase):
-    """No path configured and no writable default → noop. Standalone-safe."""
+    """No path configured and nothing at the default places → noop.
+
+    tests/conftest.py points sink_path's defaults at nowhere, so env={}
+    finds no sink whatever the host holds.
+    """
 
     def test_from_env_no_path_yields_noop(self):
         w = Writer.from_env(table="spots", mode="psk", env={})
-        # env={} has no SIGMOND_SQLITE_PATH; from_env may still pick the
-        # /var/lib/sigmond default if that dir is writable on the test
-        # host.  Force the standalone case by disabling the probe.
-        from hs_uploader.sink import writer as writer_mod
-        original = writer_mod._default_sqlite_writable
-        writer_mod._default_sqlite_writable = lambda _p: False
-        try:
-            w = Writer.from_env(table="spots", mode="psk", env={})
-            self.assertTrue(w.is_noop)
-            self.assertEqual(w.health, HEALTH_NOOP)
-        finally:
-            writer_mod._default_sqlite_writable = original
+        self.assertTrue(w.is_noop)
+        self.assertEqual(w.health, HEALTH_NOOP)
 
     def test_noop_insert_does_nothing(self):
-        from hs_uploader.sink import writer as writer_mod
-        original = writer_mod._default_sqlite_writable
-        writer_mod._default_sqlite_writable = lambda _p: False
-        try:
-            w = Writer.from_env(table="spots", mode="psk", env={})
-            w.insert([{"a": 1}, {"a": 2}])
-            self.assertEqual(w.buffered, 0)
-            w.flush()
-            w.close()
-        finally:
-            writer_mod._default_sqlite_writable = original
+        w = Writer.from_env(table="spots", mode="psk", env={})
+        self.assertTrue(w.is_noop)
+        w.insert([{"a": 1}, {"a": 2}])
+        self.assertEqual(w.buffered, 0)
+        w.flush()
+        w.close()
 
 
 class TestConfigAndAlias(unittest.TestCase):
@@ -285,17 +274,10 @@ class TestWriterFromEnvDispatch(unittest.TestCase):
         self.assertFalse(w.is_noop)
 
     def test_neither_set_with_no_default_dir_yields_noop(self):
-        # When /var/lib/sigmond doesn't exist and can't be created, the
-        # fallback is no-op (preserves standalone-safety).  We force this
-        # by monkeypatching the writability probe to return False.
-        from hs_uploader.sink import writer as writer_mod
-        original = writer_mod._default_sqlite_writable
-        writer_mod._default_sqlite_writable = lambda _p: False
-        try:
-            w = Writer.from_env(table="spots", mode="psk", env={})
-            self.assertTrue(w.is_noop)
-        finally:
-            writer_mod._default_sqlite_writable = original
+        # Nothing set and no sink at any default place: standalone-safe
+        # no-op.  The conftest fixture isolates the host's real sink.
+        w = Writer.from_env(table="spots", mode="psk", env={})
+        self.assertTrue(w.is_noop)
 
     def test_neither_set_with_writable_default_yields_enabled(self):
         # The default: SQLite at <state dir>/sink.db when that directory

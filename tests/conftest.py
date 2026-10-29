@@ -7,6 +7,7 @@ mocked via in-memory implementations.
 
 from __future__ import annotations
 
+import os
 import sys
 from pathlib import Path
 
@@ -18,6 +19,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
+import os
 import sys
 from datetime import datetime, timezone
 from pathlib import Path
@@ -170,3 +172,29 @@ def make_record():
             columns=cols,
         )
     return _make
+
+
+@pytest.fixture(autouse=True)
+def _isolate_from_the_hosts_sink(tmp_path, monkeypatch):
+    """Keep every test off the host's real sink locations.
+
+    `sink_path` binds /etc/hs-uploader/sink.toml and /var/lib/sigmond/
+    sink.db as defaults, so on a station `Writer.from_env(env={})` would
+    resolve to the live sink.  Point the defaults at paths that do not
+    exist under tmp_path.  Explicit arguments and the env still win, so
+    tests/test_sink_path.py, which passes its own paths, is unaffected.
+    """
+    from hs_uploader.sink import writer as writer_mod
+
+    real = writer_mod.sink_path
+    nowhere = tmp_path / "no-such-host-sink"
+
+    def isolated(env=None, **kw):
+        e = env if env is not None else os.environ
+        kw.setdefault("config_file", str(nowhere / "sink.toml"))
+        kw.setdefault("legacy_path", str(nowhere / "legacy" / "sink.db"))
+        if not (e.get("HS_UPLOADER_STATE_DIR") or "").strip():
+            kw.setdefault("state_dir", str(nowhere / "state"))
+        return real(env, **kw)
+
+    monkeypatch.setattr(writer_mod, "sink_path", isolated)
