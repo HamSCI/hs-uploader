@@ -1,8 +1,8 @@
 """HamSCI sink writer (CONTRACT §17), the write side of hs-uploader.
 
 Producer clients call `Writer.from_env(...)` to get a local-sink
-writer.  The backend is SQLite — a store-and-forward queue under
-sigmond's state dir that hs-uploader's sources drain upstream:
+writer.  The backend is SQLite, a store-and-forward queue that
+hs-uploader's sources drain upstream.
 
 `sink_path()` finds the sink, first match wins: `HAMSCI_SINK_PATH` or
 `SIGMOND_SQLITE_PATH` in the env; `path` in `/etc/hs-uploader/sink.toml`;
@@ -19,8 +19,9 @@ failure rather than silently losing rows.
 `PENDING_UPLOADS_DDL`, `ensure_columns` and `infer_producer` give
 readers, tools and tests the writer's own schema and producer rule.
 
-This package moved here from `sigmond.hamsci_sink` in v3.70; clients
-still import it through that name (tasks/plan-sink-control.md §10.4).
+This package moved here from `sigmond.hamsci_sink` in v3.70.  Clients
+import it as `hs_uploader.sink`, and fall back to `sigmond.hamsci_sink`
+for one release.
 """
 
 from .writer import (
