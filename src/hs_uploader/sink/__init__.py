@@ -4,10 +4,10 @@ Producer clients call `Writer.from_env(...)` to get a local-sink
 writer.  The backend is SQLite — a store-and-forward queue under
 sigmond's state dir that hs-uploader's sources drain upstream:
 
-- `SIGMOND_SQLITE_PATH` set → writer at that path (explicit override).
-- unset                    → `/var/lib/sigmond/sink.db` if its
-  directory is writable, else no-op (preserves standalone-safety for
-  clients running outside a sigmond install).
+`sink_path()` finds the sink, first match wins: `HAMSCI_SINK_PATH` or
+`SIGMOND_SQLITE_PATH` in the env; `path` in `/etc/hs-uploader/sink.toml`;
+an existing `/var/lib/sigmond/sink.db`; `<state dir>/sink.db` when its
+directory is writable.  With none of these the writer is a no-op.
 
 SQLite suits a sigmond client host: the local sink is just a buffer
 for `hs-uploader`, and a daemon-backed columnar store would burn
@@ -30,6 +30,7 @@ from .writer import (
     Writer,
     ensure_columns,
     infer_producer,
+    sink_path,
 )
 
 __all__ = [
@@ -39,4 +40,5 @@ __all__ = [
     "PENDING_UPLOADS_DDL",
     "ensure_columns",
     "infer_producer",
+    "sink_path",
 ]

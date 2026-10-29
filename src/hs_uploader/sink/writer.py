@@ -33,13 +33,18 @@ The switch check (spec-sink-2b-part2 §4):
     counts dropped rows per producer; `health` ignores it.  One INFO
     line marks each change of a producer's verdict; no row logs.
 
-Selection (`Writer.from_env`):
-    `SIGMOND_SQLITE_PATH` set → writer at that path (explicit override;
-        useful for tests or unusual layouts).
-    unset → the sigmond default `/var/lib/sigmond/sink.db`, IF that
-        directory is writable.  Otherwise no-op — a true standalone
-        client (no sigmond install) stays safe instead of erroring on
-        every flush.
+Selection (`sink_path`, used by `Writer.from_env`; first match wins):
+    1. `HAMSCI_SINK_PATH`, then `SIGMOND_SQLITE_PATH`, in the env
+        (explicit override; useful for tests or unusual layouts).
+    2. `path` in `/etc/hs-uploader/sink.toml`.  A file that will not
+        read or parse logs one ERROR and the search goes on.
+    3. `/var/lib/sigmond/sink.db`, if that file exists: a station that
+        holds one keeps it.
+    4. `<state dir>/sink.db` (`HS_UPLOADER_STATE_DIR`, else
+        `/var/lib/hs-uploader`), IF its directory is writable.
+    5. Otherwise no-op, with one ERROR per process naming the config
+        file.  A client that finds no sink stays safe instead of
+        erroring on every flush.
 
 Storage shape:
     One queue table `pending_uploads` shared across modes:
@@ -77,10 +82,11 @@ import os
 import sqlite3
 import threading
 import time
+import tomllib
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import Any, Optional, Sequence
+from typing import Any, Mapping, Optional, Sequence
 
 # Default batch trigger.  Sized as a write-buffer, not an OLAP
 # bulk-insert: we want rows on disk in seconds, not when a large batch
@@ -108,10 +114,22 @@ HEALTH_DEGRADED = "degraded"
 HEALTH_NOOP = "noop"
 
 
-# Default sink path used when no path is explicitly configured.  Lives
-# under sigmond's state dir so operators can find it for backup,
-# disk-budget accounting, and hs-uploader's reader.
-_DEFAULT_SQLITE_PATH = "/var/lib/sigmond/sink.db"
+# Where `sink_path` looks, in order.  The installer writes SINK_CONFIG;
+# LEGACY_SINK_PATH is where sigmond stations have always kept the sink.
+SINK_CONFIG = "/etc/hs-uploader/sink.toml"
+LEGACY_SINK_PATH = "/var/lib/sigmond/sink.db"
+_DEFAULT_STATE_DIR = "/var/lib/hs-uploader"
+
+# One ERROR per process per distinct condition.  Tests reset them with
+# `_reset_once_flags`.
+_config_error_logged: set = set()      # config file paths already reported
+_no_sink_logged = False
+
+
+def _reset_once_flags() -> None:
+    global _no_sink_logged
+    _config_error_logged.clear()
+    _no_sink_logged = False
 
 
 def _default_sqlite_writable(path: str) -> bool:
@@ -128,6 +146,72 @@ def _default_sqlite_writable(path: str) -> bool:
         return os.access(parent, os.W_OK)
     grandparent = parent.parent
     return grandparent.exists() and os.access(grandparent, os.W_OK)
+
+
+def _config_path(config_file: str) -> Optional[str]:
+    """`path` from the sink config file, or None.
+
+    A missing file is the normal case and says nothing.  A file that
+    fails to read or parse, or has no string `path`, logs one ERROR per
+    process and counts as absent, so a bad file never drops rows.
+    """
+    try:
+        with open(config_file, "rb") as fh:
+            data = tomllib.load(fh)
+    except FileNotFoundError:
+        return None
+    except (OSError, tomllib.TOMLDecodeError, UnicodeDecodeError) as exc:
+        _config_error(config_file, f"cannot read it: {exc}")
+        return None
+    value = data.get("path")
+    if isinstance(value, str) and value.strip():
+        return value.strip()
+    _config_error(config_file, "it has no string `path` key")
+    return None
+
+
+def _config_error(config_file: str, why: str) -> None:
+    if config_file in _config_error_logged:
+        return
+    _config_error_logged.add(config_file)
+    logger.error(
+        "hamsci_sink: ignoring sink config %s: %s; "
+        "falling back to the legacy path and the state dir",
+        config_file, why,
+    )
+
+
+def sink_path(
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    config_file: str = SINK_CONFIG,
+    legacy_path: str = LEGACY_SINK_PATH,
+    state_dir: Optional[str] = None,
+) -> Optional[str]:
+    """The one rule that finds the sink; first match wins.
+
+    1. env `HAMSCI_SINK_PATH`, then `SIGMOND_SQLITE_PATH`.
+    2. `path` in `config_file` (TOML).
+    3. `legacy_path`, if that file exists.
+    4. `<state_dir>/sink.db`, if its directory is usable.  `state_dir`
+       defaults to env `HS_UPLOADER_STATE_DIR`, else /var/lib/hs-uploader.
+    5. None.
+    """
+    e = env if env is not None else os.environ
+    for key in ("HAMSCI_SINK_PATH", "SIGMOND_SQLITE_PATH"):
+        value = (e.get(key) or "").strip()
+        if value:
+            return value
+    configured = _config_path(config_file)
+    if configured:
+        return configured
+    if os.path.exists(legacy_path):
+        return legacy_path
+    base = state_dir or (e.get("HS_UPLOADER_STATE_DIR") or "").strip() or _DEFAULT_STATE_DIR
+    candidate = os.path.join(base, "sink.db")
+    if _default_sqlite_writable(candidate):
+        return candidate
+    return None
 
 
 # Bound on the producers a writer counts and remembers for its log lines.
@@ -184,8 +268,7 @@ class SqliteConfig:
 
     @classmethod
     def from_env(cls, env: Optional[dict] = None) -> Optional["SqliteConfig"]:
-        e = env if env is not None else os.environ
-        path = (e.get("SIGMOND_SQLITE_PATH") or "").strip()
+        path = sink_path(env)
         if not path:
             return None
         return cls(path=path)
@@ -404,11 +487,10 @@ class Writer:
     ) -> "Writer":
         """Build a Writer from coordination.env.
 
-        `SIGMOND_SQLITE_PATH` selects the sink path.  When unset, the
-        sigmond default `/var/lib/sigmond/sink.db` is used if its
-        directory is writable; otherwise the writer is a silent no-op
-        (preserves standalone-safety for clients running outside a
-        sigmond install).
+        `sink_path(env)` selects the sink path (env override,
+        `/etc/hs-uploader/sink.toml`, the legacy sigmond sink, then the
+        state dir).  When it finds none the writer is a no-op, and one
+        ERROR per process says where to set a path.
 
         `mode` is the per-mode key (`wspr`, `psk`, `hfdl`, `codar`,
         `timestd`).  `database` defaults to the mode name — operators
@@ -416,17 +498,14 @@ class Writer:
         `database=` to bypass the alias.  `producer` names the client;
         leave it out and the writer infers it per row (`infer_producer`).
         """
-        e = env if env is not None else os.environ
-        sqlite_path = (e.get("SIGMOND_SQLITE_PATH") or "").strip()
-        # Fall back to the sigmond state path when no path is configured,
-        # but only when its directory is writable — a true standalone
-        # client should not silently start writing to /var/lib/sigmond.
-        if not sqlite_path and _default_sqlite_writable(_DEFAULT_SQLITE_PATH):
-            sqlite_path = _DEFAULT_SQLITE_PATH
-        effective_env = dict(e)
-        if sqlite_path:
-            effective_env["SIGMOND_SQLITE_PATH"] = sqlite_path
-        cfg = SqliteConfig.from_env(effective_env)
+        global _no_sink_logged
+        cfg = SqliteConfig.from_env(env)
+        if cfg is None and not _no_sink_logged:
+            _no_sink_logged = True
+            logger.error(
+                "hamsci_sink: no sink path found, so rows are dropped; "
+                "set `path = \"...\"` in %s", SINK_CONFIG,
+            )
         actual_db = database or _resolve_db_alias(mode, env)
         return cls(
             database=actual_db,

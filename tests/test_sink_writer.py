@@ -298,19 +298,14 @@ class TestWriterFromEnvDispatch(unittest.TestCase):
             writer_mod._default_sqlite_writable = original
 
     def test_neither_set_with_writable_default_yields_enabled(self):
-        # The default: SQLite at /var/lib/sigmond/sink.db when the
-        # parent dir is writable.  Inject a temp dir so the test doesn't
-        # need /var/lib/sigmond on the host.
+        # The default: SQLite at <state dir>/sink.db when that directory
+        # is writable.  Inject a temp state dir so the test doesn't need
+        # /var/lib/hs-uploader on the host.
         tmpdir = tempfile.mkdtemp()
         try:
-            from hs_uploader.sink import writer as writer_mod
-            original_path = writer_mod._DEFAULT_SQLITE_PATH
-            writer_mod._DEFAULT_SQLITE_PATH = str(Path(tmpdir) / "sink.db")
-            try:
-                w = Writer.from_env(table="spots", mode="psk", env={})
-                self.assertFalse(w.is_noop)
-            finally:
-                writer_mod._DEFAULT_SQLITE_PATH = original_path
+            w = Writer.from_env(table="spots", mode="psk",
+                                env={"HS_UPLOADER_STATE_DIR": tmpdir})
+            self.assertFalse(w.is_noop)
         finally:
             import shutil
             shutil.rmtree(tmpdir, ignore_errors=True)
@@ -620,6 +615,7 @@ def test_package_exports_the_writer_surface():
     assert set(sink.__all__) == {
         "Writer", "BufferFull", "SqliteConfig",
         "PENDING_UPLOADS_DDL", "ensure_columns", "infer_producer",
+        "sink_path",
     }
 
 
