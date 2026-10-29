@@ -69,12 +69,14 @@ ProtectHome=read-only
 # ssh-keygen fails "Read-only file system" every cycle and SFTP never comes up.
 # Only the keys subdirectory is writable — pipelines.toml and uploader.env stay
 # read-only.  (Greenfield-only: hosts restored from a backup already have keys.)
-# The "-" prefix tolerates a path that does not exist yet.  Without it the
+# The "-" prefix tolerates a path that does not exist yet.  It covers
+# /var/lib/sigmond too: a station without sigmond has no such directory, and
+# the unit must still start.  Without it the
 # unit fails at namespace setup (status=226/NAMESPACE) whenever it is started
 # before the client that owns a directory has created it — bring-up on AI6VN
 # 2026-09-05 started hs-uploader 13 s before mag-recorder's installer made
 # /var/lib/mag-recorder/upload, and the uploader stayed dead until a restart.
-ReadWritePaths=/var/lib/sigmond /var/lib/hs-uploader -/etc/hs-uploader/keys -/var/lib/mag-recorder/upload
+ReadWritePaths=-/var/lib/sigmond /var/lib/hs-uploader -/etc/hs-uploader/keys -/var/lib/mag-recorder/upload
 ReadOnlyPaths=/etc/sigmond /etc/hs-uploader
 # No privileged ports / raw sockets: pskreporter 4739, wsprnet 443, SFTP 22 are
 # all outbound client connections.

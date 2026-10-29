@@ -125,3 +125,80 @@ def test_writer_from_env_noop_logs_once(monkeypatch, caplog):
     errors = [r for r in caplog.records if r.levelno == logging.ERROR]
     assert len(errors) == 1
     assert "/etc/hs-uploader/sink.toml" in errors[0].getMessage()
+
+
+def _readonly(path):
+    path.chmod(0o500)
+    if os.access(path, os.W_OK):
+        path.chmod(0o700)
+        pytest.skip("running as a user who ignores directory modes")
+
+
+def _noop_with_paths(monkeypatch, **kw):
+    """Point both resolution entry points at `kw`, then build a writer."""
+    for name in ("sink_path", "_sink_choice"):
+        orig = getattr(writer_mod, name)
+        monkeypatch.setattr(
+            writer_mod, name,
+            lambda env=None, _o=orig, **k: _o(env, **{**kw, **k}))
+    return Writer.from_env(table="spots", mode="wspr", env={})
+
+
+def test_unwritable_legacy_dir_gives_a_noop_writer(tmp_path, monkeypatch, caplog):
+    legacy = _legacy(tmp_path)
+    ro = Path(legacy).parent
+    _readonly(ro)
+    try:
+        with caplog.at_level(logging.ERROR, logger="sigmond.hamsci_sink"):
+            for _ in range(2):
+                w = _noop_with_paths(monkeypatch, config_file=_missing(tmp_path),
+                                     legacy_path=legacy, state_dir=str(tmp_path))
+                assert w.is_noop
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "not writable" in errors[0].getMessage()
+        assert legacy in errors[0].getMessage()
+    finally:
+        ro.chmod(0o700)
+
+
+def test_unwritable_state_dir_gives_a_noop_writer(tmp_path, monkeypatch, caplog):
+    # The state dir's parent exists but the dir itself is read-only.
+    state = tmp_path / "state"
+    state.mkdir()
+    _readonly(state)
+    # Let the two resolutions inside from_env (sink_path, then the step
+    # lookup) accept the state dir, as a writable parent would; the third
+    # call, the writability check itself, tells the truth.
+    real, calls = writer_mod._default_sqlite_writable, []
+
+    def writable(path):
+        calls.append(path)
+        return True if len(calls) <= 2 else real(path)
+
+    monkeypatch.setattr(writer_mod, "_default_sqlite_writable", writable)
+    try:
+        with caplog.at_level(logging.ERROR, logger="sigmond.hamsci_sink"):
+            w = _noop_with_paths(monkeypatch, config_file=_missing(tmp_path),
+                                 legacy_path=str(tmp_path / "nolegacy.db"),
+                                 state_dir=str(state))
+        assert w.is_noop
+        errors = [r for r in caplog.records if r.levelno == logging.ERROR]
+        assert len(errors) == 1
+        assert "not writable" in errors[0].getMessage()
+    finally:
+        state.chmod(0o700)
+
+
+def test_unwritable_configured_path_stays_a_real_writer(tmp_path, monkeypatch):
+    ro = tmp_path / "ro"
+    ro.mkdir()
+    _readonly(ro)
+    try:
+        cfg = _config(tmp_path, f'path = "{ro}/sink.db"\n')
+        w = _noop_with_paths(monkeypatch, config_file=cfg,
+                             legacy_path=str(tmp_path / "nolegacy.db"),
+                             state_dir=str(tmp_path))
+        assert not w.is_noop
+    finally:
+        ro.chmod(0o700)

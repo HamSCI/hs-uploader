@@ -10,8 +10,10 @@ sigmond clients (the recorders) in a local SQLite sink
 (`/var/lib/sigmond/sink.db`).  Its sources and transports then forward
 those records to HamSCI and community destinations: wsprdaemon.org,
 wsprnet.org, PSKReporter, PSWS.  The writer moved here from sigmond in
-v3.70; clients still import it as `sigmond.hamsci_sink`, which sigmond
-keeps as a compatibility import.
+v3.70.  Clients import `hs_uploader.sink` first and fall back to
+`sigmond.hamsci_sink` for one release; all six that write a sink declare
+hs-uploader.  sigmond keeps a bundled copy of the writer for older client
+checkouts.
 
 Part of the HamSCI sigmond suite — see `/opt/git/sigmond/sigmond/CLAUDE.md`
 (orchestrator) and `/opt/git/sigmond/CLAUDE.md` (umbrella) for

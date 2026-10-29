@@ -139,6 +139,18 @@ def test_from_env_sets_path(monkeypatch: pytest.MonkeyPatch, tmp_path: Path) -> 
     assert src._config.path == str(path)
 
 
+def test_from_env_env_names_the_sink_though_the_file_is_absent(tmp_path: Path) -> None:
+    path = tmp_path / "absent.db"
+    assert not path.exists()
+    src = SqliteSource.from_env(
+        database="psk", table="spots",
+        accepted_schema_versions=[2],
+        env={"SIGMOND_SQLITE_PATH": str(path)},
+    )
+    assert src._config is not None  # noqa: SLF001
+    assert src._config.path == str(path)
+
+
 # ---- happy path -----------------------------------------------------------
 
 

@@ -186,15 +186,19 @@ def _isolate_from_the_hosts_sink(tmp_path, monkeypatch):
     """
     from hs_uploader.sink import writer as writer_mod
 
-    real = writer_mod.sink_path
     nowhere = tmp_path / "no-such-host-sink"
 
-    def isolated(env=None, **kw):
-        e = env if env is not None else os.environ
-        kw.setdefault("config_file", str(nowhere / "sink.toml"))
-        kw.setdefault("legacy_path", str(nowhere / "legacy" / "sink.db"))
-        if not (e.get("HS_UPLOADER_STATE_DIR") or "").strip():
-            kw.setdefault("state_dir", str(nowhere / "state"))
-        return real(env, **kw)
+    def isolating(real):
+        def isolated(env=None, **kw):
+            e = env if env is not None else os.environ
+            kw.setdefault("config_file", str(nowhere / "sink.toml"))
+            kw.setdefault("legacy_path", str(nowhere / "legacy" / "sink.db"))
+            if not (e.get("HS_UPLOADER_STATE_DIR") or "").strip():
+                kw.setdefault("state_dir", str(nowhere / "state"))
+            return real(env, **kw)
+        return isolated
 
-    monkeypatch.setattr(writer_mod, "sink_path", isolated)
+    # `sink_path` delegates to `_sink_choice`, and `Writer.from_env` calls
+    # both; isolate both entry points.
+    for name in ("sink_path", "_sink_choice"):
+        monkeypatch.setattr(writer_mod, name, isolating(getattr(writer_mod, name)))

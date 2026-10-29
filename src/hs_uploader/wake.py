@@ -33,8 +33,6 @@ from .sink import writer as _sink_writer
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_STATE_DIR = "/var/lib/hs-uploader"
-
 _DEBUG = os.environ.get("HS_UPLOADER_WAKE_DEBUG", os.environ.get(
     "WSPR_WAKE_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
 
@@ -50,7 +48,7 @@ def wake_path(env: Optional[Mapping[str, str]] = None) -> str:
     sink = _sink_writer.sink_path(e)
     if sink:
         return str(Path(sink).parent / "upload-wake.sock")
-    state = (e.get("HS_UPLOADER_STATE_DIR") or "").strip() or _DEFAULT_STATE_DIR
+    state = (e.get("HS_UPLOADER_STATE_DIR") or "").strip() or _sink_writer._DEFAULT_STATE_DIR
     return str(Path(state) / "upload-wake.sock")
 
 

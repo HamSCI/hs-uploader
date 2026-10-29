@@ -9,10 +9,11 @@ Why this exists:
 
 Where it lives:
     This module moved here from sigmond (`sigmond/lib/sigmond/
-    hamsci_sink/writer.py`) in v3.70.  Clients still import it as
-    `sigmond.hamsci_sink`, which prefers this module.  sigmond also
-    carries a copy for venvs that hold no hs-uploader (D14), and a drift
-    test holds the two together.  Keep this file stdlib-only and free of
+    hamsci_sink/writer.py`) in v3.70.  Clients import
+    `hs_uploader.sink` first and fall back to `sigmond.hamsci_sink`
+    for one release.  sigmond also carries a copy for checkouts that
+    hold no hs-uploader (D14), and a drift test holds the two together.
+    Keep this file stdlib-only and free of
     imports from the rest of `hs_uploader`, so that copy can stay a
     plain file copy.  One exception: the switch check imports
     `hs_uploader.sinkswitch` by its absolute name at each `insert()`,
@@ -45,6 +46,11 @@ Selection (`sink_path`, used by `Writer.from_env`; first match wins):
     5. Otherwise no-op, with one ERROR per process naming the config
         file.  A client that finds no sink stays safe instead of
         erroring on every flush.
+    `Writer.from_env` adds one rule: a path that came from step 3 or 4
+    and that this process cannot write (a unit under ProtectSystem=strict
+    sees /var/lib/sigmond read-only) also gives a no-op writer and one
+    ERROR.  A path named in step 1 or 2 stays a real writer and fails
+    loudly on flush.  Readers and the wake socket use `sink_path` as is.
 
 Storage shape:
     One queue table `pending_uploads` shared across modes:
@@ -181,6 +187,32 @@ def _config_error(config_file: str, why: str) -> None:
     )
 
 
+def _sink_choice(
+    env: Optional[Mapping[str, str]] = None,
+    *,
+    config_file: str = SINK_CONFIG,
+    legacy_path: str = LEGACY_SINK_PATH,
+    state_dir: Optional[str] = None,
+) -> tuple[Optional[str], str]:
+    """`(path, step)` for `sink_path`; step is `env`, `config`, `legacy`,
+    `state` or `none`.  `Writer.from_env` reads the step."""
+    e = env if env is not None else os.environ
+    for key in ("HAMSCI_SINK_PATH", "SIGMOND_SQLITE_PATH"):
+        value = (e.get(key) or "").strip()
+        if value:
+            return value, "env"
+    configured = _config_path(config_file)
+    if configured:
+        return configured, "config"
+    if os.path.exists(legacy_path):
+        return legacy_path, "legacy"
+    base = state_dir or (e.get("HS_UPLOADER_STATE_DIR") or "").strip() or _DEFAULT_STATE_DIR
+    candidate = os.path.join(base, "sink.db")
+    if _default_sqlite_writable(candidate):
+        return candidate, "state"
+    return None, "none"
+
+
 def sink_path(
     env: Optional[Mapping[str, str]] = None,
     *,
@@ -196,22 +228,13 @@ def sink_path(
     4. `<state_dir>/sink.db`, if its directory is usable.  `state_dir`
        defaults to env `HS_UPLOADER_STATE_DIR`, else /var/lib/hs-uploader.
     5. None.
+
+    This answers readers and the wake socket as well, so it never tests
+    writability of steps 3 and 4.  `Writer.from_env` does: it gives a
+    no-op writer when the step 3 or 4 path is not writable by the process.
     """
-    e = env if env is not None else os.environ
-    for key in ("HAMSCI_SINK_PATH", "SIGMOND_SQLITE_PATH"):
-        value = (e.get(key) or "").strip()
-        if value:
-            return value
-    configured = _config_path(config_file)
-    if configured:
-        return configured
-    if os.path.exists(legacy_path):
-        return legacy_path
-    base = state_dir or (e.get("HS_UPLOADER_STATE_DIR") or "").strip() or _DEFAULT_STATE_DIR
-    candidate = os.path.join(base, "sink.db")
-    if _default_sqlite_writable(candidate):
-        return candidate
-    return None
+    return _sink_choice(env, config_file=config_file,
+                        legacy_path=legacy_path, state_dir=state_dir)[0]
 
 
 # Bound on the producers a writer counts and remembers for its log lines.
@@ -500,7 +523,21 @@ class Writer:
         """
         global _no_sink_logged
         cfg = SqliteConfig.from_env(env)
-        if cfg is None and not _no_sink_logged:
+        if cfg is not None:
+            # An implicit path (legacy file or state dir) this process cannot
+            # write counts as no sink; an explicit one fails loudly on flush.
+            chosen, step = _sink_choice(env)
+            if (chosen == cfg.path and step in ("legacy", "state")
+                    and not _default_sqlite_writable(cfg.path)):
+                if not _no_sink_logged:
+                    _no_sink_logged = True
+                    logger.error(
+                        "hamsci_sink: sink path %s is not writable by this "
+                        "process, so rows are dropped; set `path = \"...\"` "
+                        "in %s to a writable location", cfg.path, SINK_CONFIG,
+                    )
+                cfg = None
+        elif not _no_sink_logged:
             _no_sink_logged = True
             logger.error(
                 "hamsci_sink: no sink path found, so rows are dropped; "
