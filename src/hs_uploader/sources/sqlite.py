@@ -91,6 +91,7 @@ from pathlib import Path
 from typing import Any, Callable, Iterator, Optional, Sequence, Union
 
 from ..core import Record, RecordBatch
+from ..sink import writer as _sink_writer
 from ._local_rows import LocalRowFilter
 
 logger = logging.getLogger(__name__)
@@ -155,21 +156,21 @@ class _ConnectionConfig:
     def from_env(cls, env: Optional[dict] = None) -> Optional["_ConnectionConfig"]:
         """Resolve from coordination.env.
 
-        Returns ``None`` (→ no-op source) when neither `SIGMOND_SQLITE_PATH`
-        is set nor the default sink db exists — the standalone-safe no-op
+        Returns ``None`` (→ no-op source) when no env names the sink
+        and the path `sink_path()` resolves does not exist — the standalone-safe no-op
         that mirrors `hs_uploader.sink.Writer.from_env()`.
         """
         e = env if env is not None else os.environ
-        path = (e.get("SIGMOND_SQLITE_PATH") or "").strip()
-        if path:
+        path = _sink_writer.sink_path(e)
+        # Adopt a resolved path only if the file is present (the writer
+        # creates it on first flush), except when the env names it
+        # outright.  Without this guard, a standalone client with no
+        # sigmond install would silently become an active source on a
+        # nonexistent file.
+        named = ((e.get("HAMSCI_SINK_PATH") or "").strip()
+                 or (e.get("SIGMOND_SQLITE_PATH") or "").strip())
+        if path and (named or Path(path).exists()):
             return cls(path=path)
-        # Default sink path — only adopt it if the file is actually present
-        # (the writer creates it on first flush).  Without this guard, a
-        # standalone client with no sigmond install would silently become
-        # an active source on a nonexistent file.
-        default = "/var/lib/sigmond/sink.db"
-        if Path(default).exists():
-            return cls(path=default)
         return None
 
 

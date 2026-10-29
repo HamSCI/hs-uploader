@@ -8,13 +8,16 @@ daemon's polling backstop still catches the work, so producers never block.
 
 This is the generic home for what wspr-recorder pioneered in
 ``wspr_recorder.upload_wake``; the daemon and every producer share ONE socket
-(default ``/var/lib/sigmond/upload-wake.sock``, beside the sink), so any
+(beside the sink, wherever ``sink_path()`` puts it), so any
 producer datagram wakes the whole daemon regardless of which pipeline it feeds.
 
 Path resolution (first match wins):
 ``HS_UPLOADER_WAKE_SOCK`` / ``WSPR_UPLOAD_WAKE_SOCK`` env override, else
-``<sink dir>/upload-wake.sock`` from ``HAMSCI_SINK_PATH`` /
-``SIGMOND_SQLITE_PATH``, else ``/var/lib/sigmond/upload-wake.sock``.
+``<sink dir>/upload-wake.sock`` where ``sink_path()`` finds the sink
+(env, ``/etc/hs-uploader/sink.toml``, the legacy ``/var/lib/sigmond``
+sink, else the state dir), else ``<state dir>/upload-wake.sock`` when it
+finds none.  The state dir is ``HS_UPLOADER_STATE_DIR`` or
+``/var/lib/hs-uploader``.
 """
 
 from __future__ import annotations
@@ -24,27 +27,31 @@ import os
 import socket
 import threading
 from pathlib import Path
-from typing import Callable, Optional
+from typing import Callable, Mapping, Optional
+
+from .sink import writer as _sink_writer
 
 logger = logging.getLogger(__name__)
 
-_DEFAULT_SOCK = "/var/lib/sigmond/upload-wake.sock"
+_DEFAULT_STATE_DIR = "/var/lib/hs-uploader"
 
 _DEBUG = os.environ.get("HS_UPLOADER_WAKE_DEBUG", os.environ.get(
     "WSPR_WAKE_DEBUG", "")).strip().lower() in ("1", "true", "yes", "on")
 
 
-def wake_path() -> str:
+def wake_path(env: Optional[Mapping[str, str]] = None) -> str:
     """Resolve the shared wake-socket path (same dir as the sink)."""
+    e = env if env is not None else os.environ
     for var in ("HS_UPLOADER_WAKE_SOCK", "WSPR_UPLOAD_WAKE_SOCK"):
-        v = os.environ.get(var, "").strip()
+        v = (e.get(var) or "").strip()
         if v:
             return v
-    for var in ("HAMSCI_SINK_PATH", "SIGMOND_SQLITE_PATH"):
-        sink = os.environ.get(var, "").strip()
-        if sink:
-            return str(Path(sink).parent / "upload-wake.sock")
-    return _DEFAULT_SOCK
+    # Looked up at call time through the module, so a test can replace it.
+    sink = _sink_writer.sink_path(e)
+    if sink:
+        return str(Path(sink).parent / "upload-wake.sock")
+    state = (e.get("HS_UPLOADER_STATE_DIR") or "").strip() or _DEFAULT_STATE_DIR
+    return str(Path(state) / "upload-wake.sock")
 
 
 def notify(path: Optional[str] = None) -> None:

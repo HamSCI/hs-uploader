@@ -43,6 +43,7 @@ from typing import Iterator, Optional
 
 from .. import sinkswitch
 from ..core import Record, RecordBatch
+from ..sink import writer as _sink_writer
 from ..sink.writer import infer_producer
 from ._local_rows import LocalRowFilter
 
@@ -86,7 +87,7 @@ class WsprCycleSource:
     def __init__(
         self,
         *,
-        db_path: Path | str = "/var/lib/sigmond/sink.db",
+        db_path: Optional[Path | str] = None,
         ship_buffer_sec: int = 0,
         start_at: str = "now",
         expected_reporters: Optional[set] = None,
@@ -95,7 +96,7 @@ class WsprCycleSource:
         sinks_dir: Optional[Path | str] = None,
         marker: Optional[Path | str] = None,
     ):
-        """``db_path`` is the sink.db path (must be readable by the
+        """``db_path`` is the sink.db path (default: ``sink_path()``; must be readable by the
         uploader's runtime user).  ``ship_buffer_sec`` is a defensive
         subtraction from the cycle floor — for clock skew between
         producer and uploader.  Default 0 because we already rely on
@@ -129,6 +130,9 @@ class WsprCycleSource:
         by default, so wspr-recorder's in-process shim, which passes
         neither, filters too.  The daemon passes the paths it uses.
         """
+        if db_path is None:
+            db_path = (_sink_writer.sink_path()
+                       or _sink_writer.LEGACY_SINK_PATH)
         self.db_path = Path(db_path)
         self.ship_buffer_sec = int(ship_buffer_sec)
         self.start_at = start_at

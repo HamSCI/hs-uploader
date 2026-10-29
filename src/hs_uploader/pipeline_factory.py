@@ -122,7 +122,7 @@ def _build_source(spec: Mapping[str, Any], *, default_start_at: str = "now",
         # event-driven cross-receiver merge gate; absent/empty = single-rx.
         reporters = spec.get("expected_reporters")
         return WsprCycleSource(
-            db_path=str(spec.get("db_path", "/var/lib/sigmond/sink.db")),
+            db_path=spec.get("db_path"),  # None: the source asks sink_path()
             start_at=str(spec.get("start_at", default_start_at)),
             expected_reporters=set(reporters) if reporters else None,
             backstop_sec=float(spec.get("backstop_sec", 90.0)),
