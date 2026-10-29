@@ -192,7 +192,14 @@ explicit even when no third-party deps are required.
 
 ## Production paths
 
-- Sigmond sink: `/var/lib/sigmond/sink.db`.  Clients write it through
+- Sink path: `sink_path()` resolves it, in this order: `HAMSCI_SINK_PATH`,
+  then `SIGMOND_SQLITE_PATH`, then `path` in `/etc/hs-uploader/sink.toml`,
+  then `/var/lib/sigmond/sink.db` if that file exists, then
+  `<HS_UPLOADER_STATE_DIR or /var/lib/hs-uploader>/sink.db` if writable,
+  else no sink.  `install.sh` (`write_sink_config`) writes `sink.toml` when
+  absent: the legacy file on a station that holds one, the state-dir file
+  on a fresh install.  It never rewrites an existing config.
+- Sigmond sink (legacy location): `/var/lib/sigmond/sink.db`.  Clients write it through
   `hs_uploader.sink.Writer` (imported as `sigmond.hamsci_sink`), and the
   sources here read it.  Since v3.70 each row carries `producer` and
   `local`; the writer adds both columns when it opens an older file and

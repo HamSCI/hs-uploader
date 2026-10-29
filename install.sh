@@ -163,6 +163,33 @@ ensure_runtime_state() {
     fi
 }
 
+write_sink_config() {
+    # write_sink_config <config_file> <legacy_path> <state_dir>
+    #
+    # Name the sink in /etc/hs-uploader/sink.toml so every writer and
+    # reader resolves to one file, whatever else appears later.  A station
+    # that holds the legacy sink keeps it (no live station moves its
+    # sink); a fresh install gets <state_dir>/sink.db.  An existing config
+    # is never touched.  Written to a temp file, then renamed.
+    local config_file="$1" legacy_path="$2" state_dir="$3" sink tmp
+    if [[ -e "$config_file" ]]; then
+        info "Sink config $config_file exists -- leaving it alone"
+        return 0
+    fi
+    if [[ -f "$legacy_path" ]]; then
+        sink="$legacy_path"
+    else
+        sink="$state_dir/sink.db"
+    fi
+    install -d -m 0755 "$(dirname "$config_file")"
+    tmp="$(mktemp "${config_file}.XXXXXX")"
+    printf '# Written by hs-uploader install.sh: names the sink once so no writer switches files later.\npath = "%s"\n' \
+        "$sink" > "$tmp"
+    chmod 0644 "$tmp"
+    mv "$tmp" "$config_file"
+    info "Wrote $config_file (path = $sink)"
+}
+
 install_daemon() {
     # The single-host uploader daemon (`hs-uploader serve`): a dedicated
     # `hsupload` system user owns the one host SSH key and runs ALL outbound
@@ -211,6 +238,7 @@ main() {
     fi
     check_dependencies
     ensure_runtime_state
+    write_sink_config /etc/hs-uploader/sink.toml /var/lib/sigmond/sink.db /var/lib/hs-uploader
     install_application
     install_daemon
     info "Install complete."
@@ -218,4 +246,7 @@ main() {
     info "      (reads /var/lib/hs-uploader/watermarks.db; needs sigmond group or root)"
 }
 
-main "$@"
+# Sourcing this file (tests) defines the functions without running the install.
+if [[ "${BASH_SOURCE[0]}" == "$0" ]]; then
+    main "$@"
+fi
