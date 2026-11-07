@@ -165,6 +165,36 @@ def test_v2_fmode_uses_jt9_format():
     )
 
 
+@pytest.mark.parametrize("mode,pkt_mode,wsprnet_code", [
+    ("W2", 2, 2),     # WSPR-2
+    ("F2", 3, 3),     # FST4W-120
+    ("F5", 6, 5),     # FST4W-300
+    ("F15", 16, 15),  # FST4W-900
+    ("F30", 31, 30),  # FST4W-1800
+])
+def test_mode_code_is_wsprnets_not_wsprdaemons(mode, pkt_mode, wsprnet_code):
+    """wspr-recorder stores wsprdaemon's pkt_mode (W2 2, F2 3, F5 6, F15 16,
+    F30 31); wsprnet.org's mode column wants 2/3/5/15/30.  Sent raw, the
+    FST4W-300/900/1800 spots showed as mode "unknown" (wspr.live code -1:
+    B1A 25 and ND 12 in 6 h, 2026-11-07).  Same table as wspr-recorder's
+    decode_mode.WSPRNET_MODE_MAP, which only its legacy upload path used."""
+    line = _record_to_mept(_v2_spot(mode=mode, pkt_mode=pkt_mode))
+    assert line.split()[-1] == str(wsprnet_code)
+
+
+def test_legacy_code_column_is_translated_too():
+    """A file-source row carries the same wsprdaemon codes under ``code``."""
+    line = _record_to_mept(_spot(code=6))
+    assert line.split()[-1] == "5"
+
+
+def test_unknown_codes_pass_through_unchanged():
+    """A code outside the table (already a wsprnet code, or something new)
+    is sent as it is, never guessed."""
+    line = _record_to_mept(_v2_spot(mode="F5", pkt_mode=5))
+    assert line.split()[-1] == "5"
+
+
 def test_v2_bracketed_resolved_callsign_passes_through():
     """Type-3 hash-resolved calls like ``<AK4MI>`` are valid spots
     (v1 wd-upload-wsprnet._has_hash_callsign drops only ``<...>``).
