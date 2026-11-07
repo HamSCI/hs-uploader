@@ -34,6 +34,7 @@ import urllib.request
 from typing import Any, List, Optional
 
 from ..core import BatchPolicy, Outcome, RecordBatch
+from .. import wspr_modes
 
 logger = logging.getLogger(__name__)
 
@@ -521,17 +522,6 @@ def dedup_records_for_wsprnet(records):
     return [t[1] for t in ordered]
 
 
-#: wsprdaemon pkt_mode -> wsprnet.org mode code.  The same table as
-#: wspr-recorder's decode_mode.WSPRNET_MODE_MAP; a code not listed passes as is.
-WSPRNET_MODE_CODE = {
-    2: 2,     # WSPR-2
-    3: 3,     # FST4W-120
-    6: 5,     # FST4W-300
-    16: 15,   # FST4W-900
-    31: 30,   # FST4W-1800
-}
-
-
 def _record_to_mept(record) -> Optional[str]:
     """Render one ``wspr.spots`` row as a wsprnet.org MEPT line.
 
@@ -600,19 +590,19 @@ def _record_to_mept(record) -> Optional[str]:
         drift = int(round(float(cols.get("drift_hz_per_s") or 0.0) * 60.0))
     else:
         drift = 0
-    # The row holds wsprdaemon's pkt_mode; wsprnet's mode column wants its
-    # own code.  Untranslated, FST4W-300/900/1800 showed as "unknown".
-    ntype = _int_or_zero(cols.get("code") if cols.get("code") is not None
-                         else cols.get("pkt_mode"))
-    ntype = WSPRNET_MODE_CODE.get(ntype, ntype)
+    # wsprnet's mode column takes wsprnet's code, never the stored
+    # wsprdaemon number (FST4W-300/900/1800 showed as "unknown").  A row
+    # naming no known mode passes its stored number through.
+    mode = wspr_modes.resolve(cols)
+    if mode is not None:
+        ntype = mode.wsprnet_code
+        is_w_mode = mode.name.startswith("W")
+    else:
+        ntype = _int_or_zero(cols.get("code") if cols.get("code") is not None
+                             else cols.get("pkt_mode"))
+        is_w_mode = ntype == 2
     grid = (cols.get("tx_loc") or cols.get("grid") or "").strip()
 
-    # Mode-aware format — W2 (pkt_mode=2) vs F-modes (pkt_mode>=3).
-    # `mode` column ("W2", "F2", "F5", ...) takes precedence; fall
-    # back to ntype/pkt_mode (2 is W2, anything else F-family).
-    mode_token = (cols.get("mode") or "").strip().upper()
-    is_w_mode = (mode_token.startswith("W") if mode_token
-                 else (ntype == 2))
     if is_w_mode:
         # v1 wd-decode line 345 (W-mode short format):
         return ("%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d"

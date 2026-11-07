@@ -427,6 +427,21 @@ def test_short_line_f2_has_11_whitespace_fields():
     assert parts[9] == "0"
 
 
+@pytest.mark.parametrize("mode,pkt_mode", [("F15", 16), ("PKT16", 16)])
+def test_tar_carries_wsprdaemon_code_and_the_real_name(mode, pkt_mode):
+    """Field 17 keeps wsprdaemon's number; the file name says F15 even for
+    a row wspr-recorder once named PKT16."""
+    rec = _record_from_row(_row_v2(band="30", mode=mode, pkt_mode=pkt_mode))
+    blob = build_wsprdaemon_tar_from_records(
+        [rec], rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_T3FD", rx_site="AC0G=B1_EM38ww")
+    with _open_tar_blob(blob) as tf:
+        name = next(n for n in tf.getnames() if n.endswith("_spots.txt"))
+        body = tf.extractfile(name).read().decode()
+    assert "_F15_20260514_115800_spots.txt" in name
+    assert body.split()[-1] == "16"
+
+
 def test_tar_from_records_layout(tmp_path):
     rows = [
         _row_v2(band="30", mode="W2", callsign="VE7SAR"),

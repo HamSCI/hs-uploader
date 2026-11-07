@@ -44,6 +44,7 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Sequence
 
 from ..core import BatchPolicy, Outcome, RecordBatch
+from .. import wspr_modes
 
 logger = logging.getLogger(__name__)
 
@@ -531,7 +532,7 @@ def _format_extended_line(cols: dict, rx_call: str, rx_grid: str,
         int(cols.get("decodetype") or 0),
         int(cols.get("ipass") or 0),
         int(cols.get("nhardmin") or 0),
-        int(cols.get("pkt_mode") or 2),
+        _wd_code(cols, 2),
         0.0,                                   # rms_noise (Phase 2)
         0.0,                                   # fft_noise (Phase 2)
         band,
@@ -549,6 +550,14 @@ def _format_extended_line(cols: dict, rx_call: str, rx_grid: str,
         0,                                     # overloads_count (Phase 2)
         int(bool(proxy_upload)),               # proxy_upload_flag (field 33)
     )
+
+
+def _wd_code(cols: dict, default: int) -> int:
+    """wsprdaemon's pkt_mode for one spot row (tar field 17)."""
+    mode = wspr_modes.resolve(cols)
+    if mode is not None:
+        return mode.wsprdaemon_code
+    return int(cols.get("pkt_mode") or default)
 
 
 def _format_noise_line(cols: dict) -> str:
@@ -592,12 +601,12 @@ def _format_short_line(cols: dict, *, w_mode: bool) -> str:
     if w_mode:
         args += (
             int(round((cols.get("drift_hz_per_s") or 0.0) * 60.0)),
-            int(cols.get("pkt_mode") or 2),
+            _wd_code(cols, 2),
         )
     else:
         # F-mode format has drift hardcoded "0" in fmt; only one arg
         # follows: ntype (pkt_mode).
-        args += (int(cols.get("pkt_mode") or 3),)
+        args += (_wd_code(cols, 3),)
     return fmt % args
 
 
@@ -847,8 +856,11 @@ def build_wsprdaemon_tar_from_records(
             # defensive).
             noise_groups[(rx_id, band, ts_filename)] = cols
         else:
+            # The resolved name, so an older row named PKT16/PKT31 files
+            # under F15/F30 like any other.
+            known = wspr_modes.resolve(cols)
             try:
-                mode = cols["mode"]
+                mode = known.name if known is not None else cols["mode"]
             except KeyError:
                 logger.warning("wsprdaemon-tar: spot row missing `mode`: %r",
                                list(cols.keys()))

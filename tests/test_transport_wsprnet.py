@@ -188,6 +188,11 @@ def test_legacy_code_column_is_translated_too():
     assert line.split()[-1] == "5"
 
 
+def test_old_pkt_name_still_posts_wsprnets_code():
+    line = _record_to_mept(_v2_spot(mode="PKT16", pkt_mode=16))
+    assert line.split()[-1] == "15"
+
+
 def test_unknown_codes_pass_through_unchanged():
     """A code outside the table (already a wsprnet code, or something new)
     is sent as it is, never guessed."""

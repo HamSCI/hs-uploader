@@ -133,6 +133,8 @@ src/hs_uploader/
   daemon.py               # host daemon (`hs-uploader serve`); Rebuilder rebuilds between pumps
   pipelines_d.py          # loads pipelines.d/<client>.toml; precedence and refusal rules
   sinkswitch.py           # reads and writes sinks/<client>.toml and site.toml (stdlib only)
+  wspr_modes.py           # WSPR/FST4W modes defined once: name, period, wsprnet and
+                          # wsprdaemon codes; wspr-recorder and both WSPR transports use it
   sink/
     writer.py             # sink Writer: stores client rows in sink.db
                           # (moved from sigmond in v3.70)
