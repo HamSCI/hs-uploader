@@ -31,6 +31,7 @@ the actual cleanup).
 from __future__ import annotations
 
 import datetime as _dt
+import hashlib
 import io
 import json
 import logging
@@ -177,6 +178,12 @@ def _ssh_control_path(base: Optional[Path],
 TAR_ROOT_NEW    = "wspr"
 TAR_ROOT_LEGACY = "wsprdaemon"
 
+# Peer directory for sigmondb rows (HFDL arrivals/captures today, CODAR
+# later): chirp/<rx_site>/<receiver>/<table>.jsonl.  A chirp tar NEVER
+# carries spots; see WsprdaemonTarSftp._tar_name for why.
+CHIRP_SUBDIR = "chirp"
+CHIRP_TABLES = {"sigmondb.arrival": "arrival", "sigmondb.capture": "capture"}
+
 # wsprdaemon.org's shared FTP-fallback bootstrap credential — the same
 # `noisegraphs` account every wsprdaemon client uses to ship its first tar
 # (carrying client_upload_info.txt) so the gateway can auto-provision SFTP.
@@ -274,10 +281,11 @@ def _client_info_bytes(reporter_id: str, ssh_pubkey: str) -> bytes:
     return "\n".join(lines).encode() + b"\n"
 
 
-def _tar_add_bytes(tf: tarfile.TarFile, arcname: str, data: bytes) -> None:
+def _tar_add_bytes(tf: tarfile.TarFile, arcname: str, data: bytes,
+                   mtime: Optional[int] = None) -> None:
     ti = tarfile.TarInfo(name=arcname)
     ti.size = len(data)
-    ti.mtime = int(time.time())
+    ti.mtime = int(time.time()) if mtime is None else mtime
     tf.addfile(ti, io.BytesIO(data))
 
 
@@ -746,6 +754,10 @@ def build_wsprdaemon_tar_from_records(
     psk_groups: dict = {}
     # Per-receiver forwarding intent collected from psk rows.
     receivers_forward: dict = {}
+    # sigmondb rows → {(rx_site, receiver, table): [cols, ...]}
+    chirp_groups: dict = {}
+    chirp_skipped: set = set()
+    chirp_newest = 0
 
     def _row_rx_identity(cols: dict) -> tuple:
         """Per-row receiver identity for diversity attribution.
@@ -786,6 +798,22 @@ def build_wsprdaemon_tar_from_records(
         if not cols:
             continue
         table = getattr(r, "table", "wspr.spots") or "wspr.spots"
+        if table.startswith("sigmondb."):
+            leaf = CHIRP_TABLES.get(table)
+            if leaf is None:
+                if table not in chirp_skipped:
+                    chirp_skipped.add(table)
+                    logger.warning(
+                        "wsprdaemon-tar: no chirp/ mapping for %s; "
+                        "skipping its rows", table)
+                continue
+            _, _, c_recv, c_site = _row_rx_identity(cols)
+            chirp_groups.setdefault((c_site, c_recv, leaf), []).append(cols)
+            try:
+                chirp_newest = max(chirp_newest, int(r.time.timestamp()))
+            except Exception:
+                pass
+            continue
         if table == "psk.spots":
             mode = (cols.get("mode") or "").lower()
             if mode not in ("ft8", "ft4", "msk144"):
@@ -869,14 +897,24 @@ def build_wsprdaemon_tar_from_records(
                 (rx_id, band, mode, ts_filename), []
             ).append(cols)
 
+    # A tar of chirp rows alone takes its member mtime from the rows, not
+    # the clock, so the same rows always make the same bytes — and so the
+    # same content-hashed name, which the server skips as already done.
+    fixed_mtime = (
+        chirp_newest
+        if chirp_groups and not (spot_groups or noise_groups or psk_groups)
+        else None
+    )
     raw_buf = io.BytesIO()
     with tarfile.open(fileobj=raw_buf, mode="w:") as tf:
-        _tar_add_bytes(tf, "uploads_config.txt", _config_bytes(version))
+        _tar_add_bytes(tf, "uploads_config.txt", _config_bytes(version),
+                       mtime=fixed_mtime)
         if client_info is not None:
             reporter_id, pubkey = client_info
             _tar_add_bytes(
                 tf, "client_upload_info.txt",
                 _client_info_bytes(reporter_id, pubkey),
+                mtime=fixed_mtime,
             )
         # ⚠ Also emitted for a WSPR-ONLY tar when the station declared a
         # wsprnet setting.  Gating routing.json on psk rows alone would mean
@@ -929,6 +967,14 @@ def build_wsprdaemon_tar_from_records(
             filename = f"{cycle}_{mode}.jsonl"
             arcname = f"{mode}/{psk_site}/{psk_recv}/{band}/{filename}"
             _tar_add_bytes(tf, arcname, content)
+        for (c_site, c_recv, leaf), rows in sorted(chirp_groups.items()):
+            # Lines sort by their own text, so the bytes do not depend on
+            # the order the source handed the rows over.
+            lines = sorted(json.dumps(c, sort_keys=True, default=str)
+                           for c in rows)
+            content = ("\n".join(lines) + "\n").encode()
+            arcname = f"{CHIRP_SUBDIR}/{c_site}/{c_recv}/{leaf}.jsonl"
+            _tar_add_bytes(tf, arcname, content, mtime=fixed_mtime)
     return _compress_tar_bytes(
         raw_buf.getvalue(),
         compression=compression, level=compression_level,
@@ -962,6 +1008,8 @@ class WsprdaemonTarSftp:
         "wspr.spots": [1, 2, 3],
         "wspr.noise": [1, 2, 3],
         "psk.spots": [2],
+        "sigmondb.arrival": [1],
+        "sigmondb.capture": [1],
     }
 
     def __init__(
@@ -987,7 +1035,9 @@ class WsprdaemonTarSftp:
         forward_to_wsprnet: Optional[bool] = None,
         wsprnet_reporter: Optional[tuple[str, str]] = None,
         psk_reporter: Optional[tuple[str, str]] = None,
+        tar_tag: Optional[str] = None,
     ):
+        self.tar_tag = tar_tag or None
         self.servers = list(servers)
         # Station-level: ask the WD servers to post our WSPR spots to
         # wsprnet.org.  None = say nothing, which leaves whatever the
@@ -1055,7 +1105,7 @@ class WsprdaemonTarSftp:
             return Outcome.permanent_failure(f"tar build failed: {exc}")
         if tar_bytes is None:
             return Outcome.acked()       # nothing to ship in this batch
-        tar_name = self._tar_name(identity, batch=batch)
+        tar_name = self._tar_name(identity, batch=batch, tar_bytes=tar_bytes)
         outcome = self._upload_tar(tar_bytes, tar_name, identity)
         if outcome.kind == "retry_later" and self.fallback_ftp is not None:
             logger.warning(
@@ -1131,7 +1181,7 @@ class WsprdaemonTarSftp:
         # ``client_upload_info.txt``).  The FTP fallback only fires from
         # ``ship()``, where the batch is still available to rebuild a
         # proper FTP-shaped tar.
-        tar_name = self._tar_name(identity)
+        tar_name = self._tar_name(identity, tar_bytes=payload_blob)
         return self._upload_tar(payload_blob, tar_name, identity)
 
     # -- internals --
@@ -1141,7 +1191,8 @@ class WsprdaemonTarSftp:
             return self.sftp_user_override
         return identity.call.replace("/", "_") if identity.call else "wsprdaemon"
 
-    def _tar_name(self, identity, batch: Optional[RecordBatch] = None) -> str:
+    def _tar_name(self, identity, batch: Optional[RecordBatch] = None,
+                  tar_bytes: Optional[bytes] = None) -> str:
         # Cycle-aligned tar name when batch.records are available:
         # ``<upload_id>_YYMMDD_HHMM.tbz`` derived from the records'
         # WSPR cycle time.  This gives one stable name per cycle so
@@ -1156,6 +1207,14 @@ class WsprdaemonTarSftp:
             ts = batch.records[0].time.strftime("%y%m%d_%H%M")
         else:
             ts = time.strftime("%y%m%d_%H%M_%S", time.gmtime())
+        if self.tar_tag:
+            # ⚠ The gateway skips any path it has already processed, and a
+            # same-named tar overwrites.  A chirp tar named like a spot tar
+            # (same upload_id, same minute) would erase that minute's spots
+            # or be dropped as done.  The tag plus a hash of the bytes keep
+            # the namespaces apart and make each distinct content distinct.
+            digest = hashlib.sha256(tar_bytes or b"").hexdigest()[:8]
+            return f"{upload_id}_{self.tar_tag}_{ts}_{digest}.tbz"
         return f"{upload_id}_{ts}.tbz"
 
     def _upload_tar(
@@ -1309,6 +1368,8 @@ class WsprdaemonTarFtp:
         "wspr.spots": [1, 2, 3],
         "wspr.noise": [1, 2, 3],
         "psk.spots": [2],
+        "sigmondb.arrival": [1],
+        "sigmondb.capture": [1],
     }
 
     def __init__(
@@ -1331,7 +1392,9 @@ class WsprdaemonTarFtp:
         forward_to_wsprnet: Optional[bool] = None,
         wsprnet_reporter: Optional[tuple[str, str]] = None,
         psk_reporter: Optional[tuple[str, str]] = None,
+        tar_tag: Optional[str] = None,
     ):
+        self.tar_tag = tar_tag or None
         self.servers = list(servers)
         self.forward_to_wsprnet = forward_to_wsprnet
         self.wsprnet_reporter = wsprnet_reporter
@@ -1371,7 +1434,9 @@ class WsprdaemonTarFtp:
             return Outcome.permanent_failure(f"tar build failed: {exc}")
         if tar_bytes is None:
             return Outcome.acked()
-        return self._upload(tar_bytes, self._tar_name(identity, batch=batch))
+        return self._upload(
+            tar_bytes,
+            self._tar_name(identity, batch=batch, tar_bytes=tar_bytes))
 
     def serialize_for_retry(self, batch: RecordBatch, identity) -> bytes:
         tar_bytes = self._build_tar(batch, identity)
@@ -1431,7 +1496,8 @@ class WsprdaemonTarFtp:
         return None
 
     def replay(self, payload_blob: bytes, identity) -> Outcome:
-        return self._upload(payload_blob, self._tar_name(identity))
+        return self._upload(
+            payload_blob, self._tar_name(identity, tar_bytes=payload_blob))
 
     # -- internals --
 
@@ -1442,7 +1508,8 @@ class WsprdaemonTarFtp:
         # that omits ftp_password still authenticates (see FTP_BOOTSTRAP_*).
         return self.ftp_password or FTP_BOOTSTRAP_PASSWORD
 
-    def _tar_name(self, identity, batch: Optional[RecordBatch] = None) -> str:
+    def _tar_name(self, identity, batch: Optional[RecordBatch] = None,
+                  tar_bytes: Optional[bytes] = None) -> str:
         # Same cycle-aligned tar name policy as WsprdaemonTarSftp.
         upload_id = (
             self.upload_id
@@ -1452,6 +1519,14 @@ class WsprdaemonTarFtp:
             ts = batch.records[0].time.strftime("%y%m%d_%H%M")
         else:
             ts = time.strftime("%y%m%d_%H%M_%S", time.gmtime())
+        if self.tar_tag:
+            # ⚠ The gateway skips any path it has already processed, and a
+            # same-named tar overwrites.  A chirp tar named like a spot tar
+            # (same upload_id, same minute) would erase that minute's spots
+            # or be dropped as done.  The tag plus a hash of the bytes keep
+            # the namespaces apart and make each distinct content distinct.
+            digest = hashlib.sha256(tar_bytes or b"").hexdigest()[:8]
+            return f"{upload_id}_{self.tar_tag}_{ts}_{digest}.tbz"
         return f"{upload_id}_{ts}.tbz"
 
     def _upload(self, tar_bytes: bytes, tar_name: str) -> Outcome:

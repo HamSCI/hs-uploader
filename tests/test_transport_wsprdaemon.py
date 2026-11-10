@@ -15,7 +15,7 @@ from unittest.mock import MagicMock, patch
 import pytest
 
 from hs_uploader import StationIdentity
-from hs_uploader.core import Record, RecordBatch
+from hs_uploader.core import Outcome, Record, RecordBatch
 from hs_uploader.transports.wsprdaemon import (
     WsprdaemonTarFtp,
     WsprdaemonTarSftp,
@@ -1302,3 +1302,120 @@ def test_the_SERVER_reads_BACK_the_psk_identity_this_client_wrote():
     # ...and a tar that declared nothing must read as "no opinion", never
     # as a merge.
     assert ws._psk_reporter({}, key) is None
+
+
+# ---- sigmondb -> chirp/ peer dir, tar_tag names (Task 4) -------------------
+
+from datetime import datetime, timezone  # noqa: E402
+from hs_uploader.transports.wsprdaemon import build_wsprdaemon_tar_from_records  # noqa: E402
+
+
+def _chirp_rec(table, **cols):
+    return Record(table=table,
+                  time=datetime(2026, 11, 10, 17, 46, tzinfo=timezone.utc),
+                  columns=cols)
+
+
+_CHIRP_RECS = [
+    _chirp_rec("sigmondb.arrival", time="2026-11-10T17:46:00Z", tx="a", snr=3),
+    _chirp_rec("sigmondb.arrival", time="2026-11-10T17:46:01Z", tx="b", snr=4),
+    _chirp_rec("sigmondb.capture", time="2026-11-10T17:46:00Z", n=1),
+]
+
+
+def _chirp_tar(recs):
+    return build_wsprdaemon_tar_from_records(
+        recs, rx_call="AC0G/B4", rx_grid="EM38ww", receiver="AC0G_B4",
+        rx_site="AC0G=B4_EM38ww", compression="bz2")
+
+
+def _members(blob):
+    with _open_tar_blob(blob) as tf:
+        return set(tf.getnames())
+
+
+def test_sigmondb_records_become_chirp_jsonl():
+    names = _members(_chirp_tar(_CHIRP_RECS))
+    assert {"chirp/AC0G=B4_EM38ww/AC0G_B4/arrival.jsonl",
+            "chirp/AC0G=B4_EM38ww/AC0G_B4/capture.jsonl"} <= names
+    assert not any(n.startswith(("wsprdaemon/", "wspr/")) for n in names)
+
+
+def test_chirp_tar_is_byte_stable_under_record_order():
+    assert _chirp_tar(_CHIRP_RECS) == _chirp_tar(list(reversed(_CHIRP_RECS)))
+
+
+def test_unknown_sigmondb_table_skipped_with_one_warning(caplog):
+    recs = [_chirp_rec("sigmondb.weird", a=1), _chirp_rec("sigmondb.weird", a=2),
+            _CHIRP_RECS[0]]
+    with caplog.at_level("WARNING"):
+        names = _members(_chirp_tar(recs))
+    assert not any("weird" in n for n in names)
+    assert sum("sigmondb.weird" in m for m in caplog.messages) == 1
+
+
+def test_chirp_row_fault_never_costs_a_spot():
+    spot = _record_from_row(_row_v2())
+    bad = _chirp_rec("sigmondb.arrival", x=object())   # default=str copes
+    names = _members(_chirp_tar([spot, bad]))
+    assert any(n.startswith("wsprdaemon/") or n.startswith("wspr/") for n in names)
+
+
+def _batch_at(iso):
+    t = datetime.fromisoformat(iso.replace("Z", "+00:00"))
+    return RecordBatch(records=[Record(table="x", time=t, columns={"a": 1})],
+                       cursor_after=b"")
+
+
+_ID = StationIdentity(call="AC0G/B4", grid="EM38ww", station_id="S1",
+                      ssh_key_file="/nonexistent")
+
+
+@pytest.mark.parametrize("cls", [WsprdaemonTarSftp, WsprdaemonTarFtp])
+def test_same_minute_tars_get_distinct_names(cls):
+    b = _batch_at("2026-11-10T17:46:00Z")
+    wspr = cls(servers=["gw1"], receiver="AC0G_B4")._tar_name(_ID, b)
+    arr = cls(servers=["gw1"], receiver="AC0G_B4", tar_tag="chirp-arrival")
+    n1, n2 = arr._tar_name(_ID, b, tar_bytes=b"a"), arr._tar_name(_ID, b, tar_bytes=b"b")
+    assert len({wspr, n1, n2}) == 3 and n1.startswith("AC0G_B4_chirp-arrival_261110_1746_")
+    assert n1.endswith(".tbz")
+
+
+def test_spot_tar_name_unchanged_without_tar_tag():
+    b = _batch_at("2026-11-10T17:46:00Z")
+    for cls in (WsprdaemonTarSftp, WsprdaemonTarFtp):
+        t = cls(servers=["gw1"], receiver="AC0G_B4")
+        assert t._tar_name(_ID, b) == "AC0G_B4_261110_1746.tbz"
+        # tar_bytes must not alter a spot tar's name
+        assert t._tar_name(_ID, b, tar_bytes=b"zz") == "AC0G_B4_261110_1746.tbz"
+
+
+def test_accepts_lists_sigmondb_tables():
+    for cls in (WsprdaemonTarSftp, WsprdaemonTarFtp):
+        assert cls.ACCEPTS["sigmondb.arrival"] == [1]
+        assert cls.ACCEPTS["sigmondb.capture"] == [1]
+
+
+def test_ship_and_replay_name_by_content_hash():
+    import hashlib
+    t = WsprdaemonTarSftp(servers=["gw1"], receiver="AC0G_B4", tar_tag="chirp-arrival",
+                          compression="bz2")
+    batch = RecordBatch(records=_CHIRP_RECS, cursor_after=b"")
+    seen = []
+    with patch.object(WsprdaemonTarSftp, "_upload_tar",
+                      side_effect=lambda b, n, i: seen.append(n) or Outcome.acked()):
+        t.ship(batch, _ID)
+        blob = t.serialize_for_retry(batch, _ID)
+        t.replay(blob, _ID)
+    h = hashlib.sha256(blob).hexdigest()[:8]
+    assert len(seen) == 2
+    assert seen[0].endswith(f"_{h}.tbz") and seen[1].endswith(f"_{h}.tbz")
+    assert seen[0].startswith("AC0G_B4_chirp-arrival_261110_1746_")
+
+
+def test_chirp_tar_bytes_do_not_depend_on_the_clock():
+    with patch("time.time", return_value=1_000_000_000):
+        a = _chirp_tar(_CHIRP_RECS)
+    with patch("time.time", return_value=1_000_000_999):
+        b = _chirp_tar(_CHIRP_RECS)
+    assert a == b

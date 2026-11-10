@@ -216,10 +216,14 @@ def _build_transport(spec: Mapping[str, Any]):
             # only on the SFTP leg would be missing on exactly the tars
             # nobody is watching yet.
             fb_kw.update(_wsprnet_proxy_kw(spec))
+            if spec.get("tar_tag"):
+                fb_kw["tar_tag"] = str(spec["tar_tag"])
             if spec.get("upload_id"):
                 fb_kw["upload_id"] = str(spec["upload_id"])
             fb = WsprdaemonTarFtp(**fb_kw)
         kw = dict(servers=list(spec.get("servers") or []))
+        if spec.get("tar_tag"):
+            kw["tar_tag"] = str(spec["tar_tag"])
         for k in ("remote_path", "version", "compression", "tar_root", "name"):
             if spec.get(k) is not None:
                 kw[k] = str(spec[k])
@@ -232,6 +236,12 @@ def _build_transport(spec: Mapping[str, Any]):
         # WsprCycleSource parks its watermark on "wspr.cycle" so it doesn't
         # collide with the raw-table (wspr.spots) wsprnet pipeline.
         kw["primary_table_name"] = str(spec.get("primary_table_name", "wspr.cycle"))
+        # A sigmondb pipeline without tar_tag would name its tar like a
+        # spot tar and could overwrite or shadow it at the gateway.
+        if kw["primary_table_name"].startswith("sigmondb.") and not kw.get("tar_tag"):
+            raise ValueError(
+                f"wsprdaemon_tar pipeline for {kw['primary_table_name']} "
+                "needs `tar_tag` (its tar must not share a name with a spot tar)")
         kw.update(_wsprnet_proxy_kw(spec))
         return WsprdaemonTarSftp(fallback_ftp=fb, **kw)
     if ttype == "heartbeat_sftp":

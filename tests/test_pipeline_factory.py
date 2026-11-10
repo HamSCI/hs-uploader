@@ -453,3 +453,36 @@ def test_the_psk_identity_reaches_BOTH_legs_of_the_tar_transport():
         assert routing is not None, f"{cls.__name__} shipped no routing.json"
         assert routing["default"]["psk_reporter"] == {
             "call": "AC0G", "grid": "EM38ww"}, cls.__name__
+
+
+def _sigmondb_manifest(tmp_path, *, tar_tag=None, ftp=True):
+    m = _wspr_manifest(tmp_path)
+    tr = {
+        "type": "wsprdaemon_tar", "servers": ["gw1.wsprdaemon.org"],
+        "receiver": "AC0G_S", "primary_table_name": "sigmondb.capture",
+    }
+    if tar_tag:
+        tr["tar_tag"] = tar_tag
+    if ftp:
+        tr["ftp_fallback"] = {"servers": ["gw2.wsprdaemon.org"]}
+    m["pipeline"] = [{
+        "name": "chirp-capture", "batch_limit": 1000,
+        "source": {"type": "sqlite", "database": "sigmondb", "table": "capture",
+                   "accepted_schema_versions": [1], "start_at": "now"},
+        "transport": tr,
+    }]
+    return m
+
+
+def test_factory_refuses_sigmondb_without_tar_tag(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    with pytest.raises(ValueError, match="tar_tag"):
+        build_pipelines(_sigmondb_manifest(tmp_path), watermark=_wm())
+
+
+def test_factory_puts_tar_tag_on_both_legs(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    p = build_pipelines(_sigmondb_manifest(tmp_path, tar_tag="chirp-capture"),
+                        watermark=_wm())[0]
+    assert p.transport.tar_tag == "chirp-capture"
+    assert p.transport.fallback_ftp.tar_tag == "chirp-capture"

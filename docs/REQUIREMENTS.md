@@ -441,7 +441,12 @@ wsprdaemon gateways, pskreporter, pswsnetwork.
   heartbeat (PSWS-HEARTBEAT-SPEC); not yet built.
 - `HSU-F-093` `[NEW]` ⬜ **No codar transport.** `codar.spots` rows are
   written to the sink (CONTRACT §17) but have no hs-uploader transport;
-  the upload destination is undecided.
+  the upload destination is undecided. CODAR arrives later by the
+  `HSU-F-095` route, through chirp-recorder.
+- `HSU-F-095` `[NEW]` ✅ **sigmondb rows ship as `chirp/` JSONL** in a
+  `wsprdaemon_tar` named with `tar_tag` and a content hash, never in a tar
+  with spots. The factory refuses a `sigmondb.*` pipeline without
+  `tar_tag`; `capabilities --features` offers `sigmondb-tar`.
 - `HSU-F-094` `[NEW]` ⬜ **CLI cannot pump.** Recovery is inspection-only;
   there is no `hs-uploader pump --once` for an operator to drain a queue
   without the consuming client running (by design today; revisit for ops
@@ -463,6 +468,7 @@ wsprdaemon gateways, pskreporter, pswsnetwork.
 | HSU-F-090 (tar noise spots-only) | *(new — file)* | tar noise test | — |
 | HSU-F-091 (ACCEPTS advisory) | *(new — file)* | transport gate test | — |
 | HSU-F-093 (codar transport) | Clients: codar-sounder | *(none yet)* | #6:31 |
+| HSU-F-095 (chirp/ tar, tar_tag) | sigmondb live | test_transport_wsprdaemon, test_pipeline_factory, test_cli | — |
 
 *New rows (HSU-F-090/091/092/093/094, HSU-Q-009) are this review's
 surfaced gaps; promote to #18 Clients / the PSWS heartbeat epic.*
