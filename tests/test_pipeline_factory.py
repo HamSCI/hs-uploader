@@ -486,3 +486,18 @@ def test_factory_puts_tar_tag_on_both_legs(tmp_path, monkeypatch):
                         watermark=_wm())[0]
     assert p.transport.tar_tag == "chirp-capture"
     assert p.transport.fallback_ftp.tar_tag == "chirp-capture"
+
+
+def test_factory_refuses_sigmondb_source_without_tar_tag_or_primary(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    m = _sigmondb_manifest(tmp_path, ftp=False)
+    del m["pipeline"][0]["transport"]["primary_table_name"]
+    with pytest.raises(ValueError, match="tar_tag"):
+        build_pipelines(m, watermark=_wm())
+
+
+@pytest.mark.parametrize("bad", ["a/b", "a b", "a_b", "A"])
+def test_factory_rejects_bad_tar_tag(tmp_path, monkeypatch, bad):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    with pytest.raises(ValueError, match="tar_tag"):
+        build_pipelines(_sigmondb_manifest(tmp_path, tar_tag=bad), watermark=_wm())

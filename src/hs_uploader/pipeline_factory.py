@@ -56,7 +56,8 @@ from .transports.discard import wrap_if_discard
 from .transports.heartbeat_sftp import HeartbeatSftp
 from .transports.pskreporter import PskReporterTcp
 from .transports.psws_magnetometer import PswsDatasetSftp
-from .transports.wsprdaemon import WsprdaemonTarFtp, WsprdaemonTarSftp
+from .transports.wsprdaemon import (
+    WsprdaemonTarFtp, WsprdaemonTarSftp, check_tar_tag)
 from .transports.wsprnet import WsprNet
 from .watermark.sqlite import SqliteWatermarkStore, default_path
 
@@ -217,13 +218,13 @@ def _build_transport(spec: Mapping[str, Any]):
             # nobody is watching yet.
             fb_kw.update(_wsprnet_proxy_kw(spec))
             if spec.get("tar_tag"):
-                fb_kw["tar_tag"] = str(spec["tar_tag"])
+                fb_kw["tar_tag"] = check_tar_tag(str(spec["tar_tag"]))
             if spec.get("upload_id"):
                 fb_kw["upload_id"] = str(spec["upload_id"])
             fb = WsprdaemonTarFtp(**fb_kw)
         kw = dict(servers=list(spec.get("servers") or []))
         if spec.get("tar_tag"):
-            kw["tar_tag"] = str(spec["tar_tag"])
+            kw["tar_tag"] = check_tar_tag(str(spec["tar_tag"]))
         for k in ("remote_path", "version", "compression", "tar_root", "name"):
             if spec.get(k) is not None:
                 kw[k] = str(spec[k])
@@ -260,6 +261,24 @@ def _build_transport(spec: Mapping[str, Any]):
             kw["name"] = str(spec["name"])
         return HeartbeatSftp(**kw)
     raise ValueError(f"unknown transport type: {ttype!r}")
+
+
+def _refuse_untagged_sigmondb(source: Mapping[str, Any],
+                              transport: Mapping[str, Any]) -> None:
+    """A wsprdaemon_tar transport fed by a sigmondb source needs tar_tag.
+
+    Without it the chirp-only tar takes the spot tar's name for the same
+    minute, and the gateway can overwrite or skip one of the two.
+    """
+    if str(transport.get("type", "")).strip().lower() != "wsprdaemon_tar":
+        return
+    db = str(source.get("database", "")).strip().lower()
+    table = str(source.get("table", "")).strip().lower()
+    if (db == "sigmondb" or table.startswith("sigmondb.")) \
+            and not transport.get("tar_tag"):
+        raise ValueError(
+            "wsprdaemon_tar pipeline reading sigmondb needs `tar_tag` "
+            "(its tar must not share a name with a spot tar)")
 
 
 def _wsprnet_proxy_kw(spec: Mapping[str, Any]) -> dict[str, Any]:
@@ -339,6 +358,7 @@ def build_entry(
     source = _build_source(entry["source"],
                            default_start_at=default_start_at(origin),
                            sinks_dir=sinks_dir, marker=marker)
+    _refuse_untagged_sigmondb(entry["source"], entry["transport"])
     transport = wrap_if_discard(entry, _build_transport(entry["transport"]))
     identity = _identity(base_identity, entry.get("identity"))
     mrpp = entry.get("max_records_per_pump")

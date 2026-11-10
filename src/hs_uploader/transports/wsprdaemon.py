@@ -182,6 +182,26 @@ TAR_ROOT_LEGACY = "wsprdaemon"
 # later): chirp/<rx_site>/<receiver>/<table>.jsonl.  A chirp tar NEVER
 # carries spots; see WsprdaemonTarSftp._tar_name for why.
 CHIRP_SUBDIR = "chirp"
+_TAR_TAG_RE = re.compile(r"^[a-z0-9-]+$")
+
+
+def check_tar_tag(tag: Optional[str]) -> Optional[str]:
+    """tar_tag goes into a remote file name: lowercase letters, digits, '-'."""
+    if tag and not _TAR_TAG_RE.match(tag):
+        raise ValueError(
+            f"tar_tag {tag!r} must match [a-z0-9-]+ (it names a remote file)")
+    return tag or None
+
+
+def _has_sigmondb(batch: RecordBatch) -> bool:
+    return any(str(getattr(r, "table", "") or "").startswith("sigmondb.")
+               for r in batch.records)
+
+
+_UNTAGGED_MSG = ("sigmondb rows on a transport without tar_tag: the tar "
+                 "would be named like a spot tar; refusing to build or send")
+
+
 CHIRP_TABLES = {"sigmondb.arrival": "arrival", "sigmondb.capture": "capture"}
 
 # wsprdaemon.org's shared FTP-fallback bootstrap credential — the same
@@ -1037,7 +1057,7 @@ class WsprdaemonTarSftp:
         psk_reporter: Optional[tuple[str, str]] = None,
         tar_tag: Optional[str] = None,
     ):
-        self.tar_tag = tar_tag or None
+        self.tar_tag = check_tar_tag(tar_tag)
         self.servers = list(servers)
         # Station-level: ask the WD servers to post our WSPR spots to
         # wsprnet.org.  None = say nothing, which leaves whatever the
@@ -1099,6 +1119,8 @@ class WsprdaemonTarSftp:
         return BatchPolicy(max_records=10_000)
 
     def ship(self, batch: RecordBatch, identity) -> Outcome:
+        if self.tar_tag is None and _has_sigmondb(batch):
+            return Outcome.permanent_failure(_UNTAGGED_MSG)
         try:
             tar_bytes = self._build_tar(batch, identity)
         except Exception as exc:
@@ -1208,12 +1230,14 @@ class WsprdaemonTarSftp:
         else:
             ts = time.strftime("%y%m%d_%H%M_%S", time.gmtime())
         if self.tar_tag:
+            if tar_bytes is None:
+                raise ValueError("a tar_tag name needs tar_bytes to hash")
             # ⚠ The gateway skips any path it has already processed, and a
             # same-named tar overwrites.  A chirp tar named like a spot tar
             # (same upload_id, same minute) would erase that minute's spots
             # or be dropped as done.  The tag plus a hash of the bytes keep
             # the namespaces apart and make each distinct content distinct.
-            digest = hashlib.sha256(tar_bytes or b"").hexdigest()[:8]
+            digest = hashlib.sha256(tar_bytes).hexdigest()[:8]
             return f"{upload_id}_{self.tar_tag}_{ts}_{digest}.tbz"
         return f"{upload_id}_{ts}.tbz"
 
@@ -1394,7 +1418,7 @@ class WsprdaemonTarFtp:
         psk_reporter: Optional[tuple[str, str]] = None,
         tar_tag: Optional[str] = None,
     ):
-        self.tar_tag = tar_tag or None
+        self.tar_tag = check_tar_tag(tar_tag)
         self.servers = list(servers)
         self.forward_to_wsprnet = forward_to_wsprnet
         self.wsprnet_reporter = wsprnet_reporter
@@ -1428,6 +1452,8 @@ class WsprdaemonTarFtp:
         return BatchPolicy(max_records=10_000)
 
     def ship(self, batch: RecordBatch, identity) -> Outcome:
+        if self.tar_tag is None and _has_sigmondb(batch):
+            return Outcome.permanent_failure(_UNTAGGED_MSG)
         try:
             tar_bytes = self._build_tar(batch, identity)
         except Exception as exc:
@@ -1520,12 +1546,14 @@ class WsprdaemonTarFtp:
         else:
             ts = time.strftime("%y%m%d_%H%M_%S", time.gmtime())
         if self.tar_tag:
+            if tar_bytes is None:
+                raise ValueError("a tar_tag name needs tar_bytes to hash")
             # ⚠ The gateway skips any path it has already processed, and a
             # same-named tar overwrites.  A chirp tar named like a spot tar
             # (same upload_id, same minute) would erase that minute's spots
             # or be dropped as done.  The tag plus a hash of the bytes keep
             # the namespaces apart and make each distinct content distinct.
-            digest = hashlib.sha256(tar_bytes or b"").hexdigest()[:8]
+            digest = hashlib.sha256(tar_bytes).hexdigest()[:8]
             return f"{upload_id}_{self.tar_tag}_{ts}_{digest}.tbz"
         return f"{upload_id}_{ts}.tbz"
 

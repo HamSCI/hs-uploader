@@ -1419,3 +1419,30 @@ def test_chirp_tar_bytes_do_not_depend_on_the_clock():
     with patch("time.time", return_value=1_000_000_999):
         b = _chirp_tar(_CHIRP_RECS)
     assert a == b
+
+
+@pytest.mark.parametrize("cls", [WsprdaemonTarSftp, WsprdaemonTarFtp])
+def test_untagged_ship_of_sigmondb_is_permanent_failure_and_sends_nothing(cls):
+    t = cls(servers=["gw1"], receiver="AC0G_B4", compression="bz2")
+    batch = RecordBatch(records=_CHIRP_RECS, cursor_after=b"")
+    up = "_upload_tar" if cls is WsprdaemonTarSftp else "_upload"
+    with patch.object(cls, up) as u, patch.object(cls, "_build_tar") as bt:
+        out = t.ship(batch, _ID)
+    assert out.kind == "permanent"
+    u.assert_not_called()
+    bt.assert_not_called()
+
+
+@pytest.mark.parametrize("cls", [WsprdaemonTarSftp, WsprdaemonTarFtp])
+def test_tar_tag_validated_in_constructor(cls):
+    assert cls(servers=["g"], tar_tag="chirp").tar_tag == "chirp"
+    for bad in ("a/b", "a b", "a_b"):
+        with pytest.raises(ValueError, match="tar_tag"):
+            cls(servers=["g"], tar_tag=bad)
+
+
+@pytest.mark.parametrize("cls", [WsprdaemonTarSftp, WsprdaemonTarFtp])
+def test_tagged_name_without_bytes_raises(cls):
+    t = cls(servers=["g"], tar_tag="chirp")
+    with pytest.raises(ValueError):
+        t._tar_name(_ID, _batch_at("2026-11-10T17:46:00Z"))
