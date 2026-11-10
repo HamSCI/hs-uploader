@@ -407,14 +407,18 @@ _PRODUCER_BY_DB = {
 }
 _PSK_DB = "psk"
 _METEOR_SCATTER_MODE = "msk144"
+_SIGMONDB_DB = "sigmondb"
+_HFDL_DETECTOR_PREFIX = "hfdl-"
 
 
 def infer_producer(target_db: str, target_table: str, payload: dict) -> str:
     """Name the client that stored a row whose writer named none (D12).
 
     MSK144 rows in `psk` belong to meteor-scatter and every other `psk`
-    row to psk-recorder; each other target_db maps to the one client
-    that writes it.  An unknown target_db, including one renamed by
+    row to psk-recorder; `sigmondb` rows whose `detector_version` starts
+    with `hfdl-` belong to hfdl-recorder and every other `sigmondb` row
+    names none; each other target_db maps to the one client that writes
+    it.  An unknown target_db, including one renamed by
     `SIGMOND_SQLITE_DB_<MODE>`, gives `''`, the column's default.
 
     The writer applies this to each new row whose caller named no
@@ -429,6 +433,11 @@ def infer_producer(target_db: str, target_table: str, payload: dict) -> str:
         if isinstance(mode, str) and mode.strip().lower() == _METEOR_SCATTER_MODE:
             return "meteor-scatter"
         return "psk-recorder"
+    if target_db == _SIGMONDB_DB:
+        version = payload.get("detector_version") if isinstance(payload, dict) else None
+        if isinstance(version, str) and version.startswith(_HFDL_DETECTOR_PREFIX):
+            return "hfdl-recorder"
+        return ""
     return _PRODUCER_BY_DB.get(target_db, "")
 
 

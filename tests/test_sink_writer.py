@@ -1013,3 +1013,12 @@ def test_the_index_build_waits_for_a_connection_holding_the_sink(tmp_path):
     assert [r[1] for r in _stored(db)] == ["ft8"]
     assert "idx_pending_uploads_producer" in _index_names(db)
     w.close()
+
+
+def test_sigmondb_hfdl_rows_infer_hfdl_recorder():
+    assert infer_producer("sigmondb", "arrival", {"detector_version": "hfdl-analyzer-2"}) == "hfdl-recorder"
+
+
+def test_sigmondb_row_of_another_detector_names_no_producer():
+    assert infer_producer("sigmondb", "capture", {"detector_version": "chirp-1"}) == ""
+    assert infer_producer("sigmondb", "capture", "not a dict") == ""
