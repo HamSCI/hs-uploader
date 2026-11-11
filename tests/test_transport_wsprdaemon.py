@@ -337,7 +337,6 @@ def test_ftp_falls_through_servers_on_error(tmp_path):
 from hs_uploader.transports.wsprdaemon import (  # noqa: E402
     build_wsprdaemon_tar_from_records,
     _format_extended_line,
-    _format_short_line,
     _derive_geo,
     _ts_from_iso,
 )
@@ -418,13 +417,23 @@ def test_extended_line_w2_has_34_whitespace_fields():
     assert len(line.split()) == 34
 
 
-def test_short_line_f2_has_11_whitespace_fields():
-    line = _format_short_line(_row_v2(mode="F2", pkt_mode=3), w_mode=False)
-    # 11-field MEPT
-    assert len(line.split()) == 11
-    # F-mode line hardcodes drift = 0 (10th field).
-    parts = line.split()
-    assert parts[9] == "0"
+@pytest.mark.parametrize("mode,pkt_mode", [("F2", 3), ("F5", 6), ("F15", 16), ("F30", 31)])
+def test_tar_gives_every_fst4w_spot_the_34_field_line(mode, pkt_mode):
+    """wd30's ingester skips any spot line under 34 fields (at DEBUG, so
+    silently).  FST4W used to get the 11-field wsprnet short line, and no
+    FST4W spot from a station on this path ever reached wsprdaemon.spots
+    (AC0G-B4, KFS, KPH2, W2NAF-2; found 2026-11-11)."""
+    rec = _record_from_row(_row_v2(band="40", mode=mode, pkt_mode=pkt_mode,
+                                   sync_quality=426.8))
+    blob = build_wsprdaemon_tar_from_records(
+        [rec], rx_call="AC0G/B1", rx_grid="EM38ww",
+        receiver="KA9Q_T3FD", rx_site="AC0G=B1_EM38ww")
+    with _open_tar_blob(blob) as tf:
+        name = next(n for n in tf.getnames() if n.endswith("_spots.txt"))
+        parts = tf.extractfile(name).read().decode().split()
+    assert len(parts) == 34
+    assert parts[17] == str(pkt_mode)          # spot_pkt_mode, the server's `code`
+    assert name.endswith(f"_{mode}_20260514_115800_wd_spots.txt")
 
 
 @pytest.mark.parametrize("mode,pkt_mode", [("F15", 16), ("PKT16", 16)])
@@ -438,8 +447,8 @@ def test_tar_carries_wsprdaemon_code_and_the_real_name(mode, pkt_mode):
     with _open_tar_blob(blob) as tf:
         name = next(n for n in tf.getnames() if n.endswith("_spots.txt"))
         body = tf.extractfile(name).read().decode()
-    assert "_F15_20260514_115800_spots.txt" in name
-    assert body.split()[-1] == "16"
+    assert "_F15_20260514_115800_wd_spots.txt" in name
+    assert body.split()[17] == "16"
 
 
 def test_tar_from_records_layout(tmp_path):
@@ -465,10 +474,10 @@ def test_tar_from_records_layout(tmp_path):
         and n.endswith("_W2_20260514_115800_wd_spots.txt")
         for n in names
     )
-    # F-mode rows produce a short _spots.txt file
+    # F-mode rows get their own file, in the same extended form
     assert any(
         n.startswith("wspr/spots/AC0G=B1_EM38ww/KA9Q_T3FD/40/")
-        and n.endswith("_F2_20260514_115800_spots.txt")
+        and n.endswith("_F2_20260514_115800_wd_spots.txt")
         for n in names
     )
 

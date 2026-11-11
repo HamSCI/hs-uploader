@@ -413,14 +413,6 @@ _W_EXT_FMT = (
     "%5d %6.1f %6.1f %6.1f %6.1f %6.1f %6.1f %6.1f %6.1f "
     "%4d %4d"
 )
-# 11-field MEPT (wsprnet) format — used for F-mode spots when shipping
-# to wsprdaemon.org because there is no extended _wd_spots equivalent
-# for F-modes.  W-mode short lines (matching this format) go to
-# wsprnet directly via the separate WsprNet transport — wsprdaemon's
-# transport does NOT emit them.
-_W_SHORT_FMT = "%-6s %4s %5.2f %3d %5.2f %12.7f %-14s %-6s %2d %2d %4d"
-_F_SHORT_FMT = "%-6s %4s %5.1f %3.0f %5.2f %12.7f %-14s %-6s %2d  0 %4d"
-
 # Noise line format — v1's `_compute_noise_line` writes 15 fields:
 #   pre[Pk RMS RMSpk RMStr] tx[Pk RMS RMSpk RMStr] post[Pk RMS RMSpk RMStr]
 #   rms_noise fft_noise overloads
@@ -604,38 +596,6 @@ def _format_noise_line(cols: dict) -> str:
         float(cols.get("fft_noise_dbm") or 0.0),
         int(cols.get("overload_count") or 0),
     )
-
-
-def _format_short_line(cols: dict, *, w_mode: bool) -> str:
-    """Render one row as the 11-field MEPT short line — F-mode form
-    for wsprdaemon.org (W-mode short goes to wsprnet via WsprNet
-    transport, not this path)."""
-    date, hhmm, _ = _ts_from_iso(cols["time"])
-    freq_mhz = cols["frequency_hz"] / 1_000_000.0
-    grid = cols.get("grid") or ""
-    fmt = _W_SHORT_FMT if w_mode else _F_SHORT_FMT
-    snr = cols["snr_db"]
-    args = (
-        date,
-        hhmm,
-        cols.get("sync_quality") or 0.0,
-        int(snr) if w_mode else float(snr),
-        cols.get("dt") or 0.0,
-        freq_mhz,
-        cols["callsign"],
-        grid,
-        int(cols["pwr_dbm"]),
-    )
-    if w_mode:
-        args += (
-            int(round((cols.get("drift_hz_per_s") or 0.0) * 60.0)),
-            _wd_code(cols, 2),
-        )
-    else:
-        # F-mode format has drift hardcoded "0" in fmt; only one arg
-        # follows: ntype (pkt_mode).
-        args += (_wd_code(cols, 3),)
-    return fmt % args
 
 
 def _psk_cycle_key(time_iso: str) -> str:
@@ -952,20 +912,17 @@ def build_wsprdaemon_tar_from_records(
             )
         for (rx_id, band, mode, ts_filename), rows in spot_groups.items():
             row_call, row_grid, row_recv, row_site = rx_id
-            is_w = mode.startswith("W")
-            if is_w:
-                # Per-row identity: the spot line carries this
-                # receiver's call+grid, not the uploader's.
-                lines = [_format_extended_line(
-                             r, row_call, row_grid,
-                             proxy_upload=bool(forward_to_wsprnet))
-                         for r in rows]
-                suffix = "_wd_spots.txt"
-            else:
-                lines = [_format_short_line(r, w_mode=False) for r in rows]
-                suffix = "_spots.txt"
+            # Every mode gets the 34-field extended line; field 17 carries
+            # the mode's wsprdaemon code.  The WD servers skip any spot line
+            # under 34 fields, so the 11-field short line FST4W once got
+            # here never landed (found 2026-11-11).  Per-row identity: the
+            # line carries this receiver's call+grid, not the uploader's.
+            lines = [_format_extended_line(
+                         r, row_call, row_grid,
+                         proxy_upload=bool(forward_to_wsprnet))
+                     for r in rows]
             content = ("\n".join(lines) + "\n").encode()
-            filename = f"{row_recv}_{band}_{mode}_{ts_filename}{suffix}"
+            filename = f"{row_recv}_{band}_{mode}_{ts_filename}_wd_spots.txt"
             arcname = f"{tar_root}/spots/{row_site}/{row_recv}/{band}/{filename}"
             _tar_add_bytes(tf, arcname, content)
         for (rx_id, band, ts_filename), row in noise_groups.items():
