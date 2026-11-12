@@ -501,3 +501,22 @@ def test_factory_rejects_bad_tar_tag(tmp_path, monkeypatch, bad):
     monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
     with pytest.raises(ValueError, match="tar_tag"):
         build_pipelines(_sigmondb_manifest(tmp_path, tar_tag=bad), watermark=_wm())
+
+
+def test_sender_names_the_shipping_machine(tmp_path, monkeypatch):
+    """`sender` is the machine that ships the tars (KFS-MAIN for four
+    radiods); `receiver` is its older name and still reads."""
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    m = _wspr_manifest(tmp_path)
+    t = m["pipeline"][0]["transport"]
+    t["sender"] = t.pop("receiver").replace("AC0G_S", "KFS-MAIN")
+    wd = build_pipelines(m, watermark=_wm())[0]
+    assert wd.transport.receiver == "KFS-MAIN"
+
+
+def test_sender_wins_over_receiver(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    m = _wspr_manifest(tmp_path)
+    m["pipeline"][0]["transport"]["sender"] = "KFS-MAIN"
+    wd = build_pipelines(m, watermark=_wm())[0]
+    assert wd.transport.receiver == "KFS-MAIN"

@@ -232,8 +232,14 @@ def _build_transport(spec: Mapping[str, Any]):
             kw["sftp_user"] = str(spec["sftp_user"])
         if spec.get("upload_id"):
             kw["upload_id"] = str(spec["upload_id"])
-        if spec.get("receiver"):
-            kw["receiver"] = str(spec["receiver"])
+        # ``sender`` names the machine that ships the tars (tar names, and
+        # the fallback for a row with no source tags of its own); each row
+        # is filed under its own source.  ``receiver`` is the older name for
+        # the same key and still reads (sigmond renders ``sender`` once this
+        # build advertises the ``sender-key`` feature).
+        sender = spec.get("sender") or spec.get("receiver")
+        if sender:
+            kw["receiver"] = str(sender)
         # WsprCycleSource parks its watermark on "wspr.cycle" so it doesn't
         # collide with the raw-table (wspr.spots) wsprnet pipeline.
         kw["primary_table_name"] = str(spec.get("primary_table_name", "wspr.cycle"))

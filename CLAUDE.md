@@ -56,7 +56,7 @@ hs-uploader --help
 hs-uploader migrate --check    # watermarks.db schema version; writes nothing
 hs-uploader migrate            # run pending migrations (sigmond does this on each manifest write)
 hs-uploader capabilities            # store schema version this code writes (one integer, now 3)
-hs-uploader capabilities --features # feature words: gate, pipelines.d, send-log-v3, switch-files
+hs-uploader capabilities --features # feature words: gate, pipelines.d, send-log-v3, sender-key, sigmondb-tar, switch-files
 hs-uploader sink status [--json] [--marker P]  # switches, effective states, and what the gate holds ("enforced" once the marker stands)
 hs-uploader sink set <site|client> <off|fill|upload> --reason R --by B   # through write_switch (root on the real sinks/)
 hs-uploader sink mark-carried [--note N]   # writes the carry-over marker atomically
@@ -108,7 +108,11 @@ fails.
   - `PskReporterTcp` — owns the TCP socket end-to-end; no external
     `pskreporter` binary dependency.
   - `WsprdaemonTarSftp` / `WsprdaemonTarFtp` — cycle-aligned tar
-    bundles to wsprdaemon.org.
+    bundles to wsprdaemon.org.  The manifest's `sender` (older name
+    `receiver`) names the machine that ships them (tar names; fallback for
+    an untagged row); each row is filed under its own source's reporter
+    id and radiod.  `sender-key` in `capabilities --features` says this
+    build reads `sender`.
   - `WsprNet` — HTTP multipart POST to `wsprnet.org/meptspots.php`.
     ⚠ Mutually exclusive with the wsprdaemon transports'
     `forward_to_wsprnet=True` (below): running both double-posts.
