@@ -52,6 +52,7 @@ from .pipelines_d import (LEGACY, Layout, Refusal, load_layout,
 from .sinkswitch import effective_state, marker_path, marker_stands
 from .gate import SinkGate  # also re-exported: spec §11.2 finds hs_uploader.daemon.SinkGate
 from .gate import exempt_rule
+from .link_gate import DEFAULT_PATH as DEFAULT_LINK_PATH, LinkGate
 from .transports.discard import wrap_if_discard
 from .wake import WakeListener
 from .watermark.sqlite import SqliteWatermarkStore, default_path
@@ -958,6 +959,17 @@ def run(manifest_path: str | Path = _DEFAULT_MANIFEST,
 
     logger.info("daemon: %d pipeline(s): %s",
                 len(pipelines), ", ".join(p.name for p in pipelines))
+
+    # The link gate holds network pipelines while a published link schedule
+    # (sigmond-link; the South Pole's satellite passes) says the link is
+    # down.  No schedule file, or [daemon] link_schedule = false: no effect.
+    link_cfg = (manifest.get("daemon", {}) or {}).get("link_schedule", True)
+    if link_cfg is not False:
+        link = LinkGate(DEFAULT_LINK_PATH if link_cfg is True else Path(link_cfg))
+        gate.link = link.may_send
+        st = link.state()
+        logger.info("daemon: link schedule %s: %s", link.path,
+                    "absent (link gate inactive)" if st is None else st.reason)
 
     uploader = _new_uploader(pipelines, gate=gate.may_send)
 

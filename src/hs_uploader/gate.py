@@ -112,8 +112,15 @@ class SinkGate:
         self._owed: set[tuple] = set()
         self._last_capped = False
 
+    # A second, independent hold: the link schedule (link_gate.LinkGate).
+    # Asked only when the switches say send, so a held pipeline never
+    # consults it.  The daemon sets it; None leaves the gate as it was.
+    link: Optional[Callable[[object], bool]] = None
+
     def may_send(self, pipe) -> bool:
-        return self.decide(pipe).send
+        if not self.decide(pipe).send:
+            return False
+        return self.link is None or bool(self.link(pipe))
 
     def decide(self, pipe) -> Decision:
         try:
