@@ -341,9 +341,11 @@ def _fill_missing_producer_keys(conn: sqlite3.Connection, *,
     Without this copy, each producer pipeline would start at its own
     anchor ("now") and skip the rows the shared pipeline had not sent
     (final review I1).  The copy fills only a missing key, with a position
-    the old pipeline has acked through.  It never touches a key that
-    exists, so it never moves a producer's record.  With ``write=False``
-    it only reads and reports what it would do.
+    the old pipeline has acked through.  A key that exists moves only
+    forward, and only when it is behind the old record (:func:`_behind_old`):
+    those rows were sent already, and re-reading them posts them twice.
+    It never moves a producer's record back.  With ``write=False`` it only
+    reads and reports what it would do.
     """
     if not _has_table(conn, "watermarks"):
         return []
@@ -352,7 +354,17 @@ def _fill_missing_producer_keys(conn: sqlite3.Connection, *,
     made_table = False
     for src, dest, table, cursor, last_ack in _old_pskreporter_records(conn):
         for new_src in NEW_PSKREPORTER_PIPELINES.values():
-            if _has_record(conn, new_src, dest, table):
+            existing = conn.execute(
+                "SELECT cursor, last_ack FROM watermarks "
+                "WHERE source_id = ? AND dest_id = ? AND table_name = ?",
+                (new_src, dest, table)).fetchone()
+            if existing is not None:
+                if _behind_old(existing, (cursor, last_ack)):
+                    lines.extend(_raise_behind_key(
+                        conn, (src, dest, table), new_src, existing,
+                        cursor, last_ack, now, write=write,
+                        made_table=made_table))
+                    made_table = made_table or write
                 continue
             if write:
                 if not made_table:
@@ -373,6 +385,64 @@ def _fill_missing_producer_keys(conn: sqlite3.Connection, *,
                 f"last_ack {last_ack}) to {_key(new_src, dest, table)}: "
                 "that producer key held no record")
     return lines
+
+
+def _row_id(blob: object) -> Optional[int]:
+    """A sqlite source cursor as the row id it names, or None when it is
+    not one (an opaque cursor is never compared)."""
+    if isinstance(blob, (bytes, bytearray, memoryview)):
+        try:
+            blob = bytes(blob).decode("ascii")
+        except UnicodeDecodeError:
+            return None
+    if isinstance(blob, int):
+        return blob
+    if isinstance(blob, str) and blob.strip().isdigit():
+        return int(blob.strip())
+    return None
+
+
+def _behind_old(existing: tuple, old: tuple) -> bool:
+    """Whether a producer key's record is BEHIND the old shared record:
+    both cursors are row ids, the old one is further on, and the old
+    pipeline acked after the producer pipeline last did.
+
+    That happens when a split manifest ran once, a shared (unscoped)
+    pipeline then ran on and sent past it, and a split manifest returns.
+    KJ6MKI, 2026-11-12: ``@psk-recorder`` was kept from an earlier render,
+    behind the oldest row in the store, while the shared pipeline had sent
+    through row 9449271; the producer pipeline re-sent 500 rows the shared
+    one had already posted to pskreporter.info, and ~28k more waited.
+    Every row up to the old cursor was sent by the shared pipeline, whose
+    filter covers both producers' modes, so raising skips nothing unsent."""
+    new_id, old_id = _row_id(existing[0]), _row_id(old[0])
+    if new_id is None or old_id is None or old_id <= new_id:
+        return False
+    new_ack, old_ack = existing[1] or "", old[1] or ""
+    return bool(old_ack) and old_ack > new_ack
+
+
+def _raise_behind_key(conn, old_key: tuple, new_src: str, existing: tuple,
+                      cursor, last_ack, now: str, *, write: bool,
+                      made_table: bool) -> list[str]:
+    src, dest, table = old_key
+    if write:
+        if not made_table:
+            conn.execute(_SUPERSEDED_KEYS_DDL)
+        conn.execute(
+            "UPDATE watermarks SET cursor = ?, last_ack = ? "
+            "WHERE source_id = ? AND dest_id = ? AND table_name = ?",
+            (cursor, last_ack, new_src, dest, table))
+        conn.execute(
+            "INSERT OR IGNORE INTO superseded_keys (old_source_id, "
+            "old_dest_id, old_table, new_source_id, new_dest_id, "
+            "new_table, migrated_at) VALUES (?,?,?,?,?,?,?)",
+            (src, dest, table, new_src, dest, table, now))
+    return [f"{'raised' if write else 'would raise'} "
+            f"{_key(new_src, dest, table)} from cursor "
+            f"{_show(existing[0])} (last_ack {existing[1]}) to "
+            f"{_show(cursor)} (last_ack {last_ack}): "
+            f"{_key(src, dest, table)} had already sent those rows"]
 
 
 def _fills(version: int) -> bool:

@@ -767,3 +767,64 @@ def test_superseded_keys_keeps_successors_that_differ_only_by_destination(tmp_pa
     conn.commit()
     conn.close()
     assert len(_two_successors_by_destination(db)) == 2
+
+
+# ---- a producer key left BEHIND the shared record (KJ6MKI, 2026-11-12) ------
+
+
+def _at_v2_with(tmp_path, new_psk_cursor, new_psk_ack):
+    db = _store_v1(tmp_path)
+    schema.migrate(str(db))                       # split once: v2, keys copied
+    s = SqliteWatermarkStore(db)
+    # Then a shared pipeline ran on and sent past the producer key.
+    s._write_cursor(*OLD, cursor=b"40", last_ack="2026-10-19T09:00:00+00:00")
+    s._write_cursor(*NEW_PSK, cursor=new_psk_cursor, last_ack=new_psk_ack)
+    s.close()
+    return db
+
+
+def test_a_behind_producer_key_is_raised_to_the_shared_record(tmp_path):
+    db = _at_v2_with(tmp_path, b"7", "2026-10-18T13:00:00+00:00")
+
+    report = schema.migrate(str(db))
+
+    rows = _watermarks(db)
+    assert rows[NEW_PSK] == (b"40", "2026-10-19T09:00:00+00:00")
+    assert rows[NEW_MS] == (b"40", "2026-10-19T09:00:00+00:00")
+    assert any("raised" in line and NEW_PSK[0] in line
+               for line in report.lines)
+
+
+def test_check_previews_the_raise_and_writes_nothing(tmp_path):
+    db = _at_v2_with(tmp_path, b"7", "2026-10-18T13:00:00+00:00")
+
+    report = schema.migrate(str(db), check=True)
+
+    assert _watermarks(db)[NEW_PSK] == (b"7", "2026-10-18T13:00:00+00:00")
+    assert report.would_write
+    assert any("would raise" in line for line in report.lines)
+
+
+def test_a_producer_key_that_acked_later_is_never_moved(tmp_path):
+    # The producer pipeline ran after the shared one: its position is its own.
+    db = _at_v2_with(tmp_path, b"7", "2026-10-20T00:00:00+00:00")
+
+    schema.migrate(str(db))
+
+    assert _watermarks(db)[NEW_PSK] == (b"7", "2026-10-20T00:00:00+00:00")
+
+
+def test_a_producer_key_ahead_is_never_moved_back(tmp_path):
+    db = _at_v2_with(tmp_path, b"90", "2026-10-18T13:00:00+00:00")
+
+    schema.migrate(str(db))
+
+    assert _watermarks(db)[NEW_PSK] == (b"90", "2026-10-18T13:00:00+00:00")
+
+
+def test_an_opaque_cursor_is_never_compared(tmp_path):
+    db = _at_v2_with(tmp_path, b"\xff\x00", "2026-10-18T13:00:00+00:00")
+
+    schema.migrate(str(db))
+
+    assert _watermarks(db)[NEW_PSK] == (b"\xff\x00", "2026-10-18T13:00:00+00:00")
