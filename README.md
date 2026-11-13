@@ -34,8 +34,10 @@ Active. Sources, transports, and watermark store are all working:
   filtered out and flip source health to `stale-schema` — a clean halt
   rather than shipping records a transport may misread.
 
-Current consumer: `psk-recorder` ships `psk.spots` rows via
-`PskReporterTcp`, behind the `PSK_USE_HS_UPLOADER=1` feature flag.
+Consumers: `wspr-recorder`, `psk-recorder`, `meteor-scatter` and
+`mag-recorder` each build their pipelines from this library, in process
+or through the hs-uploader daemon.  Sigmond's rendered uploader manifest
+decides which transports a station uses.
 
 ## Sink writer
 
