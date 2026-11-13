@@ -39,6 +39,15 @@ Consumers: `wspr-recorder`, `psk-recorder`, `meteor-scatter` and
 or through the hs-uploader daemon.  Sigmond's rendered uploader manifest
 decides which transports a station uses.
 
+For spots, a sigmond station uses one transport: `WsprdaemonTarSftp`
+(with `WsprdaemonTarFtp` as its first-contact fallback).  The
+`wspr-wsprdaemon` tar carries WSPR rows and, with `include_psk`, the
+FT8/FT4 and MSK144 rows; wsprdaemon.org forwards them to wsprnet.org and
+PSKReporter under each spot's own reporter id.  The manifest leaves out
+the `WsprNet` and `PskReporterTcp` pipelines whenever the tar carries the
+spots.  Both transports stay in the library.  wspr-recorder's own
+in-process pump still builds a `WsprNet` pipeline; see its README.
+
 ## Sink writer
 
 `hs_uploader.sink` stores a client's records in `/var/lib/sigmond/sink.db`,
