@@ -19,9 +19,24 @@ still advances past them).
 
 Stdlib only — uses ``urllib.request`` like the bash-era uploader so
 hs-uploader stays installable without ``requests``.  The HTTP
-response body is parsed for the "200 OK ... spots added" pattern;
-non-2xx or a non-parseable body yields ``retry_later`` rather than
-``acked`` so the orchestrator's exponential back-off kicks in.
+response body is parsed for the "N out of M spot(s) added" pattern.
+
+Delivery policy (Rob, 2026-11-13, replacing the 2026-05 "never retry"):
+  * A timeout, network error, HTTP 5xx or 2xx reply with no spot count
+    is ``retry_later``.  The pipeline's retry delay never drops below
+    ``RETRY_MIN_DELAY_SEC`` (120 s), because wsprnet.org often goes on
+    recording an upload after the client gave up; re-sending sooner put
+    both copies on wsprnet.  After the wait, the spots it did record come
+    back as duplicates, which it refuses.
+  * An HTTP 4xx is acked: wsprnet read the request and refused it, and
+    the same bytes would be refused again.
+  * "Upload limit of 1000 spots or 100 dupes reached" means wsprnet
+    stopped after the first <read> lines and never looked at the rest.
+    Those lines are posted again at once — they were never processed, so
+    there is nothing to race — until every line has been read.
+Measured 2026-11-13 with the old policy: the eight Sigmond stations that
+post directly lost 7-15 % of their spots on wsprnet (wsprdaemon.rx vs
+wspr.rx, 24 h); the WD30 forwarder, which retries, lost 0.2-0.8 %.
 """
 
 from __future__ import annotations
@@ -43,6 +58,16 @@ logger = logging.getLogger(__name__)
 # in wd-upload-wsprnet (MAX_SPOTS=999); larger uploads are silently
 # truncated on the server side.
 MAX_SPOTS_PER_UPLOAD = 999
+
+# What we post per transaction by default.  Under load wsprnet takes ~2 s
+# per spot (K9TRV-5, 2026-11-13: 255 s for 123 spots), so 999 could never
+# finish inside any sane timeout; 250 finishes inside DEFAULT_UPLOAD_TIMEOUT_SEC.
+# Same figure as the WD client (wsprdaemon 8a48999) and the WD30 forwarder.
+DEFAULT_SPOTS_PER_UPLOAD = 250
+DEFAULT_UPLOAD_TIMEOUT_SEC = 600.0
+
+_ADDED_RE = re.compile(r"(\d+)\s+out\s+of\s+(\d+)\s+spot", re.I)
+_LIMIT_RE = re.compile(r"Upload limit of[^<.]*reached", re.I)
 
 # Multipart boundary.  wd-upload-wsprnet uses this exact string; matching
 # it makes diffing the two uploaders' requests trivial during the
@@ -72,15 +97,19 @@ class WsprNet:
     # truthful and future-proof.
     ACCEPTS = {"wspr.spots": [1, 2, 3]}
 
+    # The pipeline factory floors this transport's retry delay here (see
+    # RetryPolicy.min_delay_sec and the module docstring).
+    RETRY_MIN_DELAY_SEC = 120.0
+
     def __init__(
         self,
         *,
         url: str = "http://wsprnet.org/meptspots.php",
         version: str = "hs-uploader/0.1",
-        upload_timeout_sec: float = 300.0,
+        upload_timeout_sec: float = DEFAULT_UPLOAD_TIMEOUT_SEC,
         urlopen=None,
         name: Optional[str] = None,
-        max_spots_per_upload: int = MAX_SPOTS_PER_UPLOAD,
+        max_spots_per_upload: int = DEFAULT_SPOTS_PER_UPLOAD,
         api_base_url: Optional[str] = None,
         # 5s (not 1s) to ease status-poll load on wsprnet.org: server
         # processing is ~3-6s, so the 1st-2nd poll still catches "done"
@@ -108,8 +137,8 @@ class WsprNet:
         # Caller-controlled batch ceiling so an operator can opt into
         # per-spot POSTs (``max_spots_per_upload=1``) for diagnostic
         # tracking — wsprnet's "M out of N added" response then
-        # answers per-spot rather than per-batch.  Default 999 matches
-        # the legacy ``wd-upload-wsprnet`` behaviour.
+        # answers per-spot rather than per-batch.  Default 250
+        # (DEFAULT_SPOTS_PER_UPLOAD); MAX_SPOTS_PER_UPLOAD (999) is the cap.
         if max_spots_per_upload < 1:
             max_spots_per_upload = 1
         if max_spots_per_upload > MAX_SPOTS_PER_UPLOAD:
@@ -210,15 +239,6 @@ class WsprNet:
             grid=grid,
             allmept=body,
         )
-        req = urllib.request.Request(
-            self.url,
-            data=multipart,
-            headers={
-                "Content-Type":
-                    "multipart/form-data; boundary=" + _BOUNDARY.decode(),
-            },
-            method="POST",
-        )
         # Count the MEPT lines we're about to send.  Each line in
         # ``body`` is one spot; trailing newlines don't count.  This
         # lets the log show both client-side count (we sent N) and
@@ -232,20 +252,63 @@ class WsprNet:
         )
         if self._api_base_url:
             return self._post_async(multipart, client_spots, cycle_summary)
+        lines = body.splitlines(keepends=True)
+        added_total = 0
+        while True:
+            verdict, detail, added, read = self._post_once(
+                b"".join(lines), call, grid, cycle_summary, len(lines))
+            if verdict == "retry":
+                return Outcome.retry_later(detail)
+            if verdict == "refused":
+                return Outcome(kind="acked", reason=detail)
+            added_total += added
+            if verdict == "done" or read >= len(lines):
+                break
+            # verdict == "cut": wsprnet stopped at its duplicate cutoff
+            # after reading `read` lines.  The rest were never looked at,
+            # so post them now; there is no earlier copy to race.
+            if read <= 0:
+                return Outcome.retry_later(
+                    "wsprnet hit its upload limit without reading a spot")
+            logger.warning(
+                "wsprnet stopped after reading %d of %d spot(s) (duplicate "
+                "cutoff); posting the %d it never read",
+                read, len(lines), len(lines) - read,
+            )
+            lines = lines[read:]
+        return Outcome(kind="acked",
+                       reason=f"{added_total}/{client_spots} added")
+
+    def _post_once(
+        self, body: bytes, call: str, grid: str, cycle_summary: str,
+        n_lines: int,
+    ):
+        """One blocking POST to meptspots.php.
+
+        Returns ``(verdict, detail, added, read)``, verdict one of:
+          * ``"done"``    — wsprnet read every line;
+          * ``"cut"``     — it stopped at its duplicate cutoff after ``read``;
+          * ``"retry"``   — no usable answer (timeout, network, 5xx, no count);
+          * ``"refused"`` — HTTP 4xx, which re-sending cannot change.
+        """
+        multipart = _build_multipart(
+            version=f"WD_{self.version}", call=call, grid=grid, allmept=body,
+        )
+        req = urllib.request.Request(
+            self.url,
+            data=multipart,
+            headers={
+                "Content-Type":
+                    "multipart/form-data; boundary=" + _BOUNDARY.decode(),
+            },
+            method="POST",
+        )
         post_t0 = time.monotonic()
         try:
             with self._urlopen(req, timeout=self.upload_timeout_sec) as resp:
                 status = getattr(resp, "status", 200)
                 response_body = resp.read().decode(errors="replace")
         except urllib.error.HTTPError as exc:
-            # HTTP 4xx/5xx: server received our request and chose to
-            # reject.  Per policy (operator @rrobinett 2026-05-14):
-            # `hs_uploader should only retry upload spots if there is
-            # a curl error.  whatever wsprnet reports in a successful
-            # curl transfer, hs-uploader should never retry them` — so
-            # ack the batch (advance watermark, no retry).  Retrying
-            # would just resend identical payload to the same server
-            # for the same rejection; better to move on to fresh spots.
             elapsed = time.monotonic() - post_t0
             response_body = ""
             try:
@@ -256,67 +319,48 @@ class WsprNet:
                 "wsprnet POST failed in %.2fs: HTTP %d — %s",
                 elapsed, exc.code, response_body[:160],
             )
-            return Outcome(
-                kind="acked",
-                reason=f"HTTP {exc.code} (no retry): {response_body[:200]}",
-            )
+            status = exc.code
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
-            # Network-level failure or timeout (no HTTP response
-            # received within upload_timeout_sec).  Per policy
-            # (operator @rrobinett 2026-05-23): even when we never
-            # see a response, treat the batch as ack'd and move on.
-            # Rationale: wsprnet.org has been observed responding
-            # 3-10 minutes after the POST body was sent, well after
-            # our client timeout fires.  Retrying just resends the
-            # same body, which the server processes a SECOND time
-            # and reports as "0/100 added" because the first
-            # delivery already populated its tables.  Net effect was
-            # a 15-minute retry loop per batch + 100s of CPU + a
-            # multi-cycle backlog buildup, all to land 0 new spots.
-            # Losing the occasional batch to a truly down network
-            # is a much cheaper failure mode than spinning forever.
+            # No answer at all.  wsprnet may still be recording this body,
+            # so it is retried only after the pipeline's retry floor
+            # (RETRY_MIN_DELAY_SEC), by which time any spot it took comes
+            # back as a refused duplicate.
             elapsed = time.monotonic() - post_t0
             logger.warning(
-                "wsprnet POST timeout/network error in %.2fs "
-                "(no retry — treating as acked): %s", elapsed, exc,
+                "wsprnet POST timeout/network error in %.2fs (retrying "
+                "after the hold-off): %s", elapsed, exc,
             )
-            return Outcome(
-                kind="acked",
-                reason=f"timeout/network error after {elapsed:.0f}s "
-                       f"(no retry): {exc}",
-            )
+            return ("retry",
+                    f"timeout/network error after {elapsed:.0f}s: {exc}", 0, 0)
 
         if not (200 <= status < 300):
-            # Defensive — _urlopen normally raises HTTPError for non-2xx,
-            # but if a custom opener delivers the response object instead,
-            # apply the same no-retry policy as the HTTPError branch.
-            return Outcome(
-                kind="acked",
-                reason=f"HTTP {status} (no retry): {response_body[:200]}",
-            )
-        # The server returns plain text along the lines of
-        # ``N out of M spot(s) added``.  We still treat any 2xx as
-        # success (the watermark advances regardless — duplicates and
-        # silently-dropped rows aren't worth retrying), but stash the
-        # "N out of M" count in Outcome.reason so the on_batch_outcome
-        # callback can log the true acceptance rate.  Without this the
-        # operator sees `shipped wsprnet=900` in the journal while
-        # wsprnet may have actually added only ~38 of them (the rest
-        # dropped as duplicates or hitting MAX_SPOTS_PER_UPLOAD
-        # truncation).  Observed on B4-100 2026-05-14 — production was
-        # POSTing 900-spot batches but only ~38% were added per body.
-        import re
-        m = re.search(r"(\d+)\s+out\s+of\s+(\d+)\s+spot", response_body)
-        reason = f"{m.group(1)}/{m.group(2)} added" if m else ""
+            if 500 <= status < 600 or status == 429:
+                return ("retry", f"HTTP {status}: {response_body[:200]}", 0, 0)
+            return ("refused",
+                    f"HTTP {status} (refused, not retried): "
+                    f"{response_body[:200]}", 0, 0)
+        # wsprnet answers in blocks, one "N out of M spot(s) added" each:
+        # sum them all, or a 250-spot upload reads back as "0 of 100".
+        pairs = _ADDED_RE.findall(response_body)
         elapsed = time.monotonic() - post_t0
-        rate = (client_spots / elapsed) if elapsed > 0 else 0
+        if not pairs:
+            logger.warning(
+                "wsprnet POST in %.2fs returned no spot count (retrying "
+                "after the hold-off): %s", elapsed,
+                " ".join(response_body.split())[:160],
+            )
+            return ("retry", "wsprnet reply had no spot count", 0, 0)
+        added = sum(int(a) for a, _ in pairs)
+        read = sum(int(b) for _, b in pairs)
+        cut = bool(_LIMIT_RE.search(response_body)) and read < n_lines
+        rate = (n_lines / elapsed) if elapsed > 0 else 0
         logger.info(
             "wsprnet POST done: %d spots (cycles: %s) in %.2fs "
             "(%.1f spots/s); server: %s",
-            client_spots, cycle_summary, elapsed, rate,
-            reason or "no count",
+            n_lines, cycle_summary, elapsed, rate,
+            f"{added}/{read} added" + (" (duplicate cutoff)" if cut else ""),
         )
-        return Outcome(kind="acked", reason=reason)
+        return ("cut" if cut else "done", "", added, read)
 
     def _post_async(
         self,
@@ -326,10 +370,16 @@ class WsprNet:
     ) -> Outcome:
         """Async upload API: submit → nonce → poll status.
 
-        Same no-retry policy as the legacy path — any server response (or
-        a poll timeout) acks the batch so the watermark advances.  The
-        server keeps results 24 h, so a poll timeout just means we don't
-        log the final count, not that the spots were lost.
+        A submit that never got a job id (HTTP 5xx, timeout, network error,
+        unreadable reply, no nonce) and a job whose status is ``failed`` are
+        ``retry_later``: nothing tells us wsprnet holds those spots.  On
+        2026-11-12/13 every one of them was a whole WSPR cycle missing from
+        wsprnet (AB4EJ: 28 HTTP 500 + 52 submit timeouts, 119 cycles lost
+        in 24 h).  An HTTP 4xx is still acked: it was read and refused.
+
+        A job still pending when polling ends is acked: the server holds it
+        and its result for 24 h, and on a backed-up day that is ~90 % of
+        jobs, so re-submitting them would double wsprnet's queue.
         """
         import json
         upload_url = f"{self._api_base_url}/upload"
@@ -357,25 +407,30 @@ class WsprNet:
                 "wsprnet async submit failed: HTTP %d — %s",
                 exc.code, body[:160],
             )
+            if 500 <= exc.code < 600 or exc.code == 429:
+                return Outcome.retry_later(
+                    f"async submit HTTP {exc.code}: {body[:200]}")
             return Outcome(kind="acked",
-                           reason=f"HTTP {exc.code} (no retry): {body[:200]}")
+                           reason=f"HTTP {exc.code} (refused, not retried): "
+                                  f"{body[:200]}")
         except (urllib.error.URLError, TimeoutError, OSError) as exc:
             elapsed = time.monotonic() - post_t0
             logger.warning(
                 "wsprnet async submit timeout/network error in %.2fs "
-                "(no retry — acked): %s", elapsed, exc,
+                "(retrying after the hold-off): %s", elapsed, exc,
             )
-            return Outcome(kind="acked",
-                           reason=f"timeout/network error (no retry): {exc}")
+            return Outcome.retry_later(
+                f"async submit timeout/network error after {elapsed:.0f}s: "
+                f"{exc}")
         except ValueError as exc:
             logger.warning("wsprnet async: submit response not JSON: %s", exc)
-            return Outcome(kind="acked", reason="bad submit response")
+            return Outcome.retry_later("async submit response not JSON")
 
         nonce = (submit or {}).get("nonce")
         if not nonce:
             logger.warning("wsprnet async: no nonce in submit response: %r",
                            submit)
-            return Outcome(kind="acked", reason="no nonce returned")
+            return Outcome.retry_later("async submit returned no nonce")
 
         # 2. Poll <base>/status/<nonce> until done/failed or timeout.
         status_url = f"{self._api_base_url}/status/{nonce}"
@@ -437,6 +492,11 @@ class WsprNet:
                 len(rejections), nonce,
                 "; ".join(str(r) for r in rejections[:25]),
             )
+        if st == "failed":
+            # The job ran and failed: nothing says wsprnet kept these spots.
+            # Re-submitting after the hold-off is safe; any it did keep come
+            # back as refused duplicates.
+            return Outcome.retry_later(f"async job failed: {reason}")
         return Outcome(kind="acked", reason=reason)
 
 

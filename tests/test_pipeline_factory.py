@@ -103,6 +103,17 @@ def test_psk_and_wsprnet_shapes(tmp_path, monkeypatch):
     assert isinstance(wspr.transport, WsprNet)
 
 
+def test_a_wsprnet_pipeline_never_retries_sooner_than_120_s(tmp_path, monkeypatch):
+    """The floor comes from the transport, so the pipelines.toml that smd
+    generates needs no change for it to apply — and other transports keep
+    their 1 s first retry."""
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    pipes = build_pipelines(_manifest(tmp_path), watermark=_wm())
+    psk, wspr = pipes[1], pipes[2]
+    assert wspr.retry.delay_for(0) == WsprNet.RETRY_MIN_DELAY_SEC == 120.0
+    assert psk.retry.delay_for(0) == 1.0
+
+
 def test_all_pipelines_share_one_watermark(tmp_path, monkeypatch):
     monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
     wm = _wm()

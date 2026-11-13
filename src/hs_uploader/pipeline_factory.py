@@ -327,12 +327,23 @@ def _wsprnet_proxy_kw(spec: Mapping[str, Any]) -> dict[str, Any]:
     return kw
 
 
-def _retry(spec: Optional[Mapping[str, Any]]) -> RetryPolicy:
+def _retry(spec: Optional[Mapping[str, Any]],
+           transport: Any = None) -> RetryPolicy:
+    """The pipeline's retry policy.
+
+    A transport may declare ``RETRY_MIN_DELAY_SEC``: the shortest safe gap
+    before it re-sends (WsprNet: wsprnet.org goes on recording an upload the
+    client timed out on).  It applies unless the entry's ``[retry]`` table
+    sets ``min_delay_sec`` itself, so the generated pipelines.toml needs no
+    change for the floor to take effect.
+    """
+    floor = float(getattr(transport, "RETRY_MIN_DELAY_SEC", 0.0) or 0.0)
     if not spec:
-        return RetryPolicy()
+        return RetryPolicy(min_delay_sec=floor)
     return RetryPolicy.exponential(
         base=float(spec.get("base", 2.0)),
         cap_sec=float(spec.get("cap_sec", 300.0)),
+        min_delay_sec=float(spec.get("min_delay_sec", floor)),
     )
 
 
@@ -374,7 +385,7 @@ def build_entry(
         transport=transport,
         watermark=watermark,
         identity=identity,
-        retry=_retry(entry.get("retry")),
+        retry=_retry(entry.get("retry"), transport),
         batch_limit=int(entry.get("batch_limit", 1000)),
         max_records_per_pump=None if mrpp is None else int(mrpp),
         client=str(entry.get("client") or ""),

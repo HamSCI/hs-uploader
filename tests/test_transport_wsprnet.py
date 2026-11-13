@@ -259,8 +259,16 @@ def test_batch_policy_caps_at_999():
     """wsprnet's hard server-side limit per transaction.  Larger
     batches are silently truncated by the gateway — the BatchPolicy
     keeps the orchestrator from emitting them in the first place."""
-    assert WsprNet().batch_policy().max_records == MAX_SPOTS_PER_UPLOAD
     assert MAX_SPOTS_PER_UPLOAD == 999
+    assert WsprNet(max_spots_per_upload=5000).batch_policy().max_records == 999
+
+
+def test_by_default_250_spots_go_per_post():
+    """⛔ Under load wsprnet took 255 s for 123 spots (K9TRV-5, 2026-11-13):
+    999 per post could never finish inside the timeout.  250 can."""
+    t = WsprNet()
+    assert t.batch_policy().max_records == 250
+    assert 250 * (255 / 123) <= t.upload_timeout_sec
 
 
 # ---- multipart wire shape ----
@@ -303,7 +311,8 @@ def test_multipart_body_matches_wd_upload_wsprnet_shape():
 
 
 class _FakeResp:
-    def __init__(self, status=200, body=b"200 OK 1 spots added"):
+    # wsprnet's real wording; a reply without "N out of M spot" is retried.
+    def __init__(self, status=200, body=b"1 out of 1 spot(s) added<br>"):
         self.status = status
         self._body = body
 
@@ -343,11 +352,10 @@ def test_ship_returns_acked_on_2xx():
     assert "multipart/form-data; boundary=" in ct
 
 
-def test_ship_acks_on_5xx_no_retry():
-    """Per policy (operator @rrobinett 2026-05-14): ANY HTTP response —
-    2xx success or 4xx/5xx error — is ack'd, never retried.  Retrying
-    a 5xx just resends identical payload to the same server for the
-    same rejection."""
+def test_ship_retries_a_5xx():
+    """Policy since 2026-11-13 (Rob, replacing 2026-05-14's "never retry"):
+    a 5xx says nothing about whether wsprnet recorded the spots, so it is
+    retried — after the pipeline's 120 s floor, see the RetryPolicy tests."""
     import urllib.error
 
     def fake_urlopen(req, timeout):
@@ -359,20 +367,34 @@ def test_ship_acks_on_5xx_no_retry():
     t = WsprNet(urlopen=fake_urlopen)
     batch = RecordBatch(records=(_spot(),), cursor_after=b"")
     outcome = t.ship(batch, _ident())
-    assert outcome.kind == "acked"
+    assert outcome.kind == "retry_later"
     assert "502" in outcome.reason
 
 
-def test_ship_acks_on_network_error_no_retry():
-    """Per policy (operator @rrobinett 2026-05-23): even network-level
-    failures and timeouts are ack'd, not retried.  wsprnet.org has been
-    observed responding 3-10 min after the POST body was sent — long
-    after our upload_timeout_sec fires.  Retrying on timeout just
-    re-uploads the same body, which the server processes a second time
-    and reports as ``0/N added`` (the first delivery already populated
-    its tables).  Net effect was multi-minute retry loops landing zero
-    new spots.  Lose-the-occasional-true-outage is cheaper than spin-
-    forever."""
+def test_ship_acks_a_4xx_without_retrying():
+    """wsprnet read the request and refused it; the same bytes would be
+    refused again."""
+    import urllib.error
+
+    def fake_urlopen(req, timeout):
+        raise urllib.error.HTTPError(
+            req.full_url, 400, "Bad Request", hdrs={}, fp=BytesIO(b"no"),
+        )
+
+    t = WsprNet(urlopen=fake_urlopen)
+    outcome = t.ship(RecordBatch(records=(_spot(),), cursor_after=b""),
+                     _ident())
+    assert outcome.kind == "acked"
+    assert "400" in outcome.reason
+
+
+def test_ship_retries_a_timeout_or_network_error():
+    """⛔ Policy since 2026-11-13 (Rob): acking a timeout LOST the batch
+    whenever wsprnet had not recorded it — the eight Sigmond stations that
+    posted directly were 7-15 % short on wsprnet, while the WD30 forwarder,
+    which retries, was 0.2-0.8 % short.  The 2026-05-23 worry, a retry
+    landing on top of a first copy wsprnet is still recording, is handled
+    by the 120 s retry floor, not by giving up."""
     import urllib.error
 
     def fake_urlopen(req, timeout):
@@ -381,8 +403,65 @@ def test_ship_acks_on_network_error_no_retry():
     t = WsprNet(urlopen=fake_urlopen)
     batch = RecordBatch(records=(_spot(),), cursor_after=b"")
     outcome = t.ship(batch, _ident())
-    assert outcome.kind == "acked"
+    assert outcome.kind == "retry_later"
     assert "connection refused" in outcome.reason
+
+
+def test_a_2xx_with_no_spot_count_is_retried():
+    """K9TRV-5, 2026-11-13: wsprnet answered some uploads with a 20-byte
+    empty HTML page.  That says nothing about the spots."""
+    t = WsprNet(urlopen=lambda req, timeout: _FakeResp(
+        body=b"<html>\n\n<body>\n"))
+    outcome = t.ship(RecordBatch(records=(_spot(),), cursor_after=b""),
+                     _ident())
+    assert outcome.kind == "retry_later"
+
+
+def _limit_server(limit_after):
+    """A fake wsprnet that refuses known spots and stops after
+    `limit_after` duplicates, the way meptspots.php does."""
+    seen = set()
+    posts = []
+
+    def urlopen(req, timeout):
+        body = req.data.split(b'filename="spots.txt"')[1]
+        body = body.split(b"\r\n\r\n", 1)[1].rsplit(b"\r\n--", 1)[0]
+        lines = [ln for ln in body.split(b"\n") if ln.strip()]
+        posts.append(len(lines))
+        added = read = dupes = 0
+        for ln in lines:
+            read += 1
+            if ln in seen:
+                dupes += 1
+            else:
+                seen.add(ln)
+                added += 1
+            if dupes >= limit_after:
+                return _FakeResp(body=(
+                    b"Upload limit of 1000 spots or 100 dupes reached.<br>"
+                    + f"{added} out of {read} spot(s) added<br>".encode()))
+        return _FakeResp(body=f"{added} out of {read} spot(s) added".encode())
+
+    return urlopen, seen, posts
+
+
+def test_the_lines_wsprnet_never_READ_after_its_dupe_cutoff_are_posted_again():
+    """⛔ "Upload limit ... 100 dupes reached. 0 out of 100 spot(s) added":
+    wsprnet stopped reading.  Acking that batch lost every line after the
+    first 100.  They were never processed, so they are re-posted at once."""
+    urlopen, seen, posts = _limit_server(limit_after=3)
+    spots = tuple(_spot(tx_sign=f"K{i:03d}A", freq_mhz=14.0971 + i * 0.001)
+                  for i in range(10))
+    t = WsprNet(urlopen=urlopen)
+    # wsprnet already holds the first 5 (an earlier, timed-out copy).
+    first = t.serialize_for_retry(RecordBatch(records=spots[:5],
+                                              cursor_after=b""), _ident())
+    seen.update(ln for ln in first.split(b"\n") if ln.strip())
+    outcome = t.ship(RecordBatch(records=spots, cursor_after=b""), _ident())
+    assert outcome.kind == "acked"
+    assert len(seen) == 10, "every spot must reach wsprnet"
+    assert posts == [10, 7], posts
+    assert outcome.reason == "5/10 added"
 
 
 def test_ship_permanent_failure_when_call_missing():
@@ -622,7 +701,9 @@ def test_async_submit_and_poll_done():
     assert ("GET", "https://wsprnet.org/api/upload/v1/status/abc123") in calls
 
 
-def test_async_status_failed_is_acked():
+def test_async_status_failed_is_retried():
+    """Since 2026-11-13 (Rob): a failed job says nothing about whether
+    wsprnet kept the spots, so it is retried after the 120 s floor."""
     def fake_urlopen(req, timeout):
         if req.full_url.endswith("/upload"):
             return _JsonResp({"nonce": "n1", "queued": True})
@@ -633,11 +714,11 @@ def test_async_status_failed_is_acked():
                 api_base_url="https://wsprnet.org/api/upload/v1",
                 poll_interval_sec=0.01)
     outcome = t.ship(RecordBatch(records=(_spot(),), cursor_after=b""), _ident())
-    assert outcome.kind == "acked"
-    assert outcome.reason == "0/5 added"
+    assert outcome.kind == "retry_later"
+    assert "0/5 added" in outcome.reason
 
 
-def test_async_no_nonce_is_acked():
+def test_async_no_nonce_is_retried():
     def fake_urlopen(req, timeout):
         return _JsonResp({"queued": False, "error": "bad"})
 
@@ -645,8 +726,32 @@ def test_async_no_nonce_is_acked():
                 api_base_url="https://wsprnet.org/api/upload/v1",
                 poll_interval_sec=0.01)
     outcome = t.ship(RecordBatch(records=(_spot(),), cursor_after=b""), _ident())
-    assert outcome.kind == "acked"
+    assert outcome.kind == "retry_later"
     assert "no nonce" in outcome.reason
+
+
+@pytest.mark.parametrize("exc_factory, expect", [
+    (lambda url: __import__("urllib.error").error.HTTPError(
+        url, 500, "Internal Server Error", hdrs={}, fp=BytesIO(b"oops")),
+     "retry_later"),
+    (lambda url: __import__("urllib.error").error.URLError(
+        "[Errno 110] Connection timed out"), "retry_later"),
+    (lambda url: __import__("urllib.error").error.HTTPError(
+        url, 400, "Bad Request", hdrs={}, fp=BytesIO(b"no")), "acked"),
+])
+def test_a_failed_async_SUBMIT_is_retried_unless_refused(exc_factory, expect):
+    """⛔ 2026-11-12/13: every async submit that failed (HTTP 500, timeout)
+    was acked, and each was a whole WSPR cycle missing from wsprnet —
+    AB4EJ lost 119 cycles in 24 h to 28 HTTP 500s and 52 submit timeouts.
+    A 4xx was read and refused, so it is still acked."""
+    def fake_urlopen(req, timeout):
+        raise exc_factory(req.full_url)
+
+    t = WsprNet(urlopen=fake_urlopen,
+                api_base_url="https://wsprnet.org/api/upload/v1",
+                poll_interval_sec=0.01)
+    outcome = t.ship(RecordBatch(records=(_spot(),), cursor_after=b""), _ident())
+    assert outcome.kind == expect
 
 
 def test_async_poll_timeout_is_acked():

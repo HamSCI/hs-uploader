@@ -121,6 +121,9 @@ dedup_order_by_desc = "snr_db"
 [pipeline.transport]
 type = "wsprnet"
 api_base_url = "https://wsprnet.org/api/upload/v1"
+# Pinned: 29a0806 defaulted to 999 per post, this tree to 250 (2026-11-13).
+# The check is about the sink gate, so both trees get the same cap.
+max_spots_per_upload = 999
 
 [[pipeline]]
 name = "heartbeat"

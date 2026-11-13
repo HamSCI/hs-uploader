@@ -287,3 +287,16 @@ def test_retry_policy_delay_for():
     assert rp.delay_for(6) == 60.0   # capped
     assert rp.delay_for(20) == 60.0  # still capped
     assert rp.delay_for(-1) == 0.0   # negative tolerated
+
+
+def test_retry_policy_min_delay_is_a_floor_under_every_attempt():
+    """⛔ wsprnet.org goes on recording an upload the client timed out on.
+    A first retry after base**0 = 1 s re-sent the body while the first copy
+    was still landing, and both did.  The floor keeps every retry clear."""
+    rp = RetryPolicy(base=2.0, cap_sec=300.0, max_attempts=12,
+                     min_delay_sec=120.0)
+    assert rp.delay_for(0) == 120.0
+    assert rp.delay_for(6) == 120.0    # 64 s, floored
+    assert rp.delay_for(8) == 256.0    # above the floor, unchanged
+    assert rp.delay_for(20) == 300.0   # cap still applies
+    assert RetryPolicy().delay_for(0) == 1.0, "no floor unless asked"

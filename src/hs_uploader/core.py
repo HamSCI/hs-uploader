@@ -164,23 +164,31 @@ class RetryPolicy:
     the deliverable is enqueued and re-tried at ``base ** attempts``
     seconds (capped at ``cap_sec``) until ``max_attempts`` is reached,
     after which the deliverable goes to dead-letter.
+
+    ``min_delay_sec`` is a floor under every retry delay.  A transport whose
+    far end keeps working after the client gives up (wsprnet.org records a
+    timed-out upload anyway) needs one: retrying one second later re-sends
+    the body while the first copy is still being recorded, and both land.
     """
 
     base: float = 2.0
     cap_sec: float = 300.0
     max_attempts: int = 12
+    min_delay_sec: float = 0.0
 
     @classmethod
     def exponential(
-        cls, base: float = 2.0, cap_sec: float = 300.0, max_attempts: int = 12
+        cls, base: float = 2.0, cap_sec: float = 300.0, max_attempts: int = 12,
+        min_delay_sec: float = 0.0,
     ) -> "RetryPolicy":
-        return cls(base=base, cap_sec=cap_sec, max_attempts=max_attempts)
+        return cls(base=base, cap_sec=cap_sec, max_attempts=max_attempts,
+                   min_delay_sec=min_delay_sec)
 
     def delay_for(self, attempt: int) -> float:
         """Seconds to wait before attempt N (0-indexed)."""
         if attempt < 0:
             return 0.0
-        return min(self.base**attempt, self.cap_sec)
+        return max(self.min_delay_sec, min(self.base**attempt, self.cap_sec))
 
 
 # ------------------------------------------------------------------- Pipeline
