@@ -45,8 +45,7 @@ For spots, a sigmond station uses one transport: `WsprdaemonTarSftp`
 FT8/FT4 and MSK144 rows; wsprdaemon.org forwards them to wsprnet.org and
 PSKReporter under each spot's own reporter id.  The manifest leaves out
 the `WsprNet` and `PskReporterTcp` pipelines whenever the tar carries the
-spots.  Both transports stay in the library.  wspr-recorder's own
-in-process pump still builds a `WsprNet` pipeline; see its README.
+spots.  Both transports stay in the library.
 
 ## Sink writer
 
