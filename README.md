@@ -295,6 +295,16 @@ for a week logs nothing more.  A fault (a broken switch file, `sinks/`
 missing while the marker stands, an exception inside the gate) logs at
 ERROR once, then a reminder every 6 hours while it lasts.
 
+**The link schedule.**  At a station whose link comes and goes on a
+schedule (the South Pole's satellite passes), sigmond-link writes
+`/var/lib/sigmond/link-schedule.json`.  When the switches say send, the
+gate also asks that schedule.  Outside every window it holds each network
+pipeline, just as a switch hold does: data, cursor and retries stay, and
+the next pass ships the backlog.  Inside a window the transport judges the
+link as before.  No file, an unreadable one, one older than 8 days, or a
+time outside its horizon all mean send.  `[daemon] link_schedule = false`
+turns the check off; a path string reads another file.
+
 **The starting record.**  A legacy entry with `start_at = "now"` fixes its
 starting point at its first pump.  A pipeline held from its first pump
 would never fix one, and the first real pump would skip everything stored
@@ -394,6 +404,13 @@ With `--features` it prints one feature word per line instead, sorted:
 - `pipelines.d` -- the daemon reads pipeline files.
 - `send-log-v3` -- the store has migration 3 and the send log names its
   pipeline and client.
+- `sender-key` -- the wsprdaemon tar transport reads `sender`, the name of
+  the machine that ships the tars.  It still reads the older `receiver`
+  when a pipeline gives no `sender`.
+- `sigmondb-tar` -- the wsprdaemon tar transport ships sigmondb arrival and
+  capture rows in their own tagged tars (`tar_tag`).  sigmond renders a
+  pipeline that `requires_features` this word only for a daemon that
+  offers it.
 - `switch-files` -- the code reads switch files and reports them.
 
 An hs-uploader without the flag exits 2.  sigmond's manifest step prints the
