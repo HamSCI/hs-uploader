@@ -36,7 +36,10 @@ import os
 import signal
 import socket
 import threading
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python <3.11 (pyproject pulls tomli there)
+    import tomli as tomllib  # type: ignore[no-redef]
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from pathlib import Path

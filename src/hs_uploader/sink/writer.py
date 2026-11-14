@@ -88,7 +88,10 @@ import os
 import sqlite3
 import threading
 import time
-import tomllib
+try:
+    import tomllib
+except ModuleNotFoundError:  # Python <3.11 (pyproject pulls tomli there)
+    import tomli as tomllib  # type: ignore[no-redef]
 from dataclasses import dataclass
 from datetime import datetime, timezone
 from pathlib import Path
