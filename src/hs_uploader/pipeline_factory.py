@@ -209,9 +209,13 @@ def _build_transport(spec: Mapping[str, Any]):
             if fbspec.get("ftp_password_file"):
                 fb_kw["ftp_password_file"] = str(fbspec["ftp_password_file"])
             # Keep the fallback tar's wire format in sync with the SFTP leg.
-            for k in ("version", "compression", "tar_root", "receiver"):
+            for k in ("version", "compression", "tar_root"):
                 if spec.get(k) is not None:
                     fb_kw[k] = str(spec[k])
+            # The same sender as the SFTP leg: this tar provisions its login.
+            fb_sender = spec.get("sender") or spec.get("receiver")
+            if fb_sender:
+                fb_kw["receiver"] = str(fb_sender)
             # ...including the wsprnet switch.  FTP is the BOOTSTRAP leg,
             # the first tar a new station ever sends; a switch carried
             # only on the SFTP leg would be missing on exactly the tars

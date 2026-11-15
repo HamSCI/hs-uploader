@@ -531,3 +531,23 @@ def test_sender_wins_over_receiver(tmp_path, monkeypatch):
     m["pipeline"][0]["transport"]["sender"] = "KFS-MAIN"
     wd = build_pipelines(m, watermark=_wm())[0]
     assert wd.transport.receiver == "KFS-MAIN"
+
+
+def test_ftp_fallback_takes_sender(tmp_path, monkeypatch):
+    """The FTP leg bootstraps a new SFTP login, so it must name the same
+    sender; with only `sender` set (sigmond's rendering since sender-key) it
+    used to get no receiver and refuse every sigmondb tar (N8UR, 2026-11-14)."""
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    m = _sigmondb_manifest(tmp_path, tar_tag="chirp-capture")
+    t = m["pipeline"][0]["transport"]
+    t["sender"] = t.pop("receiver").replace("AC0G_S", "N8UR-SIGMOND")
+    p = build_pipelines(m, watermark=_wm())[0]
+    assert p.transport.fallback_ftp.receiver == "N8UR-SIGMOND"
+
+
+def test_ftp_fallback_sender_wins_over_receiver(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    m = _wspr_manifest(tmp_path)
+    m["pipeline"][0]["transport"]["sender"] = "KFS-MAIN"
+    wd = build_pipelines(m, watermark=_wm())[0]
+    assert wd.transport.fallback_ftp.receiver == "KFS-MAIN"
