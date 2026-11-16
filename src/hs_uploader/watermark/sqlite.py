@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Callable, Optional
 
 from .base import Advance, Deliverable
+from .schema import BUSY_TIMEOUT_S
 
 _ATTEMPTS_RING_SIZE = 10_000
 
@@ -150,7 +151,12 @@ class SqliteWatermarkStore:
         # ``check_same_thread=False`` because the orchestrator may dispatch
         # from a thread that's different from the constructor's; we
         # serialize all access through ``self._lock``.
-        self._conn = sqlite3.connect(self.path, check_same_thread=False)
+        # The daemon, the recorders' in-process senders and `hs-uploader
+        # migrate` all write this file.  sqlite3's default 5 s wait raised
+        # "database is locked" at start and in the pump loop (AC1SN, N8UR,
+        # 2026-11-16); wait as long as migrate does.
+        self._conn = sqlite3.connect(self.path, check_same_thread=False,
+                                     timeout=BUSY_TIMEOUT_S)
         self._conn.row_factory = sqlite3.Row
         self._lock = threading.RLock()
         # advance_cursor's warning windows, one per key:

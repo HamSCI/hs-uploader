@@ -182,3 +182,15 @@ def test_memory_db_no_chmod(tmp_path):
     """``:memory:`` paths have no on-disk file; chmod must skip cleanly."""
     # Just verify no exception.
     SqliteWatermarkStore(":memory:")
+
+
+def test_store_waits_for_a_busy_database(tmp_path):
+    """The daemon, the recorders' in-process senders and `hs-uploader migrate`
+    all write watermarks.db.  With sqlite3's default 5 s wait the store raised
+    "database is locked" at daemon start (AC1SN, align 2026-11-16) and in the
+    pump loop (N8UR, ~40 since 11-14).  It waits as long as migrate does."""
+    from hs_uploader.watermark.schema import BUSY_TIMEOUT_S
+    from hs_uploader.watermark.sqlite import SqliteWatermarkStore
+    store = SqliteWatermarkStore(tmp_path / "watermarks.db")
+    ms = store._conn.execute("PRAGMA busy_timeout").fetchone()[0]
+    assert ms >= BUSY_TIMEOUT_S * 1000
