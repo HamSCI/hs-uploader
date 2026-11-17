@@ -251,6 +251,30 @@ class TestUnreachableHandling(unittest.TestCase):
                 w.insert([{"i": i}])
         self.assertEqual(w.health, HEALTH_DEGRADED)
 
+    def test_overflow_recovers_when_sqlite_returns(self):
+        # AB4EJ, 2026-11-17: a lock stall long enough to overflow the
+        # buffer once left psk-recorder raising BufferFull every cycle
+        # until restart, because insert() raised before it tried flush().
+        state = {"fail": True}
+
+        def factory(cfg):
+            if state["fail"]:
+                raise sqlite3.OperationalError("database is locked")
+            return sqlite3.connect(":memory:")
+
+        w = Writer.from_env(
+            table="spots", mode="psk",
+            env={"SIGMOND_SQLITE_PATH": "/nonexistent/dir/sink.db"},
+            batch_rows=3, connect_factory=factory,
+        )
+        with self.assertRaises(BufferFull):
+            for i in range(7):
+                w.insert([{"i": i}])
+        state["fail"] = False
+        w.insert([{"i": 7}])            # stores the backlog, no raise
+        self.assertEqual(w.buffered, 0)
+        self.assertEqual(w.health, HEALTH_OK)
+
 
 class TestWriterFromEnvDispatch(unittest.TestCase):
     """`Writer.from_env` selects a writable sink path: an explicit

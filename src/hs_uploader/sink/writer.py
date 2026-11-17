@@ -580,8 +580,10 @@ class Writer:
     def insert(self, rows: Sequence) -> None:
         """Buffer rows; auto-flush on size OR age threshold.
 
-        Raises `BufferFull` if the buffer would exceed `2 * batch_rows`
-        (SQLite has been unwritable for too long).
+        Raises `BufferFull` if the buffer still exceeds `2 * batch_rows`
+        after a flush attempt (SQLite has been unwritable for too long).
+        Every insert past the threshold tries the flush first, so the
+        writer recovers by itself once SQLite takes writes again.
 
         Two flush triggers:
         - Size: buffer reaches `batch_rows`.
@@ -593,15 +595,6 @@ class Writer:
             if self.is_noop or not rows:
                 return
             self._buffer.extend(self._judge(rows))
-            if len(self._buffer) > self._buffer_max:
-                self._health = HEALTH_DEGRADED
-                buffered = len(self._buffer)
-                self._buffer = self._buffer[: self._buffer_max]
-                raise BufferFull(
-                    f"hamsci_sink buffer overflow: {buffered} rows pending, "
-                    f"max {self._buffer_max} (SQLite unwritable at "
-                    f"{self._config.path if self._config else '?'})"
-                )
             size_trigger = len(self._buffer) >= self.batch_rows
             age_trigger = (
                 self.auto_flush_seconds > 0
@@ -611,6 +604,15 @@ class Writer:
             )
             if size_trigger or age_trigger:
                 self.flush()
+            if len(self._buffer) > self._buffer_max:
+                self._health = HEALTH_DEGRADED
+                buffered = len(self._buffer)
+                self._buffer = self._buffer[: self._buffer_max]
+                raise BufferFull(
+                    f"hamsci_sink buffer overflow: {buffered} rows pending, "
+                    f"max {self._buffer_max} (SQLite unwritable at "
+                    f"{self._config.path if self._config else '?'})"
+                )
 
     def _judge(self, rows: Sequence) -> Sequence:
         """The rows to store: every row unless its producer reads `off` (§4).
