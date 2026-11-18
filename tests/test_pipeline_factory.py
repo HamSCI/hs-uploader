@@ -551,3 +551,32 @@ def test_ftp_fallback_sender_wins_over_receiver(tmp_path, monkeypatch):
     m["pipeline"][0]["transport"]["sender"] = "KFS-MAIN"
     wd = build_pipelines(m, watermark=_wm())[0]
     assert wd.transport.fallback_ftp.receiver == "KFS-MAIN"
+
+
+# ---- declared receivers (transporters: B2, KFS-MAIN) -----------------------
+
+def test_receivers_reach_both_legs(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    m = _sigmondb_manifest(tmp_path, tar_tag="chirp-capture")
+    m["pipeline"][0]["transport"]["receivers"] = ["AC0G/B1A", "AC0G/B1B"]
+    p = build_pipelines(m, watermark=_wm())[0]
+    assert p.transport.receivers == ["AC0G/B1A", "AC0G/B1B"]
+    assert p.transport.fallback_ftp.receivers == ["AC0G/B1A", "AC0G/B1B"]
+
+
+def test_no_receivers_key_declares_none(tmp_path, monkeypatch):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    p = build_pipelines(_sigmondb_manifest(tmp_path, tar_tag="chirp-capture"),
+                        watermark=_wm())[0]
+    assert p.transport.receivers == []
+    assert p.transport.fallback_ftp.receivers == []
+
+
+@pytest.mark.parametrize("bad", ["AC0G/B1A", ["AC0G/B1A", ""], ["  "],
+                                 [1], [None], {"a": 1}])
+def test_bad_receivers_refuse_the_pipeline(tmp_path, monkeypatch, bad):
+    monkeypatch.setenv("SIGMOND_SQLITE_PATH", str(tmp_path / "sink.db"))
+    m = _sigmondb_manifest(tmp_path, tar_tag="chirp-capture")
+    m["pipeline"][0]["transport"]["receivers"] = bad
+    with pytest.raises(ValueError, match="receivers"):
+        build_pipelines(m, watermark=_wm())

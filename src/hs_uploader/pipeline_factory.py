@@ -196,6 +196,9 @@ def _build_transport(spec: Mapping[str, Any]):
         # only when every SFTP server rejects auth — typically first-time
         # bootstrap, where the FTP tar carries ``client_upload_info.txt``
         # so the gateway auto-provisions SFTP for this station's pubkey.
+        # Refused here, before either leg is built, so a bad list never
+        # half-reaches one leg.
+        receivers = _receivers(spec)
         fb = None
         fbspec = spec.get("ftp_fallback")
         if fbspec and (fbspec.get("servers")):
@@ -216,6 +219,10 @@ def _build_transport(spec: Mapping[str, Any]):
             fb_sender = spec.get("sender") or spec.get("receiver")
             if fb_sender:
                 fb_kw["receiver"] = str(fb_sender)
+            # ...and the same declared receivers, or a transporter's
+            # bootstrap tar would have its receivers' rows refused.
+            if receivers:
+                fb_kw["receivers"] = receivers
             # ...including the wsprnet switch.  FTP is the BOOTSTRAP leg,
             # the first tar a new station ever sends; a switch carried
             # only on the SFTP leg would be missing on exactly the tars
@@ -244,6 +251,8 @@ def _build_transport(spec: Mapping[str, Any]):
         sender = spec.get("sender") or spec.get("receiver")
         if sender:
             kw["receiver"] = str(sender)
+        if receivers:
+            kw["receivers"] = receivers
         # WsprCycleSource parks its watermark on "wspr.cycle" so it doesn't
         # collide with the raw-table (wspr.spots) wsprnet pipeline.
         kw["primary_table_name"] = str(spec.get("primary_table_name", "wspr.cycle"))
@@ -289,6 +298,28 @@ def _refuse_untagged_sigmondb(source: Mapping[str, Any],
         raise ValueError(
             "wsprdaemon_tar pipeline reading sigmondb needs `tar_tag` "
             "(its tar must not share a name with a spot tar)")
+
+
+def _receivers(spec: Mapping[str, Any]) -> list[str]:
+    """The ``receivers`` a transporter declares it carries rows for.
+
+    Manifest key (cross-repo contract with sigmond's renderer): ``receivers``,
+    a list of reporter ids such as ``["AC0G/B1A", "AC0G/B1B"]``, on a
+    ``wsprdaemon_tar`` transport.  It lands in routing.json
+    ``default.receivers``, the list wsprdaemon-server's sigmondb ingest checks
+    a chirp row's reporter_id against.  Absent or empty means none: the
+    sender then carries only its own reporter, and the tar is unchanged.
+    Anything but a list of non-empty strings refuses the pipeline.
+    """
+    raw = spec.get("receivers")
+    if raw is None:
+        return []
+    if not isinstance(raw, (list, tuple)) or not all(
+            isinstance(r, str) and r.strip() for r in raw):
+        raise ValueError(
+            "wsprdaemon_tar `receivers` must be a list of non-empty "
+            f"reporter-id strings, got {raw!r}")
+    return [r.strip() for r in raw]
 
 
 def _wsprnet_proxy_kw(spec: Mapping[str, Any]) -> dict[str, Any]:

@@ -1455,3 +1455,121 @@ def test_tagged_name_without_bytes_raises(cls):
     t = cls(servers=["g"], tar_tag="chirp")
     with pytest.raises(ValueError):
         t._tar_name(_ID, _batch_at("2026-11-10T17:46:00Z"))
+
+
+# ---- declared receivers: a transporter names the receivers it carries ------
+#
+# B2 and KFS-MAIN ship chirp rows for receivers on other machines.  The
+# server's sigmondb ingest accepts a row's reporter_id only when it is the
+# sender's own or appears in this tar's routing.json default.receivers.
+
+from hs_uploader.transports.wsprdaemon import _build_rx_site  # noqa: E402
+
+_KFS_SITE = _build_rx_site("KFS-MAIN", "EM12ab")
+_KFS_ARR = dict(
+    time="2026-11-10T17:46:58.461539Z", reporter_id="KFS/OMNI", tx_id="hfdl:4",
+    group_key="g", centre_hz=8.9e6, rate_hz_per_s=0.0, delay_ns=12345,
+    delay_sigma_ns=None, level_db=-90.0, margin_db=None, half_band_db=None,
+    clean_tag="", doppler_hz=None, phase_rate=None, carrier_phase_rad=None,
+    s4=None, sigma_phi_rad=None, detector_version="v1", schema_version=1,
+    engineering={"delay_basis": "counter"})
+
+
+def _kfs_tar(recs=None, **kw):
+    if recs is None:
+        recs = [_chirp_rec("sigmondb.arrival", **_KFS_ARR),
+                _chirp_rec("sigmondb.arrival",
+                           **dict(_KFS_ARR, reporter_id="KFS/WEST",
+                                  time="2026-11-10T17:47:58Z"))]
+    return build_wsprdaemon_tar_from_records(
+        recs, rx_call="KFS-MAIN", rx_grid="EM12ab", receiver="KFS-MAIN",
+        rx_site=_KFS_SITE, compression="bz2", **kw)
+
+
+def test_declared_receivers_ride_in_routing_json_of_a_chirp_only_tar():
+    names, routing, _l = _tar_members(
+        _kfs_tar(receivers=["KFS/WEST", "KFS/OMNI"]))
+    assert "routing.json" in names
+    assert not any(n.startswith(("wspr/", "wsprdaemon/", "ft8/")) for n in names)
+    assert routing["default"]["receivers"] == ["KFS/OMNI", "KFS/WEST"]
+    # chirp/<RX_SITE> stays the SENDER's site; rows are not filed per row.
+    assert {n.split("/")[1] for n in names if n.startswith("chirp/")} == {_KFS_SITE}
+
+
+def test_declared_receivers_sorted_and_deduplicated():
+    a = _kfs_tar(receivers=["KFS/WEST", "KFS/OMNI", "KFS/WEST"])
+    b = _kfs_tar(receivers=["KFS/OMNI", "KFS/WEST"])
+    _n, routing, _l = _tar_members(a)
+    assert routing["default"]["receivers"] == ["KFS/OMNI", "KFS/WEST"]
+    # Manifest order must not move the bytes, nor the content-hashed name.
+    assert a == b
+
+
+@pytest.mark.parametrize("unset", [{}, {"receivers": None}, {"receivers": []}])
+def test_no_receivers_builds_the_same_tar_as_before(unset):
+    """⛔ A station that declares nothing builds byte-identical tars to
+    today's: no routing.json on a chirp-only tar, and no new key on a WSPR
+    tar's routing.json."""
+    blob = _kfs_tar(**unset)
+    assert blob == _kfs_tar()
+    names, routing, _l = _tar_members(blob)
+    assert routing is None and "routing.json" not in names
+    _n, r2, _l2 = _tar_members(_wspr_tar(forward_to_wsprnet=True, **unset))
+    assert "receivers" not in r2["default"]
+    with patch("time.time", return_value=1_000_000_000):
+        x = _wspr_tar(forward_to_wsprnet=True, **unset)
+        y = _wspr_tar(forward_to_wsprnet=True)
+    assert x == y
+
+
+@pytest.mark.parametrize("cls", [WsprdaemonTarSftp, WsprdaemonTarFtp])
+def test_both_legs_carry_receivers_to_the_builder(cls, tmp_path):
+    t = cls(servers=["wd1.example"], receiver="KFS-MAIN", compression="bz2",
+            receivers=["KFS/OMNI"])
+    assert t.receivers == ["KFS/OMNI"]
+    batch = RecordBatch(records=[_chirp_rec("sigmondb.arrival", **_KFS_ARR)],
+                        cursor_after=b"1")
+    ident = _ident(call="KFS-MAIN", grid="EM12ab",
+                   key=str(tmp_path / "id_ed25519"))
+    _n, routing, _l = _tar_members(t._build_tar(batch, ident))
+    assert routing["default"]["receivers"] == ["KFS/OMNI"]
+
+
+def _server_ws():
+    import sys as _sys, types as _types
+    from pathlib import Path as _P
+    srv = _P(__file__).resolve().parents[2] / "wsprdaemon-server"
+    if not (srv / "sigmondb" / "ingest.py").exists() or \
+            "declared_receivers" not in (srv / "sigmondb" / "ingest.py").read_text():
+        pytest.skip("no wsprdaemon-server checkout with declared receivers")
+    for _mod in ("clickhouse_connect", "clickhouse_driver"):
+        if _mod not in _sys.modules:
+            _stub = _types.ModuleType(_mod)
+            _stub.Client = object
+            _stub.get_client = lambda **kw: None
+            _sys.modules[_mod] = _stub
+    if str(srv) not in _sys.path:
+        _sys.path.insert(0, str(srv))
+    import wsprdaemon_server as ws
+    return ws
+
+
+def test_the_SERVER_accepts_a_receiver_this_builder_declared(tmp_path):
+    """⛔ Cross-repo contract: routing.json default.receivers is written here
+    and read by wsprdaemon-server's sigmondb ingest.  A rename on either side
+    would refuse every transporter's rows, silently from here."""
+    ws = _server_ws()
+
+    def _arrivals(blob, name):
+        p = tmp_path / f"{name}.tbz"
+        p.write_bytes(blob)
+        r = ws.extract_and_parse_tbz(p, tmp_path / name, None, None, "chirp")
+        return sorted(t[ws_idx] for t in r[5].get("arrival", []))
+
+    from sigmondb import ddl
+    ws_idx = ddl.COLUMNS["arrival"].index("reporter_id")
+    declared = _kfs_tar(receivers=["KFS/OMNI", "KFS/WEST"])
+    assert _arrivals(declared, "declared") == ["KFS/OMNI", "KFS/WEST"]
+    # ...and the declaration is what admits them: the same rows, undeclared,
+    # are refused.
+    assert _arrivals(_kfs_tar(), "undeclared") == []

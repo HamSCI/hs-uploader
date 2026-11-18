@@ -5,7 +5,7 @@ Phase 2 (PR 5, 2026-05-18) layout:
   <tar root>/
   ├── uploads_config.txt                                       (sigmond metadata)
   ├── client_upload_info.txt                                   (FTP-bootstrap only)
-  ├── routing.json                                             (per-receiver forwarding flags; only when ft* present)
+  ├── routing.json                                             (forwarding flags, declared receivers; only when ft* or a declaration is present)
   ├── wspr/spots/<RX_SITE>/<RECEIVER>/<BAND>/<filename>        (WSPR spots)
   ├── wspr/noise/<RX_SITE>/<RECEIVER>/<BAND>/<filename>        (WSPR noise)
   ├── ft8/<RX_SITE>/<RECEIVER>/<BAND>/<filename>.jsonl         (FT8 spots)
@@ -619,6 +619,7 @@ def _render_routing_json(
     forward_to_wsprnet: Optional[bool] = None,
     wsprnet_reporter: Optional[tuple[str, str]] = None,
     psk_reporter: Optional[tuple[str, str]] = None,
+    receivers: Optional[Sequence[str]] = None,
 ) -> bytes:
     """Emit routing.json from a {receiver_key: forward_bool} map.
 
@@ -638,6 +639,13 @@ def _render_routing_json(
     means "leave field 33 alone", and writing an explicit ``false`` from
     a station that simply has no opinion would switch off a legacy
     per-spot setting nobody asked us to touch.
+
+    ``receivers`` names the receivers a transporter (B2, KFS-MAIN) carries
+    rows for.  The server's sigmondb ingest accepts a chirp row's
+    reporter_id only when it is the sender's own or appears here, under
+    ``default.receivers``.  Written sorted and de-duplicated, so the bytes,
+    and the content-hashed tar name, do not depend on the manifest's order.
+    Empty or ``None`` writes nothing.
     """
     obj: dict = {}
     if not receivers_forward:
@@ -675,6 +683,8 @@ def _render_routing_json(
             # reporter.
             obj["default"]["psk_reporter"] = {"call": call,
                                               "grid": grid or ""}
+    if receivers:
+        obj["default"]["receivers"] = sorted(set(receivers))
     return json.dumps(obj, sort_keys=True).encode() + b"\n"
 
 
@@ -693,6 +703,7 @@ def build_wsprdaemon_tar_from_records(
     forward_to_wsprnet: Optional[bool] = None,
     wsprnet_reporter: Optional[tuple[str, str]] = None,
     psk_reporter: Optional[tuple[str, str]] = None,
+    receivers: Optional[Sequence[str]] = None,
 ) -> bytes:
     """Build a Phase 2 wsprdaemon tar from sink.db-style records.
 
@@ -726,6 +737,12 @@ def build_wsprdaemon_tar_from_records(
     ⚠ Turning it on does NOT stop this station posting to wsprnet
     directly; that is the WsprNet transport's own pipeline, and shipping
     both would double-post.  Switch them together.
+
+    ``receivers`` declares the receivers this sender carries rows for (a
+    transporter such as B2 or KFS-MAIN).  It rides in ``routing.json``
+    ``default.receivers``, and triggers that file even on a chirp-only tar,
+    because that is the tar the server checks it against.  chirp/<RX_SITE>
+    stays the sender's site.
     """
     spot_groups: dict = {}
     noise_groups: dict = {}
@@ -900,15 +917,20 @@ def build_wsprdaemon_tar_from_records(
         # wsprnet setting.  Gating routing.json on psk rows alone would mean
         # a station with no ft8/ft4 at all — exactly the kind that proxies
         # its wsprnet uploads — could never send the switch.
+        # Likewise for a CHIRP-ONLY tar from a transporter that declares
+        # the receivers it carries: the server checks each chirp row's
+        # reporter against that list, in this tar.
         if (psk_groups or forward_to_wsprnet is not None
-                or wsprnet_reporter or psk_reporter):
+                or wsprnet_reporter or psk_reporter or receivers):
             _tar_add_bytes(
                 tf, "routing.json",
                 _render_routing_json(
                     receivers_forward,
                     forward_to_wsprnet=forward_to_wsprnet,
                     wsprnet_reporter=wsprnet_reporter,
-                    psk_reporter=psk_reporter),
+                    psk_reporter=psk_reporter,
+                    receivers=receivers),
+                mtime=fixed_mtime,
             )
         for (rx_id, band, mode, ts_filename), rows in spot_groups.items():
             row_call, row_grid, row_recv, row_site = rx_id
@@ -1013,6 +1035,7 @@ class WsprdaemonTarSftp:
         wsprnet_reporter: Optional[tuple[str, str]] = None,
         psk_reporter: Optional[tuple[str, str]] = None,
         tar_tag: Optional[str] = None,
+        receivers: Optional[Sequence[str]] = None,
     ):
         self.tar_tag = check_tar_tag(tar_tag)
         self.servers = list(servers)
@@ -1022,6 +1045,9 @@ class WsprdaemonTarSftp:
         self.forward_to_wsprnet = forward_to_wsprnet
         self.wsprnet_reporter = wsprnet_reporter
         self.psk_reporter = psk_reporter
+        # Receivers this sender carries rows for (transporters only);
+        # routing.json default.receivers.  Empty = say nothing.
+        self.receivers = list(receivers or [])
         self.spool_root = Path(spool_root) if spool_root else None
         self.sftp_user_override = sftp_user
         # Writable known_hosts (see _default_known_hosts) — avoids the
@@ -1147,6 +1173,7 @@ class WsprdaemonTarSftp:
                 forward_to_wsprnet=self.forward_to_wsprnet,
                 wsprnet_reporter=self.wsprnet_reporter,
                 psk_reporter=self.psk_reporter,
+                receivers=self.receivers,
             )
         return None
 
@@ -1374,12 +1401,16 @@ class WsprdaemonTarFtp:
         wsprnet_reporter: Optional[tuple[str, str]] = None,
         psk_reporter: Optional[tuple[str, str]] = None,
         tar_tag: Optional[str] = None,
+        receivers: Optional[Sequence[str]] = None,
     ):
         self.tar_tag = check_tar_tag(tar_tag)
         self.servers = list(servers)
         self.forward_to_wsprnet = forward_to_wsprnet
         self.wsprnet_reporter = wsprnet_reporter
         self.psk_reporter = psk_reporter
+        # Receivers this sender carries rows for (transporters only);
+        # routing.json default.receivers.  Empty = say nothing.
+        self.receivers = list(receivers or [])
         self.spool_root = Path(spool_root) if spool_root else None
         self.ftp_user = ftp_user
         self.ftp_password_file = (
@@ -1475,6 +1506,7 @@ class WsprdaemonTarFtp:
                 forward_to_wsprnet=self.forward_to_wsprnet,
                 wsprnet_reporter=self.wsprnet_reporter,
                 psk_reporter=self.psk_reporter,
+                receivers=self.receivers,
             )
         return None
 

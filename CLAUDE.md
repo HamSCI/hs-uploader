@@ -113,6 +113,15 @@ fails.
     an untagged row); each row is filed under its own source's reporter
     id and radiod.  `sender-key` in `capabilities --features` says this
     build reads `sender`.
+    A transporter (B2, KFS-MAIN) ships rows for receivers on other
+    machines, so it lists them in the manifest's `receivers` (a list of
+    reporter ids, e.g. `["AC0G/B1A", "AC0G/B1B"]`; both legs get it).  The
+    builder writes them, sorted and de-duplicated, to `routing.json`
+    `default.receivers`, even on a chirp-only tar.  wsprdaemon-server's
+    sigmondb ingest accepts a chirp row's `reporter_id` only when it is
+    the sender's own or listed there.  chirp/<RX_SITE> stays the sender's
+    site.  A station that sets no `receivers` builds the same bytes as
+    before.  Contract test: `test_the_SERVER_accepts_a_receiver_this_builder_declared`.
   - `WsprNet` — HTTP multipart POST to `wsprnet.org/meptspots.php`.
     ⚠ Mutually exclusive with the wsprdaemon transports'
     `forward_to_wsprnet=True` (below): running both double-posts.
