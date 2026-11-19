@@ -202,7 +202,10 @@ _UNTAGGED_MSG = ("sigmondb rows on a transport without tar_tag: the tar "
                  "would be named like a spot tar; refusing to build or send")
 
 
-CHIRP_TABLES = {"sigmondb.arrival": "arrival", "sigmondb.capture": "capture"}
+# sigmondb table -> chirp/<site>/<receiver>/<leaf>.jsonl; the leaf must be a
+# name wsprdaemon-server's sigmondb/ingest.py CHIRP_TABLES accepts.
+CHIRP_TABLES = {"sigmondb.arrival": "arrival", "sigmondb.capture": "capture",
+                "sigmondb.station_drift": "station_drift"}
 
 # wsprdaemon.org's shared FTP-fallback bootstrap credential — the same
 # `noisegraphs` account every wsprdaemon client uses to ship its first tar

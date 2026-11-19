@@ -417,6 +417,10 @@ With `--features` it prints one feature word per line instead, sorted:
 - `sender-key` -- the wsprdaemon tar transport reads `sender`, the name of
   the machine that ships the tars.  It still reads the older `receiver`
   when a pipeline gives no `sender`.
+- `sigmondb-station-drift` -- the wsprdaemon tar transport also ships
+  sigmondb station_drift rows, as `chirp/<site>/<receiver>/station_drift.jsonl`.
+  An older release logs "no chirp/ mapping" and drops them.  sigmond renders
+  its daily drift pipeline only for a daemon that offers this word.
 - `sigmondb-tar` -- the wsprdaemon tar transport ships sigmondb arrival and
   capture rows in their own tagged tars (`tar_tag`).  sigmond renders a
   pipeline that `requires_features` this word only for a daemon that

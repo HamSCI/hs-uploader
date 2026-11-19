@@ -35,8 +35,10 @@ from .watermark.sqlite import SqliteWatermarkStore, default_path
 
 
 # A word appears only in the release that ships its code complete (spec 7.1).
+# "sigmondb-station-drift": the wsprdaemon tar carries sigmondb.station_drift
+# rows (chirp/.../station_drift.jsonl); an older release drops them.
 FEATURES = ("gate", "pipelines.d", "send-log-v3", "sender-key",
-            "sigmondb-tar", "switch-files")
+            "sigmondb-station-drift", "sigmondb-tar", "switch-files")
 
 # The production manifest; sinks/ beside it is the real switch directory.
 _REAL_MANIFEST = "/etc/hs-uploader/pipelines.toml"

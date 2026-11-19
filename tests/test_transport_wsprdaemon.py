@@ -1350,6 +1350,32 @@ def test_sigmondb_records_become_chirp_jsonl():
     assert not any(n.startswith(("wsprdaemon/", "wspr/")) for n in names)
 
 
+def test_station_drift_rows_become_chirp_jsonl():
+    # sigmond's daily drift row: wsprdaemon-server's ingest reads the leaf
+    # "station_drift" (sigmondb/ingest.py CHIRP_TABLES).
+    import json as _j
+    rec = _chirp_rec("sigmondb.station_drift", time="2026-11-19T01:02:03Z",
+                     reporter_id="AC0G/B4", n_fault=0, schema_version=1)
+    blob = _chirp_tar([rec])
+    path = "chirp/AC0G=B4_EM38ww/AC0G_B4/station_drift.jsonl"
+    assert path in _members(blob)
+    with _open_tar_blob(blob) as tf:
+        line = tf.extractfile(path).read().decode().splitlines()
+    assert len(line) == 1 and _j.loads(line[0])["reporter_id"] == "AC0G/B4"
+
+
+def test_chirp_tables_match_the_server_ingest():
+    from hs_uploader.transports.wsprdaemon import CHIRP_TABLES
+    assert CHIRP_TABLES["sigmondb.station_drift"] == "station_drift"
+    server = Path(__file__).resolve().parents[2] / "wsprdaemon-server" / "sigmondb" / "ingest.py"
+    if not server.is_file():
+        pytest.skip("no wsprdaemon-server checkout beside this one")
+    import re as _re
+    m = _re.search(r"^CHIRP_TABLES = \(([^)]*)\)", server.read_text(), _re.M)
+    leaves = set(_re.findall(r'"([a-z_]+)"', m.group(1)))
+    assert set(CHIRP_TABLES.values()) <= leaves
+
+
 def test_chirp_tar_is_byte_stable_under_record_order():
     assert _chirp_tar(_CHIRP_RECS) == _chirp_tar(list(reversed(_CHIRP_RECS)))
 
